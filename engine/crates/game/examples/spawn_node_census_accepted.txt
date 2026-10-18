@@ -1,0 +1,13 @@
+# spawn_node_census's accepted failing nodes (card SPNC). One line each: `<map> <post> <node index>  # reason`.
+# A node failing under today's first-leg rule is ACCEPTED when a line names it; every other one is NEW.
+# Accepted = the lives from it were read on main and its bots walk off: the census is a screen (a straight floor walk,
+# then a soldier's floor flood with a detour limit), and the bots' own steering finds ways it does not.
+# main fdebf98, 16 rounds each (lead_tmp/spnc/main16, tools/nodelives.py): the share of lives still within 3 m of the
+# node 12 s on, against 0.5 % (BF1) / 0.0 % (BF2) for the other nodes of the map. All four of Endor's are on the
+# bunker deck at y 9.5 over hubs at y -3; the bots walk down its ramp to the south-east (y 9.5 -> -1.9 in 5-12 s).
+bf1_end1 cp5 6  # 70 lives, median 50.5 s, 0.0 % at the node 12 s on
+bf1_end1 cp5 7  # 71 lives, median 66.2 s, 7.0 %
+bf1_end1 cp5 8  # 89 lives, median 61.2 s, 11.4 % (the slowest down the ramp; no 20 s stay in 98.7 %)
+bf1_end1 cp6 7  # 104 lives, median 33.5 s, 1.0 %
+bf2_end1 cp5 6  # 63 lives, median 45.8 s, 4.8 %
+bf2_end1 cp5 7  # 71 lives, median 64.0 s, 0.0 %

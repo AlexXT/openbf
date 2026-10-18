@@ -1,0 +1,137 @@
+---
+id: WTHR
+title: Weather, precipitation: rain on both Kaminos and BF1 Yavin 2, snow on the Hoths and Rhen Var, ash on Mygeeto, embers on Mustafar, pollen on Felucia - the PS2's particles in one 5 m cube tiled round the camera, streaks as lines, flakes as sprites, wind, rain shadows and splashes (RE done: re-weather.md)
+milestone: M1
+value: 5
+phase: build
+status: done
+deps:
+files: engine/crates/mungefs/src/fx.rs,engine/crates/manifest/src/lib.rs,engine/crates/bake/src/map.rs,engine/crates/core/src/region.rs,engine/crates/game/src/weather.rs,engine/crates/game/src/viewer/scene.rs,engine/crates/game/src/fx.rs,engine/crates/render/src/particles.rs
+declares: goldens=maps/bf1_hot1.png,maps/bf1_kam1.png,maps/bf1_rhn1.png,maps/bf1_yav2.png,maps/bf2_fel1.png,maps/bf2_hot1.png,maps/bf2_kam1.png,maps/bf2_mus1.png,maps/bf2_myg1.png; rebake=maps; parity=bf1_kam1,bf2_kam1,bf1_yav2,bf1_hot1,bf2_hot1,bf1_rhn1,bf2_myg1,bf2_mus1,bf2_fel1
+needs:
+effort:
+branch: wthr
+resume: landed 1dbb18fa 2026-10-06
+created: 2026-09-25 (from QUEUE.md)
+defer: 
+acceptance: 
+alpha: yes
+---
+
+## The maintainer's decision (2026-09-25)
+In scope: rain and lightning are the disc's own content, and anything the PS2 draws is in scope without asking. Build it faithful-yet-modern.
+
+## Why
+The PS2 draws precipitation on nine maps - rain on both Kaminos and BF1 Yavin 2, snow on both Hoths and BF1 Rhen
+Var, ash on BF2 Mygeeto, embers on BF2 Mustafar, pollen on BF2 Felucia - and the port draws none. The maintainer plays Kamino;
+Hoth and Mygeeto are showcase maps. THIS CARD IS NOW THE BUILD OF THE PRECIPITATION (RE done 2026-10-05); the
+lightning flashes, thunder and the sky bolt are card WTHL.
+
+## Evidence
+`analysis/re-weather.md` ([O]; verifier 64 SUPPORTED / 5 PARTLY folded in / 0 NOT of 69). The whole rule set:
+- sections 1-2: the nine blocks, the field map, N particles in ONE unit cube tiled over the world in 5 m cells, the
+  0.5 s re-roll, the motion (fall + wind + offset);
+- section 3: a streak = one line from the drop (its alpha) to where it was StreakLength/30 s ago relative to the
+  moving player (alpha 0), 1 pixel of the PS2's 512, colour = Color applied twice (Kamino (91, 94, 101) in display
+  units), ordinary alpha blend, depth tested, no depth write, not fogged; a flake = a camera-facing textured square
+  of edge 2.83 x floor(ParticleSize x 256)/256, spun by its phase, at its own alpha with NO distance fade;
+  the cells drawn and a streak cell's alpha (dpx, Range, the 0.66 fade);
+- section 4: the `rainshadow...` regions (4-23 a map) and the cell walk that keeps the rain out of halls;
+- section 5: the splashes (`com_sfx_rainsplash` / `rainsplash`, already baked) and their rate; section 6: the wind.
+Instruments: `lead_tmp/wthr/tools/predict.py <state>` (rebuilds a PS2 frame's streaks from that state's RAM and
+scores them against the state's screenshot; `--export` writes a test vector), `flake_fade.py`, `ramcensus.py`,
+`regions.py`, `census.py`. Vectors: `lead_tmp/wthr/vectors/bf2_kam1_cp1_cp6_b000.json` (a rain-shadow view, 27 cells),
+`bf2_mus1_cp0_cp5_b000.json` (a plain view, 28 cells).
+
+## Acceptance (run and paste each)
+1. Unit tests on the two vectors: from the vector's camera, regions and particle array the port's cell walk gives
+   the same cell set with each alpha within 1e-3, the same far / fade start / dpx and the same streak vector
+   (the vectors are the Python model's output, itself scored against the PS2 frames).
+2. Unit tests of the rules with PS2 numbers: the wind's RAM row (from (1.2584, 0, 0.6926), target (1.1839, 0,
+   0.6062), clock 0.8667 -> (1.1938, 0, 0.6177)); the streak colour byte rule (216, 220, 228) -> (91, 94, 101);
+   the flake edge (0.015 -> 0.0332 m, 0.03 -> 0.0774 m); the splash interval (spread 8, rate 7, a 12.7 x 11 m box
+   -> 23.5 a second); the region overlap tests of kinds 5 and 7 and kind 2's centre test.
+3. The frame test (a scratch example or a test): the port's weather layer rendered at the pose of
+   `bf2_kam1_walk_cp5_cp5_b000` with that state's particles, wind and time offset -4/60 s injected, scored against
+   the state's screenshot as `predict.py` does: correlation >= 0.40 (the Python model: 0.53; a shuffled particle
+   array <= 0.02 - run that control too). At the two indoor poses (`cp0_cp1`, `cp3_cp2`): 0 streak pixels.
+4. Pictures for the maintainer: BF2 KAM1 and BF2 HOT1 / MYG1 at one walk pose each beside the PS2 frame.
+Each rule broken should fail one test (mutation-check at least: tile 4 m, no rain shadow, the fade on flakes).
+
+## Build notes (decisions taken in the RE; reversible)
+- Viewer-side, not sim state: its own LCG stream, frame dt; the sim hash must not move (`declares:` has no sim).
+- Streak width: the PS2's line is 1 pixel of 512; draw a streak 1/512 of the frame's width (>= 1 px) so the look
+  holds at any resolution - one FEEL_NOTES line.
+- Flakes keep the PS2's missing fade (they pop with their cell at Range, 15-20 m, at 3-8 cm: not visible); a fade
+  would be a named deviation - not taken.
+- The streak pass needs a per-vertex alpha (head a, tail 0): `render::ParticleDraw` has one colour per draw.
+- BF2 divides GroundEffectsPerSec by the view count, BF1 does not; the PS2's camera-velocity input is the player's
+  soldier / vehicle velocity.
+- Goldens: decide in the build whether the still goldens show weather (a fixed particle state at t = 0 keeps them
+  deterministic); `declares:` below assumes they do on the nine maps and that every other map is untouched.
+
+## Original placeholder (kept)
+See the original entry below.
+
+## Original QUEUE.md entry (verbatim, 2026-09-25)
+WTHR. [TODO — ADDED 2026-09-25 (lane 1) by PXC batch 2 (FINDINGS F11); **[RE] FIRST**; FREE; LOW-MEDIUM value; a build is a new presentation system — check PLAN §LOCKED FEATURE SET §Presentation first and record the call] **Weather: rain streaks and lightning bolts on Kamino (BF1 and BF2) on the PS2, none in the port** [RE] — evidence `engine/artifacts/pcsx2/ref/bf1_kam1/pairs/cp0_cp2_beta1_v3_water.png` (two bolts) and the rain in every BF1/BF2 KAM1 frame; PLAN has no weather text (0 hits for weather / lightning / precipitation — the batch-2 verifier). The maintainer's `engine/artifacts/pcsx2/ref/COMPARISON_RULES.md` counts a missing layer that changes the game's character as a finding. RE (§5): what authors it — the map's `fx__` config (an `Effect("Rain")` / lightning entry beside `Effect("Water")`, which `mungefs::fx` parses), the streak/particle system, the flash, its sounds — and a census over both discs. GATE: `analysis/re-weather.md` (§5, [O], verifier) with the census + a build entry. Files: `analysis/re-weather.md` (new), `analysis/RE_LOG.md`, scratch `engine/artifacts/lead_tmp/re/wthr/`.
+
+## Notes (planner 2026-09-25)
+- The RE may run; the BUILD waits on the maintainer: PLAN's LOCKED FEATURE SET has no weather, and adding it is his call (STATUS
+  For the maintainer). Do not set this card to phase=build until INBOX answers.
+
+## Planner note (2026-09-26)
+The maintainer answered (INBOX 2026-09-25): weather is in scope. The earlier "build waits on the maintainer" note is void — RE, then build as
+any other card. Value 2 → 3 (visible on both Kaminos).
+
+## Note (PXWA, 2026-09-29, lane 2): BF1 Rhen Var snows
+The PCSX2 walkabout shows falling snow on BF1 RHN1 (and flakes on RHN2) at every post; the port draws none. RHN1.LVL
+authors `Precipitation` / `fx_snow` / `rhn1_snow_01` (disc strings). Frames: `engine/artifacts/pcsx2/ref/bf1_rhn1/walk/
+pairs/cp0_cp2__sheet.png`, `cp4_cp5__sheet.png`. The snow may also be part of RHN1's near haze (FARC note).
+- 2026-09-29 (PXWB, FINDINGS F56/F60): BF2 too — heavy rain at every outdoor KAM1 post (`pcsx2/ref/bf2_kam1/walk/pairs/cp1_cp6__sheet.png`), falling snow on HOT1 (`bf2_hot1/walk/pairs/cp4_cp7__sheet.png` b090/b270), ash on MYG1 (`bf2_myg1/walk/pairs/cp0_cp4_con__sheet.png`).
+
+## Planner note (2026-09-30, M-ALPHA)
+`defer: post-alpha` — not needed for the alpha's six showcase maps or its checklist. Value 3 (kept).
+
+`acceptance: needed` (planner 2026-09-30): no measurable acceptance yet (a parity delta, a leak-census count, a sim replay hash or a pixel test). Write one before the card is picked.
+
+- Planner 2026-09-30 17:30: Raised 3 → 4: the maintainer plays Kamino (INBOX 11:10) and KAMR (M1 5) is its bring-up; KAMR's geometry and sea fixes do not wait for weather, but the rain and lightning are the next visible Kamino gap after them.
+
+## Acceptance (planner 2026-09-30 17:30)
+- RE: each map's `Precipitation` / weather block (particle type, density, fall speed, streak length, colour, wind) and the lightning rule (interval, flash, bolt draw), per game, [V]/[O] with the verifier.
+- Built: at the PXWB walk poses of BF2 KAM1, HOT1 (snow), MYG1 (ash) and BF1 RHN1 (snow), a pixel test on a sky/air box: the count of precipitation pixels (a high-pass mask over consecutive frames) within ±30 % of the PS2 pair's, median over the four bearings; fall speed within ±15 % measured over consecutive frames; a unit test pins the lightning interval rule.
+- Alpha: yes, and no longer post-alpha — HOT1's snow and MYG1's ash fall on two showcase maps (PXWB F56/F60).
+
+## Note (KAMR RE, 2026-09-30, lane 3): the Lightning effect is read — use it
+`analysis/re-kamino.md` §1: the disc block (BF1 KAM1, BF1 YAV2, BF2 KAM1: Lightning + LightningBolt("skybolt") +
+Precipitation "Streaks" + Wind + ColorControl; `lead_tmp/kamr/re/fxkeys.py <LVL>` prints every key), the parser and the
+tick (B2 `FUN_0045aa30` / `FUN_0045ae80`, B1 `FUN_00377c40` / `FUN_00378120`): flash schedule (interval 3..5 s, 2..5
+sub-flashes 0.01..0.5 s apart, a random direction 30..60 deg over the horizon), FadeTime 0.2 s, and per tick of a fade
+the lights blended toward the flash colour, the dome colour AND the fog colour lerped white -> black by
+0.4*(1 - brightness). PS2 frames at a flash: `lead_tmp/kamr/ps2exp/out/sea_ctl2.png`, `sea_dome255.png` (bolt, light
+grey fogged sea edge). The steady dome factor is card KSKY (it bakes the block: take the manifest field from there).
+The Lightning object in RAM: BF2 KAM1 0x173a750 (float pattern 0.1, 0.4, 1.0, 0.2, 3.0, 5.0 at +0x34); set +0x68 = 1e9
+to freeze it for clean frames.
+
+## Planner 2026-10-03 07:15 - value 4 -> 5
+- Why: Kamino's rain and lightning are on the map the maintainer plays, the card has been at 4 since 09-30 and the research
+  lanes take equal-value RE cards in ID order, which put it last of eleven. The maintainer's rule of 09-30 22:50 (Kamino cards
+  before value-5 cards on other maps) names it by its KAMR note. HOT1's snow and MYG1's ash are two showcase maps.
+- The Lightning block is already read (the note above); what is left to read is the Precipitation "Streaks" draw.
+- Reverse: `loopctl.py set WTHR value=4`.
+
+## Note (WTHR RE, 2026-10-05, lane 2)
+- RE done, docs 6927748. The "Acceptance (planner 2026-09-30 17:30)" section above is superseded by "## Acceptance (run
+  and paste each)" at the top: the pixel-count measure it proposed is replaced by the RAM vectors and the frame test
+  (a model scored against the PS2 screenshot of the very state it was read from).
+- BF1 RHN2 has NO precipitation (disc and RAM); the "flakes on RHN2" of the PXWA note are not this effect.
+- The lightning half of this card's title is card WTHL.
+- 2026-10-06 planner: `engine/CRATES.md` taken out of `files:`. The picker refuses a card whose files overlap a card in progress, and 22 open cards listed the map, so any one of them held the other 21 (a chain card in progress held WADE and WTHR). The map's row for a new or moved source file is still owed in the same branch (`scripts/size_report.sh --check-map`); a rebase conflict in it is one line. Undo: add the path back.
+
+## Note (WTHR build, 2026-10-06, lane 2) - LANDED 1dbb18f + goldens 9cd9b52
+- Report `reports/20261006_2350_card_WTHR.md`. Acceptance 1-4 run and pasted there: three PS2 vectors (27 / 28 / 4
+  cells, alpha gap under 6e-6), the frame test 0.444 at cp5_cp5 (shuffled 0.017, indoor poses 0 streak pixels), five
+  mutations each failing a test, pairs in `lead_tmp/wthr/out/pairs/`.
+- `declares:` was narrowed from `goldens=any` to the nine `maps/*.png`; all nine moved and nothing else.
+- Left for a later card if wanted: the flake maps' parity rose 0.03-0.15 (cause not found); the splash loop's second
+  writer of the "in view" flags; one splash seen over the sea edge (surface not identified).

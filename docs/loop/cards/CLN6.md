@@ -1,0 +1,36 @@
+---
+id: CLN6
+title: Two referee repairs, one session and one gates run (CLN6 + CLN7): (1) the host-libm referee cannot see path-form calls or glam; (2) two game-side referees that do not test what they say (golden_tat1 renders another scene than the binary; water_look asserts a literal table)
+milestone: M0
+value: 2
+phase: cleanup
+status: todo
+deps:
+files:
+declares:
+needs:
+effort:
+branch:
+resume:
+created: 2026-09-25 (from QUEUE.md)
+acceptance: 
+---
+
+## Why / Evidence / Acceptance
+See the original entry below; the first session to work this card rewrites this section into short Why / Evidence / Acceptance lines and fills `files:` and `declares:`.
+
+## Original QUEUE.md entry (verbatim, 2026-09-25)
+CLN6. [TODO — **NOTE 2026-09-25 (DET1's landing, `c01892a`): the scan is now `offenders_under(dir, skip)` and runs twice — `no_std_transcendentals_in_core` and `no_std_transcendentals_in_game_sim_inputs` (`game/src` bar `PRESENTATION`: `viewer.rs`, `viewer/`, `gallery.rs`, `sounds.rs`, `water_anim.rs`) — so a new pattern lands on both scopes. Mind that glam rotations DO occur in scanned game files, draw matrices and animation blends read from sim state, none feeding it (`walk.rs:520,533,554` the marker/target/bolt draws, `soldier_vis.rs:373`, `skin.rs:108,114`), plus test-only `skin.rs:235` and `camera_collide.rs:348,366`: a glam denylist over `game/src` needs those answered, not waved through.** **NOTE 2026-09-24 (SPL3's landing): `no_std_transcendentals_in_core` now walks every `.rs` under `core/src`, module directories included, and names a file by its path under `src` (`3644ec8`) — build on that; the one-`#[cfg(test)]`-per-file rule it still enforces is why SPL3 kept its shared fixtures in `collision.rs`'s `mod tests`.** ADDED 2026-09-23 (lane 2) by the cleanse's bug hunt; FREE — `core/src/fmath.rs` (its test module) is shared with nothing live; lower value than the fidelity entries: there is NO live violation] **The host-libm referee cannot see path-form calls or glam** — `core/src/fmath.rs`'s `BANNED` scan (CLN1's referee) matches only the method-call form `.name(`, so `f32::sin(x)`, `.map(f32::cos)` and glam's own rotation / `angle_between` / `slerp` helpers (workspace `glam = "0.30"` has no `libm` feature, so they reach the host libm) pass unseen, as does `.powi(`, which std documents as non-deterministic. MEASURED 2026-09-23: none of these occurs in `core/src` non-test code today (the only glam call is `Quat::from_mat3`, sqrt only). Build: add the path forms and a glam denylist to the referee — or turn on glam's `libm` feature, which is only acceptable if every gate hash stays put — and prove each new pattern can fail (the CLN1 pattern: insert one call, paste the failure, remove it). GATE: `./ci.sh` 0 (+N referee cases); `--sim-hash 100` = `17e1b946ff0e821c` and `scripts/sim_gates.sh` unmoved. Files: `engine/crates/core/src/fmath.rs` (+ `engine/Cargo.toml` only on the feature route).
+
+- **Acceptance (planner 2026-09-30 08:30, from the entry's GATE):** each new referee pattern (path-form `f32::sin(`, `.map(f32::cos)`, `.powi(`, the glam rotation/`angle_between`/`slerp` denylist) is shown FAILING once on an inserted call (paste the failure), then passing; `./ci.sh` 0 at +N referee cases; `game --sim-hash 100` = 17e1b946ff0e821c and `scripts/sim_gates.sh` unmoved; every gate PASS, nothing declared.
+
+## Part 2 (was card CLN7, merged by the planner 2026-10-06 14:00)
+The batch rule (the maintainer, 2026-09-30): CLN6 and CLN7 are both M0, value 2, `cleanup`, both repair a referee that does not test what it says, and both end in the same gates run with nothing declared (CLN7's golden referee must leave `engine/goldens` clean). Two commits, one ci and one gates run; each part keeps its own acceptance below. Do part 1 (the libm scan) first: it is text-only. Undo: `loopctl.py set CLN7 status=todo resume=` and delete this section.
+
+### CLN7: Why / Evidence / Acceptance
+See the original entry below; the first session to work this card rewrites this section into short Why / Evidence / Acceptance lines and fills `files:` and `declares:`.
+
+### CLN7: original QUEUE.md entry (verbatim, 2026-09-25)
+CLN7. [TODO — ADDED 2026-09-23 (lane 2) by the cleanse's test-prune pass; touches a GOLDEN REFEREE, so it is a queue entry rather than a cleanse fold-in; `game/src/viewer/look.rs`'s test module (`viewer.rs`'s until SPL1) is shared with OCF / 9 / W3 / 7 — take it while none of them is live] **Two game-side referees that do not test what they say** — (a) `game/tests/golden_tat1.rs` renders `load_scene` + `upload_scene` only, while `engine/goldens/tat1_overview.png` is written by the game binary's own capture path (`scripts/goldens.sh` → `run_headless` → `load_and_upload`, which merges `common_bf1` — the ≥ 12 drawable common instances `tests/load_scene.rs` counts), so the referee compares two different scenes and spends part of its tolerance on the difference; give the test the binary's scene (`apply_mode_layer("con")` + the `common_bf1` merge) and read the diff with `--nocapture` before and after — NO golden may move. (b) `viewer/look.rs`'s `no_shipped_map_fogs_its_water_at_a_step` (`viewer::look::tests` since SPL1) compares a table of literals with literals (fog near 400/1000/3000 vs 90/100/150) and reads no bake, so a rebake that moved them could not fail it; move the check into `game/tests/water_look.rs`'s per-map loop (`lighting.fog.near >= look.fog_begin` wherever `fog_begin` is `Some`) and delete the literal table. GATE: `./ci.sh` 0; `scripts/gpu_tests.sh` 0 with `git status --short engine/goldens` EMPTY; the new water_look assertion shown failing once on a doctored value (paste), then passing. Files: `engine/crates/game/tests/golden_tat1.rs`, `engine/crates/game/src/viewer/look.rs` (test module only), `engine/crates/game/tests/water_look.rs`.
+
+- **Acceptance (planner 2026-09-30 08:30, from the entry's GATE):** (a) golden_tat1's per-pixel diff vs `goldens/tat1_overview.png` printed with `--nocapture` before and after, the after diff smaller (same scene as the binary); (b) the new water_look assertion shown failing once on a doctored fog value (paste), then passing, and the literal table gone; `./ci.sh` 0; gpu gate with `git status --short engine/goldens` empty; nothing declared.

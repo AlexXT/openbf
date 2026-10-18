@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mungefs",
+    "crates/manifest",
+    "crates/pak",
+    "crates/bake",
+    "crates/core",
+    "crates/render",
+    "crates/audio",
+    "crates/input",
+    "crates/ui",
+    "crates/net",
+    "crates/game",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Locked stack (PLAN.md Part B). Versions match the maintainer's existing wgpu projects.
+[workspace.dependencies]
+glam = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+wgpu = "27"
+winit = "0.30"
+egui = "0.33"
+egui-wgpu = "0.33"
+egui-winit = "0.33"
+gilrs = "0.11"
+kira = "0.10"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ron = "0.10"
+gltf = { version = "1", features = ["extras"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+png = "0.17"
+ktx2 = "0.4"
+# `enhanced-determinism` = `simba/libm_force` + `indexmap`: parry's scalar math
+# goes through the `libm` crate instead of the host libm, and its internal maps
+# iterate in insertion order. Same contract as `core::fmath` (which covers only
+# code we write) — a replay recorded on one OS has to reproduce on every other.
+parry3d = { version = "0.22", features = ["enhanced-determinism"] }
+libm = "0.2"
+anyhow = "1"
+thiserror = "2"
+
+# Line tables only (2026-10-15): full DWARF made every example and test binary huge (engine/target 154 GB) and the loop
+# rewrote it on each build — SSD wear. Backtraces and profilers still resolve file:line. Codegen is unchanged.
+[profile.release]
+debug = "line-tables-only"
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+# Tests and debug builds run optimised dependencies and an optimised `core` (card TSTX, 2026-10-02): the heavy
+# integration tests step real battles, which at opt-level 0 took 50 s each. Measured on the same tree with nextest:
+# the test step 53 s -> 12 s, a rebuild after touching core 19 s -> 13 s, after touching game 18 s -> 12 s; the one-off
+# rebuild of the dependencies is ~90 s. Debug assertions and overflow checks stay on. The sim gives the same results
+# at any opt-level (no fast-math; the 100-tick hash pin in sim/state.rs passes).
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.core]
+opt-level = 2

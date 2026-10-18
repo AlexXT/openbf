@@ -1,0 +1,138 @@
+//! Fixed-step deterministic sim — the capture/replay spine (PLAN.md
+//! §Determinism) and, from P4, the combat world: units (soldier + health +
+//! weapon), bolts, damage, deaths feeding `Battle`, BF1 aim assist, dev
+//! cheats. No wall-clock, no OS randomness: `SimRng` (SCE rand) + `GameLcg`
+//! (inline gameplay LCG) are the only entropy, both seeded from the log.
+//!
+//! Tick order (one `step`): 0a the spawn screen's class choice → 0 respawns
+//! (member timer, spawn wave, alive-AI cap) → 0b squad commands (Phase D) →
+//! 1 the commander (Phase B) → 1b controllers → per-unit pads → 1c the use
+//! input (enter / exit, VSEAT) → 2 player aim assist → 3 soldier movement (a human's zoom press first, card ZOOM; a
+//! rider's pad drives its vehicle instead; + 3a wall pass; 3a' the floor
+//! contact under the new feet; then the hovers and their riders; 3b unit
+//! separation; 3c environmental death: the kill floor, the death regions) → 4
+//! weapon cycles (a soldier's channels, switches and held weapons first, card
+//! GREN) → bolt spawns (predictive raycast) and throws → 5 bolt flight →
+//! impacts → damage/death → 5b the thrown grenades (fuse, flight, sweep,
+//! blast) → 5c the pickups (flight, life, the touch; card PWUP) → 6 command posts → bleed → domination → outcome → 7 the
+//! vehicle pads (follow, decay, spawn); tick++.
+//! Events for the tick are left in `events`.
+//!
+//! ## Where the code lives
+//!
+//! Split by queue SPL5 (2026-09-24, a pure move) into six parts, each
+//! re-exported here so every `crate::sim::X` path is unchanged: `state` (the
+//! `Sim` struct, its output types, the queries and `Sim::hash`), `input` (the
+//! pad, the input log, `Sim::run_log` and the aim assist), `spawn` (spawns,
+//! the class tables, the spawn screen, respawns and the spawn waves), `combat`
+//! (a bolt's impact and the environmental deaths), `round` (the command
+//! posts, the bleed and the outcome) and `step` (`Sim::step` and the unit
+//! separation); VENT added `vehicles` (the vehicle slots and the seat
+//! bookkeeping, `crate::vehicle`, and VPAD's pad tick) and VSEAT `seats`
+//! (the use input, the exit placement, the driver's pad). VDTH added `blast`
+//! (an explosion's area damage, `Sim::explode`); KFLR `bounds` (the playable
+//! level: the hub floors, the level test, the kill floor); GREN `ordnance` (the
+//! weapon channels, the throw and the grenades' tick); PWUP `pickups` (a death's
+//! drop, the item, the pickup). This file keeps only the test fixtures the parts' tests
+//! share.
+
+mod blast;
+mod bounds;
+mod combat;
+mod guns;
+mod input;
+mod ordnance;
+mod pickups;
+mod round;
+mod seats;
+mod spawn;
+mod state;
+mod step;
+mod vehicles;
+
+pub use blast::{soldier_blast_sphere, BLAST_GATHER_MAX};
+pub use bounds::{
+    Level, ReturnPath, BOUND_DROP, KILL_FLOOR_DROP, LEVEL_HUBS, LEVEL_RISE, UNDER_MAP_SPEED,
+};
+pub use guns::SeatLook;
+pub use input::{buttons, InputLog, PadState};
+pub use pickups::{
+    Buffs, DropTable, ItemClass, Pickup, BODY_AHEAD, BODY_RADIUS, DROP_HEIGHT, DROP_SIDE_SPEED,
+    ITEM_GRAVITY, ITEM_POOL_DEFAULT, LIFE_END, MAX_DROPS, TAKE_AGE,
+};
+pub use round::scale_reinforcements;
+pub use seats::{ENTER_REACH, EXIT_RING};
+pub use spawn::SpawnWaves;
+pub use state::{
+    omni_radius_for, Call, Cheats, DeathCause, Event, Hazard, NavStats, Sim, HAZARD_RADIUS,
+    LETHAL_LANDING_SPEED, OUTCOME_DRAW,
+};
+
+#[cfg(test)]
+mod tests {
+    //! The fixtures the parts' test modules share; each part's own tests
+    //! live beside its code, in that part's `mod tests`.
+    use crate::cp::CpDef;
+    use crate::heightfield::Heightfield;
+    use crate::sim::{buttons, PadState, Sim};
+    use crate::unit::{Controller, UnitHandle, UnitSpec};
+    use glam::Vec3;
+
+    /// Flat ground at y = 0 over ±2 km. A `Sim` with NO heightfield now floors
+    /// at [`crate::collision::NO_GROUND`] (−300) rather than 0, so the tests
+    /// that were written against the old 0-fallback say what they meant.
+    pub(super) fn flat_ground() -> Heightfield {
+        Heightfield {
+            size: 2,
+            unit: 4000.0,
+            offset_x: 2000.0,
+            offset_z: 2000.0,
+            heights: vec![0.0; 4],
+        }
+    }
+
+    /// Player at the origin facing -Z, target trooper 20 m ahead.
+    pub(super) fn duel() -> (Sim, UnitHandle, UnitHandle) {
+        let mut s = Sim::empty(7);
+        s.heightfield = Some(flat_ground());
+        let p = s.spawn(&UnitSpec::player(0, Vec3::ZERO)).unwrap();
+        let t = s
+            .spawn(&UnitSpec::trooper(1, Vec3::new(0.0, 0.0, -20.0)))
+            .unwrap();
+        (s, p, t)
+    }
+
+    pub(super) fn fire() -> PadState {
+        PadState {
+            buttons: buttons::FIRE,
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn sphere_cp(name: &str, pos: Vec3, r: f32, major: bool) -> CpDef {
+        let (capture_time, neutralize_time) = CpDef::class_times(major);
+        CpDef {
+            name: name.into(),
+            pos,
+            capture: crate::region::Region::sphere(pos, r),
+            control: None,
+            value_bleed: 10,
+            value_atk: [100, 100],
+            value_def: [100, 100],
+            spawn_nodes: vec![
+                (pos + Vec3::new(2.0, 0.0, 2.0), 0.0),
+                (pos - Vec3::X * 2.0, 0.0),
+            ],
+            capture_time,
+            neutralize_time,
+        }
+    }
+
+    pub(super) fn ai(team: u8, pos: Vec3, yaw: f32) -> UnitSpec {
+        UnitSpec {
+            controller: Controller::Ai,
+            yaw,
+            ..UnitSpec::trooper(team, pos)
+        }
+    }
+}

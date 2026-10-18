@@ -1,0 +1,49 @@
+---
+id: GRFG
+title: The ordnance census as a gate: gates.py runs ordnance_census with the leak group and compares its footer with a gates.toml [ordnance] row (new 0) - the builder was refused by the oracle guard, the planner commits it
+milestone: M0
+value: 5
+phase: build
+status: done
+deps:
+files: scripts/gates.py
+declares: oracle=baselines,guards
+needs:
+effort:
+branch: grfg
+resume: landed d21b4119 2026-10-16
+created: 2026-10-09
+---
+## Why
+Card GRFL landed the grenade fix, its test and the census (game/examples/ordnance_census.rs + ordnance_census_accepted.txt) on 296fa0c, but not the gate: the oracle guard refuses a builder's edit of the gate script and of the baseline file. Without the gate the 7,260 / new 0 footer is watched by nobody.
+
+## Evidence
+- engine/artifacts/lead_tmp/grfl/build/GATE_PROPOSAL.md: the g_ordnance function (never executed) and the [ordnance] row.
+- Measured on 296fa0c's tree, three runs byte-identical, 30 s on 16 threads under the 8 G cap: ordnance: maps 32  floors 389228  gaps 6500  runs 1556912  through 7260  accepted 7260  new 0. The parent's ray through the same binary: through 127017 accepted 13407 new 113610.
+
+## Acceptance
+- gates.py --groups leak on main prints an ordnance row PASS with that footer; with the sweep fix reverted in a scratch worktree the row is FAIL (new 113610).
+- land.py's row readers take the new row name (a dry run).
+- Optional: trace the 45 SO runs of the accepted list (a body with an ordnance layer crossed; 11 on dag1_prop_grandtree_2, 6 on uta1_bldg_lizardpen) and remove their lines.
+
+- 2026-10-09 12:45 planner. **Waits on the maintainer with BSPN (STATUS question 33).** `oracle=baselines,guards` on this card is never read: the guard and the protect gate read `git show HEAD:<card>` and no card is in git. A planner is exempt from the hook but a planner does not build, and a build session's branch that edits `scripts/gates.py` fails the protect gate for the same reason. The proposal stays at `lead_tmp/grfl/build/GATE_PROPOSAL.md`. Undo: `loopctl.py set GRFG needs=`.
+
+## Note (cleanse 14, 2026-10-09) - land.py's fidelity re-baseline is wider than the declaration
+For the planner, with this card's gate wiring (same files, same channel). `scripts/land.py` `rebaseline()` reads the card's
+`fidelity=` tokens and calls `gates.fidelity_rebaseline(only=...)` with `only = None` when any token is `all` or starts with
+`@`, else the set of metric names. So `fidelity=still_pct@bf1_kam1` rewrites still_pct's baseline on all 32 maps and the
+aggregate, and `fidelity=@bf1_bes1` rewrites EVERY metric on every map - including each value that got worse inside its
+tolerance on maps the card never named. Two such landings can each lose 0.9 of a tolerance and no gate row ever says so.
+Read in the code (land.py:519-529, gates.py `fidelity_rebaseline`), not yet seen in a landing: no declaration is readable
+until STATUS question 33 is settled. Proposed: re-baseline only the declared (metric, map) values plus the ones that got
+better; add the case to `gates.py --selftest-fidelity`.
+
+## Planner 2026-10-12 11:10
+- **value 3 -> 4.** the maintainer approved this card by name on 2026-10-11 and `[approvals.GRFG] oracle = "baselines,guards"` stays open in gates.toml until it lands (the scoreboard's debt list); at 3 it would not be picked for weeks. One session. When it is done the planner removes the approval block. Undo: `loopctl.py set GRFG value=3`.
+
+- Planner 2026-10-12 19:35: value 4 -> 5. The maintainer's approval of 2026-10-11 has stood unused for 10 landings (BSPN ...
+  CLSE4) - the debt rule sends that to STATUS (question 41). At 5 the dry run gives it to lane 2 after TGAP.
+  Undo: `loopctl.py set GRFG value=4`.
+
+## Outcome (2026-10-16 03:09, lane 1, LANDED d21b411)
+g_ordnance in gates.py (runs with the leak group, FAIL unless the footer ends `new 0`), gates.toml [ordnance] footer from main d1def96. Acceptance: branch PASS (new 0); main with GRFL's fix reverted FAIL (new 112300); land.undeclared dry run PASS -> ignored, FAIL -> refuses. Planner: remove [approvals.GRFG]. Report reports/20261016_0309_card_GRFG.md.

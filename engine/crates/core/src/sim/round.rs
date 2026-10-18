@@ -1,0 +1,358 @@
+//! The command posts and how the round ends: [`Sim::add_cp`] registers a
+//! post, and `update_cps` — step 6 — counts each post's occupants, applies
+//! the conquest bleed and D12's Elite team handicap, sheds the AI the bleed
+//! takes, and decides the outcome (a team at 0 tickets, domination, or the
+//! time limit). The capture, defeat, handicap and time-limit tests live here.
+
+use super::state::{Event, Sim, OUTCOME_DRAW};
+use crate::cp::{self, CommandPost, CpChange, CpDef};
+use crate::TICK_HZ;
+
+/// The Instant Action reinforcement option (`con_mult`, 10..500 %, default
+/// 100) applied to one team's authored count: BF2's `SetReinforcementCount`
+/// scales each team's OWN count in integers, `count * pct / 100`
+/// (`analysis/re-time-limit.md` §5 [V][O], decomp 32452).
+pub fn scale_reinforcements(count: u32, pct: u32) -> u32 {
+    (u64::from(count) * u64::from(pct) / 100) as u32
+}
+
+impl Sim {
+    /// Register a command post with its starting owner (0-based team, None =
+    /// neutral). Returns its index.
+    pub fn add_cp(&mut self, def: CpDef, owner: Option<u8>) -> usize {
+        let mut cp = CommandPost::new(def, owner);
+        // Resolve the post's planning hub once: `locate` is O(hubs + arcs) and
+        // a capture centre never moves. Requires `nav` to be set first —
+        // `WalkSim::with_teams` does that before `setup_conquest`.
+        cp.nav_hub = self
+            .nav
+            .as_ref()
+            .and_then(|g| g.hub_for(cp.def.capture.center, crate::nav::Mover::SOLDIER));
+        self.cps.push(cp);
+        // The playable level is walked from the posts (`sim/bounds.rs`).
+        self.resolve_nav_floors();
+        self.resolve_spawn_seats();
+        self.cps.len() - 1
+    }
+
+    /// D12's team handicap: at Elite, a team that HAS a human whose
+    /// opponent has none bleeds `bleed_handicap` times faster. A host option
+    /// (`team_handicap_on`), inert when both sides have a human or neither.
+    ///
+    /// OURS, PROVISIONAL — the PS2 has no such lever
+    /// (`analysis/re-ai-difficulty.md` §9.2); BF2's ±4 rubber band and a
+    /// per-team `SetAIDifficulty` delta are deliberately NOT built (design:
+    /// symmetric competence). The "reinforcement bias" the design names has
+    /// no number and is an open lead decision.
+    ///
+    /// Must run AFTER [`cp::apply_bleed`] (which OVERWRITES `bleed_per_sec`)
+    /// and before [`Battle::tick_bleed`] spends it. Dead units keep their
+    /// team, so the test is `is_player` over `units`, not `alive_players`.
+    fn apply_team_handicap(&mut self) {
+        if !self.team_handicap_on {
+            return;
+        }
+        let mult = self.difficulty.tier().bleed_handicap;
+        if mult == 1.0 {
+            return;
+        }
+        let teams = self.battle.teams.len();
+        let mut has_human = vec![false; teams];
+        for u in &self.units {
+            if u.is_player && (u.team as usize) < teams {
+                has_human[u.team as usize] = true;
+            }
+        }
+        // Two-team rule (the sim's `battle` is two teams; `cp::apply_bleed`
+        // is the same shape): the opponent of team t is 1 - t.
+        for t in 0..teams.min(2) {
+            if has_human[t] && !has_human[1 - t] {
+                self.battle.teams[t].bleed_per_sec *= mult;
+            }
+        }
+    }
+
+    /// Whether unit `ui` counts for post `ci`'s capture now: an alive
+    /// CapturePosts soldier of a battle team on foot, tested as a POINT at the
+    /// entity origin (report §4). The capture tick's rule; the HUD's capture
+    /// icon (card CPBAR) asks the same. A rider (a vehicle's or a turret's
+    /// seat) is not in the PS2's scan (card WCREW: in BF1 RAM, 73 of 73 post
+    /// rows with a seated soldier in the region count only those on foot;
+    /// BF2 not sampled).
+    pub fn counts_in_cp(&self, ui: usize, ci: usize) -> bool {
+        let u = &self.units[ui];
+        u.alive
+            && u.capture_posts
+            && u.mount.is_none()
+            && (u.team as usize) < self.battle.teams.len()
+            && self.cps[ci].def.capture.contains(u.soldier.pos)
+    }
+
+    /// Per team, the units that count inside post `ci`'s capture region
+    /// ([`Self::counts_in_cp`]): what [`CommandPost::update`] is fed.
+    pub fn cp_inside(&self, ci: usize) -> Vec<u32> {
+        let mut inside = vec![0u32; self.battle.teams.len()];
+        for k in 0..self.units.len() {
+            if self.counts_in_cp(k, ci) {
+                inside[self.units[k].team as usize] += 1;
+            }
+        }
+        inside
+    }
+
+    pub(super) fn update_cps(&mut self, dt: f32) {
+        if self.cps.is_empty() {
+            return;
+        }
+        let teams = self.battle.teams.len();
+        for ci in 0..self.cps.len() {
+            let inside = self.cp_inside(ci);
+            match self.cps[ci].update(dt, &inside) {
+                CpChange::None => {}
+                CpChange::Saved { team } => self.events.push(Event::Saved {
+                    cp: ci as u32,
+                    team,
+                }),
+                CpChange::Captured { by } => self.events.push(Event::Captured {
+                    cp: ci as u32,
+                    team: by,
+                }),
+                CpChange::Neutralized { by } => {
+                    self.events.push(Event::Neutralized { cp: ci as u32, by })
+                }
+            }
+        }
+        // BF2 conquest bleed (strict CP-value majority, clamped at alive).
+        cp::apply_bleed(&mut self.battle, &self.cps);
+        self.apply_team_handicap();
+        let shed = self.battle.tick_bleed(dt);
+        for (t, &n) in shed.iter().enumerate() {
+            if n > 0 {
+                self.shed_ai(t as u8, n);
+            }
+        }
+        if self.outcome.is_none() {
+            // BF2 Objective.lua OnTicketCountChange: count <= 0 → MissionDefeat.
+            for t in 0..teams {
+                if self.battle.teams[t].tickets() == 0 {
+                    self.outcome = Some(if t == 0 { 1 } else { 0 });
+                    self.events.push(Event::TeamDefeated { team: t as u8 });
+                }
+            }
+            if let Some(loser) = cp::tick_domination(&self.cps, &mut self.domination, dt, 2) {
+                if self.outcome.is_none() {
+                    self.outcome = Some(if loser == 0 { 1 } else { 0 });
+                    self.events.push(Event::TeamDefeated { team: loser });
+                }
+            }
+            self.check_time_limit();
+        }
+    }
+
+    /// The conquest time limit (queue TLO): once `time_limit` seconds of sim
+    /// clock have run — this is the step that makes `tick` reach
+    /// `limit × TICK_HZ` — BF2's `ObjectiveConquest:GameOptionsTimeLimitUp`
+    /// gives the round to the team with MORE reinforcements, and equal counts
+    /// to both ([`OUTCOME_DRAW`]) (`analysis/re-time-limit.md` §1 hop 9
+    /// [V][O]). Runs after the 0-ticket and domination rules, only while the
+    /// round is undecided; Off (`None`) never ends a round.
+    fn check_time_limit(&mut self) {
+        let Some(limit) = self.time_limit else {
+            return;
+        };
+        if self.outcome.is_some() || self.tick + 1 < u64::from(limit) * u64::from(TICK_HZ) {
+            return;
+        }
+        let t = [
+            self.battle.teams[0].tickets(),
+            self.battle.teams[1].tickets(),
+        ];
+        let winner = match t[0].cmp(&t[1]) {
+            std::cmp::Ordering::Greater => 0,
+            std::cmp::Ordering::Less => 1,
+            std::cmp::Ordering::Equal => OUTCOME_DRAW,
+        };
+        self.outcome = Some(winner);
+        self.events.push(Event::TimeUp { winner });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::battle::Battle;
+    use crate::sim::tests::{ai, fire, flat_ground, sphere_cp};
+    use crate::sim::PadState;
+    use crate::skill::Difficulty;
+    use crate::unit::{Controller, UnitSpec};
+    use glam::Vec3;
+
+    /// An AI walks to the nearest non-friendly post and captures it.
+    #[test]
+    fn ai_walks_to_neutral_cp_and_captures_it() {
+        let mut s = Sim::empty(3);
+        s.heightfield = Some(flat_ground());
+        s.add_cp(
+            sphere_cp("cp1", Vec3::new(0.0, 0.0, -40.0), 8.0, false),
+            None,
+        );
+        let h = s.spawn(&ai(0, Vec3::ZERO, 1.0)).unwrap(); // facing off-axis
+        let mut captured_tick = None;
+        for _ in 0..(30 * 30) {
+            s.step(&[PadState::default()]);
+            if s.events
+                .iter()
+                .any(|e| matches!(e, Event::Captured { team: 0, .. }))
+            {
+                captured_tick = Some(s.tick);
+                break;
+            }
+        }
+        let t = captured_tick.expect("captured within 30 s") as f32 / 30.0;
+        // ~32 m walk at 9 m/s (+turn) ≈ 4-5 s, then CaptureTime 10 s.
+        assert!(t > 13.0 && t < 20.0, "captured at {t} s");
+        assert_eq!(s.cps[0].owner, Some(0));
+        let u = s.unit(h).unwrap();
+        assert!(s.cps[0].def.capture.contains(u.soldier.pos));
+        assert!(u.soldier.vel.length() < 0.5, "holds inside the post");
+        assert_eq!(s.spawn_points(0).len(), 2);
+        assert!(s.spawn_points(1).is_empty());
+    }
+
+    /// Card WCREW: a rider inside a post's region does not count (the PS2's
+    /// scan holds only soldiers on foot), so an enemy parked in a vehicle on
+    /// a neutral post neither contests it nor stops it being captured - BF1
+    /// Geonosis seed 3 never ended while an AT-TE's pilot sat in cp2.
+    #[test]
+    fn a_rider_in_a_post_neither_counts_nor_contests() {
+        use crate::vehicle::{SeatKind, VehicleKind, VehicleSpec};
+        use crate::weapon::HealthType;
+        let mut s = Sim::empty(5);
+        s.heightfield = Some(flat_ground());
+        s.add_cp(
+            sphere_cp("cp", Vec3::new(0.0, 0.0, -20.0), 8.0, false),
+            None,
+        );
+        let idle = |team, pos| UnitSpec {
+            controller: Controller::Idle,
+            ..UnitSpec::trooper(team, pos)
+        };
+        s.spawn(&idle(0, Vec3::new(2.0, 0.0, -20.0))).unwrap();
+        let rider = s.spawn(&idle(1, Vec3::new(-2.0, 0.0, -20.0))).unwrap();
+        let v = s.spawn_vehicle(&VehicleSpec {
+            kind: VehicleKind::Hover,
+            class: 0,
+            home_team: Some(1),
+            neutral_when_empty: false,
+            spawn_pad: None,
+            pos: Vec3::new(-2.0, 1.0, -20.0),
+            yaw: 0.0,
+            max_health: 900.0,
+            health_type: HealthType::Vehicle,
+            seats: vec![SeatKind::Pilot],
+        });
+        // On foot both count: the post is contested.
+        assert_eq!(s.cp_inside(0), vec![1, 1]);
+        assert!(s.seat_unit(rider, v, 0));
+        let u = s.unit(rider).unwrap();
+        assert!(
+            s.cps[0].def.capture.contains(u.soldier.pos),
+            "{:?}",
+            u.soldier.pos
+        );
+        assert_eq!(s.cp_inside(0), vec![1, 0], "the rider is not counted");
+        for _ in 0..(12 * 30) {
+            s.step(&[]);
+        }
+        assert_eq!(
+            s.cps[0].owner,
+            Some(0),
+            "team 0 captured it beside the rider"
+        );
+    }
+
+    /// BF2 rule: a team at 0 tickets is defeated at once; AI never respawn
+    /// past the pool (no-overspawn), and bleed shedding keeps the invariant.
+    #[test]
+    fn defeat_at_zero_tickets_and_no_overspawn() {
+        let mut s = Sim::empty(4);
+        s.battle = Battle::new([50, 1]);
+        s.add_cp(
+            sphere_cp("cp", Vec3::new(30.0, 0.0, -30.0), 8.0, false),
+            Some(1),
+        );
+        s.spawn(&UnitSpec::player(0, Vec3::ZERO)).unwrap();
+        s.spawn(&UnitSpec::trooper(1, Vec3::new(0.0, 0.0, -20.0)))
+            .unwrap();
+        // A second AI is refused: 1 alive == 1 ticket.
+        assert!(s
+            .spawn(&UnitSpec::trooper(1, Vec3::new(3.0, 0.0, -20.0)))
+            .is_none());
+        for _ in 0..90 {
+            s.step(&[fire()]);
+            if s.outcome.is_some() {
+                break;
+            }
+        }
+        assert_eq!(s.outcome, Some(0), "team 1 lost its last ticket");
+        assert!(s
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::TeamDefeated { team: 1 })));
+        assert_eq!(s.battle.teams[1].tickets(), 0);
+        for t in &s.battle.teams {
+            assert!(t.invariant_holds());
+        }
+    }
+
+    /// D12 (b): at Elite the team that HAS a human, facing a side that has
+    /// none, bleeds `bleed_handicap` times faster. Inert at Normal, inert
+    /// with no human anywhere, inert with the host option off.
+    #[test]
+    fn the_elite_team_handicap_bleeds_only_the_lone_humans_side() {
+        // One post, owned by team 1 → team 0 is the bleeding side, and team 0
+        // is where the human is put.
+        fn bleed(d: Difficulty, on: bool, human: bool) -> f32 {
+            let mut s = Sim::empty(4);
+            s.difficulty = d;
+            s.team_handicap_on = on;
+            s.battle = Battle::new([50, 50]);
+            s.add_cp(
+                sphere_cp("cp", Vec3::new(30.0, 0.0, -30.0), 8.0, false),
+                Some(1),
+            );
+            let spec = if human {
+                UnitSpec {
+                    controller: Controller::Idle,
+                    ..UnitSpec::player(0, Vec3::ZERO)
+                }
+            } else {
+                UnitSpec {
+                    controller: Controller::Idle,
+                    ..UnitSpec::trooper(0, Vec3::ZERO)
+                }
+            };
+            s.spawn(&spec).unwrap();
+            s.spawn(&UnitSpec {
+                controller: Controller::Idle,
+                ..UnitSpec::trooper(1, Vec3::new(0.0, 0.0, -20.0))
+            })
+            .unwrap();
+            s.step(&[PadState::default()]);
+            s.battle.teams[0].bleed_per_sec
+        }
+
+        let base = bleed(Difficulty::Normal, true, true);
+        assert!(base > 0.0, "team 0 bleeds at all: {base}");
+        let h = Difficulty::Elite.tier().bleed_handicap;
+        assert!((h - 1.25).abs() < 1e-6, "the tier's placeholder: {h}");
+        assert!(
+            (bleed(Difficulty::Elite, true, true) - base * h).abs() < 1e-6,
+            "{}",
+            bleed(Difficulty::Elite, true, true)
+        );
+        // Bots only on both sides, and the option off: the plain rate.
+        assert!((bleed(Difficulty::Elite, true, false) - base).abs() < 1e-6);
+        assert!((bleed(Difficulty::Elite, false, true) - base).abs() < 1e-6);
+    }
+}

@@ -1,0 +1,8 @@
+# cargo-nextest settings (card TSTX). `ci.sh` runs the `ci` profile.
+[profile.ci]
+# Run every test even after a failure, so one report lists them all (as `cargo test --no-fail-fast` would).
+fail-fast = false
+# Print a SLOW line for a test past 60 s; nothing is killed.
+slow-timeout = { period = "60s" }
+# Failures are printed at the end as well as where they happen, so the tail of ci.txt shows them.
+failure-output = "immediate-final"

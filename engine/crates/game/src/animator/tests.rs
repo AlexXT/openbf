@@ -1,0 +1,884 @@
+//! The two-layer animator on a synthetic rig: every clip writes its own
+//! number into the bones it has a track for, so a pose says which clip each
+//! bone was sampled from.
+
+use super::*;
+use crate::skin::BoneXform;
+use glam::{Mat4, Quat, Vec3};
+use manifest::anim_sets::{Bf1Sets, Bf2Animation, Bf2Layer, Bf2Sets, SetClip};
+use std::collections::BTreeMap;
+
+const LEG: usize = 2;
+const ARM: usize = 4;
+const BONES: [&str; 5] = [
+    "DummyRoot",
+    "bone_pelvis",
+    "bone_l_thigh",
+    "bone_ribcage",
+    "bone_r_forearm",
+];
+// Clip numbers.
+const IDLE: usize = 0;
+const RUN: usize = 1;
+const SHOOT: usize = 2;
+const BAZOOKA_RUN: usize = 3;
+const RELOAD: usize = 4;
+const WALK: usize = 5;
+const SHOOT_LEGS: usize = 6;
+const ALERT: usize = 7;
+const TURN: usize = 8;
+
+fn skel() -> Skeleton {
+    Skeleton::new(
+        BONES.iter().map(|b| (*b).to_string()).collect(),
+        vec![None, Some(0), Some(1), Some(1), Some(3)],
+        vec![Mat4::IDENTITY; 5],
+    )
+}
+
+/// A clip whose tracked bones sit at x = 100 * (number + 1) + frame.
+fn clip(k: usize, name: &str, frames: usize, upper_only: bool) -> Clip {
+    let track = |_| {
+        Some(
+            (0..frames)
+                .map(|f| BoneXform {
+                    rotation: Quat::IDENTITY,
+                    translation: Vec3::new(100.0 * (k + 1) as f32 + f as f32, 0.0, 0.0),
+                })
+                .collect(),
+        )
+    };
+    Clip {
+        name: name.into(),
+        fps: 30.0,
+        frames,
+        tracks: (0..5)
+            .map(|b| if upper_only && b < 3 { None } else { track(b) })
+            .collect(),
+    }
+}
+
+fn clips() -> Vec<Clip> {
+    vec![
+        clip(IDLE, "idle", 31, false),
+        clip(RUN, "run", 19, false),
+        clip(SHOOT, "shoot", 7, true),
+        clip(BAZOOKA_RUN, "bazooka_run", 19, true),
+        clip(RELOAD, "reload", 31, true),
+        clip(WALK, "walk", 19, false),
+        clip(SHOOT_LEGS, "shoot_legs", 7, false),
+        clip(ALERT, "alert_idle", 31, false),
+        clip(TURN, "turn", 15, false),
+    ]
+}
+
+fn set_clips(blend: f32) -> Vec<SetClip> {
+    clips()
+        .iter()
+        .enumerate()
+        .map(|(k, c)| SetClip {
+            name: c.name.clone(),
+            frames: c.frames as u32,
+            looping: Some(matches!(k, IDLE | RUN | BAZOOKA_RUN | WALK | ALERT)),
+            blend: Some(if k == SHOOT { 0.01 } else { blend }),
+        })
+        .collect()
+}
+
+fn masks() -> (Vec<String>, Vec<String>) {
+    let n = |r: std::ops::Range<usize>| BONES[r].iter().map(|b| (*b).to_string()).collect();
+    (n(3..5), n(0..3))
+}
+
+/// BF1 tables: rifle (set 0) and bazooka (set 1, its own run).
+fn rig_bf1() -> Rig {
+    let i = |k: usize| Some(k as u16);
+    let mut base = vec![vec![None; 13]; 3];
+    (base[0][0], base[0][5], base[0][7]) = (i(IDLE), i(WALK), i(RUN));
+    (base[0][3], base[0][4]) = (i(TURN), i(TURN));
+    let mut w = vec![vec![vec![None; 13]; 9]; 3];
+    w[0][0] = base[0].clone();
+    w[0][1] = base[0].clone();
+    w[0][1][7] = i(BAZOOKA_RUN);
+    let mut u = vec![vec![vec![None; 6]; 9]; 3];
+    for row in u[0].iter_mut().take(2) {
+        (row[1], row[5]) = (i(SHOOT), i(RELOAD));
+    }
+    let (upper_bones, lower_bones) = masks();
+    let sets = SoldierSets {
+        game: "bf1".into(),
+        upper_bones,
+        lower_bones,
+        clips: set_clips(0.15),
+        bf1: Some(Bf1Sets {
+            weapons: bf1::WEAPONS.iter().map(|w| (*w).to_string()).collect(),
+            base,
+            special: vec![None; 31],
+            w,
+            alert: vec![vec![None; 13]; 9],
+            u,
+            s: vec![vec![None; 31]; 9],
+        }),
+        ..Default::default()
+    };
+    Rig::new(sets, &skel(), &clips())
+}
+
+/// BF2: one family, class rifle; shoot has a lower slot of its own.
+fn rig_bf2() -> Rig {
+    let mut slots = vec![None; 2 * bf2::PAIRS];
+    let mut put = |pair: usize, up: usize, low: usize| {
+        (slots[2 * pair], slots[2 * pair + 1]) = (Some(up as u16), Some(low as u16));
+    };
+    put(bf2::move_pair(0, 0), IDLE, IDLE);
+    put(bf2::move_pair(0, 5), WALK, WALK);
+    put(bf2::move_pair(0, 6), RUN, RUN);
+    put(bf2::move_pair(0, 3), IDLE, TURN);
+    put(bf2::move_pair(0, 4), IDLE, TURN);
+    put(bf2::action_pair(0, 0), SHOOT, SHOOT_LEGS);
+    put(bf2::action_pair(0, 5), RELOAD, SHOOT_LEGS);
+    let layer = |looping: bool, t: f32| {
+        Some(Bf2Layer {
+            looping,
+            blend_in: t,
+            blend_out: t,
+            ..Default::default()
+        })
+    };
+    let bf2_animations = (0..bf2::PAIRS)
+        .map(|p| {
+            let act = p >= bf2::action_pair(0, 0);
+            Bf2Animation {
+                name: bf2::base_name(p),
+                upper: layer(!act, if act { 0.02 } else { 0.25 }),
+                lower: layer(!act, if act { 0.5 } else { 0.2 }),
+            }
+        })
+        .collect();
+    let (upper_bones, mut lower_bones) = masks();
+    lower_bones.remove(0); // DummyRoot is in neither (§6.4)
+    let sets = SoldierSets {
+        game: "bf2".into(),
+        upper_bones,
+        lower_bones,
+        clips: set_clips(0.15),
+        bf2: vec![Bf2Sets {
+            family: "human".into(),
+            sets: BTreeMap::from([("rifle".to_string(), slots)]),
+        }],
+        bf2_animations,
+        ..Default::default()
+    };
+    Rig::new(sets, &skel(), &clips())
+}
+
+fn input(speed: f32) -> AnimInput {
+    AnimInput {
+        stance: Stance::Stand,
+        vel: glam::Vec2::new(0.0, speed),
+        yaw: 0.0,
+        max_speed: 7.0,
+        dead: false,
+        set: 0,
+        fired: false,
+        reloading: false,
+        reload_time: 0.0,
+        alert: false,
+        aim: (0.0, 0.0),
+    }
+}
+
+const DT: f32 = 1.0 / 60.0;
+
+struct Run {
+    rig: Rig,
+    clips: Vec<Clip>,
+    skel: Skeleton,
+    a: Animator,
+}
+
+impl Run {
+    fn new(rig: Rig) -> Self {
+        Self {
+            rig,
+            clips: clips(),
+            skel: skel(),
+            a: Animator::new(),
+        }
+    }
+
+    fn steps(&mut self, i: &AnimInput, n: usize) {
+        for _ in 0..n {
+            self.a.step(&self.rig, &self.clips, &self.skel, i, DT);
+        }
+    }
+
+    fn shoot(&mut self, i: &AnimInput) {
+        let mut f = *i;
+        f.fired = true;
+        self.steps(&f, 1);
+    }
+
+    /// The clip number a bone's pose was sampled from.
+    fn clip_of(&self, bone: usize) -> usize {
+        let x = self.a.pose(&self.skel).0[bone].translation.x;
+        (x / 100.0).floor() as usize - 1
+    }
+}
+
+#[test]
+fn stance_table() {
+    let at = |stance| {
+        let mut i = input(3.0);
+        i.stance = stance;
+        stance_of(&i, Game::Bf1)
+    };
+    assert_eq!(at(Stance::Stand), Ok(0));
+    assert_eq!(at(Stance::Crouch), Ok(1));
+    assert_eq!(at(Stance::Prone), Ok(2));
+    assert_eq!(at(Stance::Sprint), Ok(0));
+    assert_eq!(at(Stance::Roll), Err(Special::Roll));
+    assert_eq!(at(Stance::Jump), Err(Special::Jump));
+    let mut d = input(5.0);
+    d.dead = true;
+    assert_eq!(stance_of(&d, Game::Bf1), Err(Special::Dead));
+    // BF2 sprints on its own pair; BF1 on the run clip.
+    let mut s = input(8.0);
+    s.stance = Stance::Sprint;
+    assert_eq!(stance_of(&s, Game::Bf2), Err(Special::Sprint));
+    let mut r = Run::new(rig_bf1());
+    r.steps(
+        &AnimInput {
+            vel: glam::Vec2::new(0.0, 3.0),
+            ..s
+        },
+        10,
+    );
+    assert_eq!(r.a.body(), Some(Body::Feet(0, Move::RunForward)));
+}
+
+#[test]
+fn a_shot_on_the_run_keeps_the_legs_running() {
+    for rig in [rig_bf1(), rig_bf2()] {
+        let mut r = Run::new(rig);
+        let run = input(6.5);
+        r.steps(&run, 30);
+        assert_eq!((r.clip_of(LEG), r.clip_of(ARM)), (RUN, RUN));
+        r.shoot(&run);
+        r.steps(&run, 2);
+        // One pose: the leg from the run clip, the arm from the shoot clip.
+        assert_eq!((r.clip_of(LEG), r.clip_of(ARM)), (RUN, SHOOT));
+        assert_eq!(r.a.lower_clip(), Some(RUN));
+        assert_eq!(r.a.action(), Some((ActionKind::Shoot, false)));
+    }
+}
+
+#[test]
+fn a_shot_standing_takes_the_legs_too() {
+    // BF1: the same clip on both players.
+    let mut r = Run::new(rig_bf1());
+    r.steps(&input(0.0), 30);
+    r.shoot(&input(0.0));
+    assert_eq!(
+        (r.a.upper_clip(), r.a.lower_clip()),
+        (Some(SHOOT), Some(SHOOT))
+    );
+    assert_eq!(r.clip_of(ARM), SHOOT);
+    // BF2: the action's lower slot, crossfaded over its 0.5 s.
+    let mut r = Run::new(rig_bf2());
+    r.steps(&input(0.0), 30);
+    r.shoot(&input(0.0));
+    assert_eq!(
+        (r.a.upper_clip(), r.a.lower_clip()),
+        (Some(SHOOT), Some(SHOOT_LEGS))
+    );
+    r.steps(&input(0.0), 2);
+    let x = r.a.pose(&r.skel).0[LEG].translation.x;
+    assert!(x > 131.0 && x < 700.0, "the legs are on their way: {x}");
+    // Once he moves the legs leave the action, and do not rejoin it.
+    r.steps(&input(6.5), 1);
+    assert_eq!(r.a.action(), Some((ActionKind::Shoot, false)));
+    r.steps(&input(0.0), 1);
+    assert_eq!(r.a.lower_clip(), Some(IDLE));
+}
+
+#[test]
+fn the_action_ends_with_its_clip_and_a_second_shot_restarts_it() {
+    for rig in [rig_bf1(), rig_bf2()] {
+        let bf2 = rig.game == Game::Bf2;
+        let mut r = Run::new(rig);
+        let run = input(6.5);
+        r.steps(&run, 10);
+        r.shoot(&run);
+        // 7 frames at 30 a second: 14 updates (BF2: 6 intervals, 12).
+        let n = if bf2 { 12 } else { 14 };
+        r.steps(&run, n - 4);
+        assert!(r.a.action().is_some(), "still shooting");
+        let late = r.a.upper.t;
+        r.shoot(&run);
+        assert!(r.a.upper.t < late, "restarted: {} < {late}", r.a.upper.t);
+        r.steps(&run, n - 2);
+        assert!(r.a.action().is_some(), "the second shot's clip is running");
+        r.steps(&run, 3);
+        assert_eq!(r.a.action(), None);
+        assert_eq!(r.a.upper_clip(), Some(RUN));
+        r.steps(&run, 30);
+        assert_eq!((r.clip_of(LEG), r.clip_of(ARM)), (RUN, RUN));
+    }
+}
+
+#[test]
+fn the_weapon_in_hand_picks_the_upper_clip() {
+    let rig = rig_bf1();
+    assert_eq!(rig.weapon_set("", "bazooka"), 1);
+    assert_eq!(rig.weapon_set("", "lightsabre"), 5);
+    assert_eq!(rig.weapon_set("", "no_such"), 0);
+    let mut r = Run::new(rig);
+    let mut run = input(6.5);
+    run.set = 1;
+    r.steps(&run, 30);
+    assert_eq!((r.clip_of(LEG), r.clip_of(ARM)), (RUN, BAZOOKA_RUN));
+    // The upper clip started at the legs' phase and keeps it.
+    assert!((r.a.upper.t - r.a.lower.t).abs() < 1e-4);
+    // A gait the set has no clip for takes the other one of its direction
+    // (BF2 ships no stand_walkbackward): here backward has neither -> idle.
+    let (_, low) = r
+        .rig
+        .body_slots(0, Body::Feet(0, Move::WalkBackward), false);
+    assert_eq!(low.map(|s| s.clip), Some(IDLE));
+    let mut t = r.rig.clone();
+    t.sets.bf1.as_mut().unwrap().base[0][8] = Some(RUN as u16);
+    let (_, low) = t.body_slots(0, Body::Feet(0, Move::WalkBackward), false);
+    assert_eq!(low.map(|s| s.clip), Some(RUN));
+    // BF2: the text after the underscore names the class; no match = rifle.
+    let rig = rig_bf2();
+    assert_eq!(rig.weapon_set("human", "human_rifle"), 0);
+    assert_eq!(rig.weapon_set("wookie", "bazooka"), 0);
+    assert_eq!(rig.set_name(0), "human_rifle");
+}
+
+#[test]
+fn a_reload_starts_once_and_bf2_fits_it_to_the_weapon() {
+    let mut r = Run::new(rig_bf2());
+    let mut i = input(6.5);
+    (i.reloading, i.reload_time) = (true, 2.0);
+    r.steps(&i, 60);
+    // 31 frames = 1.0 s of clip over a 2.0 s reload: half way after 1 s.
+    assert_eq!(r.a.action(), Some((ActionKind::Reload, false)));
+    assert!((r.a.upper.t - 0.5).abs() < 0.03, "{}", r.a.upper.t);
+    r.steps(&i, 65);
+    assert_eq!(r.a.action(), None, "ended with its clip, not restarted");
+    assert_eq!((r.clip_of(LEG), r.a.upper_clip()), (RUN, Some(RUN)));
+}
+
+#[test]
+fn bf2_crossfades_linearly_and_bf1_pulls_the_kept_pose() {
+    // BF2 idle -> run on the legs: T = min(in 0.2, out 0.2); half way at 0.1 s.
+    let mut r = Run::new(rig_bf2());
+    r.steps(&input(0.0), 1);
+    let from = r.a.pose(&r.skel).0[LEG].translation.x;
+    r.steps(&input(6.5), 6);
+    let (x, to) = (r.a.pose(&r.skel).0[LEG].translation.x, 200.0);
+    let k = (x - from) / (to - from);
+    assert!((k - 0.5).abs() < 0.06, "linear: {k} at T / 2");
+    r.steps(&input(6.5), 7);
+    assert_eq!(r.clip_of(LEG), RUN);
+    // BF1: a pull by t / T each update is past a linear fade's half at T / 2.
+    let mut r = Run::new(rig_bf1());
+    r.steps(&input(0.0), 1);
+    let from = r.a.pose(&r.skel).0[LEG].translation.x;
+    r.steps(&input(6.5), 5);
+    let k = (r.a.pose(&r.skel).0[LEG].translation.x - from) / (200.0 - from);
+    assert!(k > 0.6 && k < 1.0, "pulled: {k}");
+    r.steps(&input(6.5), 5);
+    assert_eq!(r.clip_of(LEG), RUN);
+}
+
+#[test]
+fn bf1_pull_is_the_same_at_any_frame_rate() {
+    let pose_after = |dt: f32, n: usize| {
+        let mut r = Run::new(rig_bf1());
+        r.steps(&input(0.0), 1);
+        // A non-looping target so the sampled frame does not matter: reload
+        // on a standing soldier, read on the arm.
+        let mut i = input(0.0);
+        i.reloading = true;
+        for _ in 0..n {
+            r.a.step(&r.rig, &r.clips, &r.skel, &i, dt);
+        }
+        (r.a.pose(&r.skel).0[ARM].translation.x - 100.0) / 400.0
+    };
+    let (a, b) = (pose_after(1.0 / 60.0, 4), pose_after(1.0 / 120.0, 8));
+    assert!((a - b).abs() < 0.05, "60 Hz {a} against 120 Hz {b}");
+}
+
+#[test]
+fn playback_rate_per_game_and_loop_wrap() {
+    // BF1: a 19-frame loop takes 19/30 s; after 18/30 s t = 18/19.
+    let mut r = Run::new(rig_bf1());
+    let run = input(6.5);
+    for _ in 0..18 {
+        r.a.step(&r.rig, &r.clips, &r.skel, &run, 1.0 / 30.0);
+    }
+    assert!((r.a.lower.t - 18.0 / 19.0).abs() < 1e-4, "{}", r.a.lower.t);
+    r.a.step(&r.rig, &r.clips, &r.skel, &run, 1.0 / 30.0);
+    assert!(r.a.lower.t < 1e-3 || r.a.lower.t > 0.999, "wrapped");
+    // BF2: exactly 30 fps over F-1 intervals.
+    let mut r = Run::new(rig_bf2());
+    for _ in 0..9 {
+        r.a.step(&r.rig, &r.clips, &r.skel, &run, 1.0 / 30.0);
+    }
+    assert!((r.a.lower.t - 0.5).abs() < 1e-4);
+    assert_eq!(find_clip(&r.clips, "reload"), Some(RELOAD));
+}
+
+#[test]
+fn bf1_alert_plays_the_alert_row_until_the_timer_runs_out() {
+    let mut rig = rig_bf1();
+    let t = rig.sets.bf1.as_mut().unwrap();
+    // The rifle's alert idle; the bazooka's row is the rifle's (the bake's
+    // fallback), the tool's too - but the tool set takes no alert.
+    for w in [0, 1, 4] {
+        t.alert[w][0] = Some(ALERT as u16);
+    }
+    t.w[0][4] = t.base[0].clone();
+    let mut r = Run::new(rig);
+    let mut i = input(0.0);
+    r.steps(&i, 30);
+    assert_eq!((r.clip_of(LEG), r.clip_of(ARM)), (IDLE, IDLE));
+    i.alert = true;
+    r.steps(&i, 60);
+    assert!(r.a.aim().alert());
+    assert_eq!(
+        (r.a.lower_clip(), r.a.upper_clip()),
+        (Some(ALERT), Some(ALERT))
+    );
+    assert_eq!((r.clip_of(LEG), r.clip_of(ARM)), (ALERT, ALERT));
+    // Running: the row has no run clip, the plain one plays.
+    r.steps(
+        &AnimInput {
+            vel: glam::Vec2::new(0.0, 6.5),
+            ..i
+        },
+        30,
+    );
+    assert_eq!((r.a.lower_clip(), r.a.upper_clip()), (Some(RUN), Some(RUN)));
+    // The reason gone: 2.0 s more of it, then the plain idle.
+    i.alert = false;
+    r.steps(&i, 110);
+    assert_eq!(r.a.upper_clip(), Some(ALERT));
+    r.steps(&i, 20);
+    assert_eq!(
+        (r.a.lower_clip(), r.a.upper_clip()),
+        (Some(IDLE), Some(IDLE))
+    );
+    // A shot alone makes him alert.
+    r.shoot(&i);
+    r.steps(&i, 30);
+    assert_eq!(r.a.upper_clip(), Some(ALERT));
+    // The tool in hand: never.
+    let mut tool = Run::new(r.rig.clone());
+    i.alert = true;
+    i.set = 4;
+    tool.steps(&i, 60);
+    assert!(!tool.a.aim().alert());
+    assert_eq!(tool.a.upper_clip(), Some(IDLE));
+}
+
+#[test]
+fn bf2_alert_plays_the_alert_block_and_its_clip_aims_the_torso() {
+    let mut rig = rig_bf2();
+    let (plain, alert) = (bf2::move_pair(0, 0), bf2::move_pair(3, 0));
+    let slots = rig.sets.bf2[0].sets.get_mut("rifle").unwrap();
+    (slots[2 * alert], slots[2 * alert + 1]) = (Some(ALERT as u16), Some(ALERT as u16));
+    for (p, aim) in [(plain, "Head"), (alert, "Torso")] {
+        rig.sets.bf2_animations[p].upper.as_mut().unwrap().aim = aim.into();
+    }
+    let mut r = Run::new(rig);
+    let mut i = input(0.0);
+    i.aim = (0.0, 0.5);
+    r.steps(&i, 30);
+    assert_eq!(r.a.upper_clip(), Some(IDLE));
+    assert_eq!(r.a.aim().weights(), (0.0, 1.0));
+    i.alert = true;
+    r.steps(&i, 30);
+    assert_eq!(
+        (r.a.lower_clip(), r.a.upper_clip()),
+        (Some(ALERT), Some(ALERT))
+    );
+    assert_eq!(r.a.aim().weights(), (1.0, 0.0));
+    i.alert = false;
+    r.steps(&i, 140);
+    assert_eq!(r.a.upper_clip(), Some(ALERT), "2.5 s of it");
+    r.steps(&i, 40);
+    assert_eq!(
+        (r.a.lower_clip(), r.a.upper_clip()),
+        (Some(IDLE), Some(IDLE))
+    );
+    assert_eq!(r.a.aim().weights(), (0.0, 1.0));
+}
+
+/// Card ROLLS: the travel angle is the velocity against the facing the body
+/// is DRAWN with (`soldier_vis`'s model turn), positive to his left - the
+/// PS2's row 0 - so a body turned by it dives head first along the velocity.
+#[test]
+fn travel_is_the_velocity_against_the_drawn_facing() {
+    for yaw in [0.0f32, 1.0, -2.5, 3.0] {
+        let model = Mat4::from_rotation_y(yaw + std::f32::consts::PI);
+        let (fwd, left) = (
+            model.transform_vector3(Vec3::Z),
+            model.transform_vector3(Vec3::X),
+        );
+        // The sim's own right (`Unit::aim_frame`) is the drawn left's opposite.
+        let right = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
+        assert!((right + left).length() < 1e-5, "{yaw}");
+        for (v, want) in [
+            (left, 90.0f32),
+            (-left, -90.0),
+            (fwd, 0.0),
+            (fwd + left, 45.0),
+            (fwd * 0.8 - left * 0.6, -36.87),
+        ] {
+            let vel = v.normalize() * 10.5 + Vec3::Y * 3.0;
+            let t = travel(vel, yaw).expect("moving");
+            assert!(
+                (t.to_degrees() - want).abs() < 0.01,
+                "yaw {yaw}: {} not {want}",
+                t.to_degrees()
+            );
+            // The dive's forward (+Z) turned by the travel, drawn: along the
+            // velocity.
+            let dive = model.transform_vector3(Quat::from_rotation_y(t) * Vec3::Z);
+            let flat = Vec3::new(vel.x, 0.0, vel.z).normalize();
+            assert!(
+                dive.dot(flat) > 0.9999,
+                "yaw {yaw} want {want}: dive {dive} vel {flat}"
+            );
+        }
+        assert_eq!(travel(left * 0.25 + Vec3::Y * 5.0, yaw), None);
+    }
+}
+
+fn roll(t: f32) -> AnimInput {
+    AnimInput {
+        stance: Stance::Roll,
+        vel: 10.5 * glam::Vec2::new(t.to_radians().sin(), t.to_radians().cos()),
+        ..input(10.5)
+    }
+}
+
+/// The root bone's yaw in the drawn pose (degrees, his left positive).
+fn root_yaw(r: &Run) -> f32 {
+    let q = r.a.pose(&r.skel).0[0].rotation;
+    let f = q * Vec3::Z;
+    f.x.atan2(f.z).to_degrees()
+}
+
+/// Card ROLLS: a roll turns `DummyRoot` toward its travel by the PS2's
+/// quarter of the rest an update (re-roll-picture 4.1: 76.0 is BF2's first
+/// update from a strafe twist of +71; from 0 it is 22.5), within 15 degrees
+/// from the 9th update and 2 at the 26th; a forward roll does not turn it.
+#[test]
+fn a_roll_turns_the_root_toward_its_travel() {
+    const STEP: f32 = 1.0 / 30.0;
+    for rig in [rig_bf1(), rig_bf2()] {
+        for want in [90.0f32, -90.0, 37.9, -37.5, 0.0] {
+            let mut r = Run::new(rig.clone());
+            r.steps(&input(0.0), 5);
+            for n in 1..=26 {
+                r.a.step(&r.rig, &r.clips, &r.skel, &roll(want), STEP);
+                let eased = want * (1.0 - 0.75f32.powi(n));
+                let tw = r.a.twist().to_degrees();
+                assert!(
+                    (tw - eased).abs() < 1e-3,
+                    "{:?} {want} update {n}: {tw} not {eased}",
+                    rig.game
+                );
+                assert!(
+                    (root_yaw(&r) - tw).abs() < 1e-3,
+                    "drawn {} twist {tw}",
+                    root_yaw(&r)
+                );
+                if n >= 9 {
+                    assert!((want - tw).abs() < 15.0, "{want} update {n}: {tw}");
+                }
+                if want == 0.0 {
+                    assert!(tw.abs() < 1e-6);
+                }
+            }
+            assert!((want - r.a.twist().to_degrees()).abs() < 2.0);
+            assert_eq!(r.a.roll().updates, 26);
+            // Up again: the same quarter back to 0, under 10 degrees in 0.5 s.
+            r.a.step(&r.rig, &r.clips, &r.skel, &input(3.0), STEP);
+            let gap = r.a.roll().ended.expect("the roll ended").to_degrees();
+            assert!(gap.abs() < 0.1, "{gap}");
+            for _ in 1..15 {
+                r.a.step(&r.rig, &r.clips, &r.skel, &input(3.0), STEP);
+            }
+            assert!(r.a.roll().after.is_some_and(|t| (t - 0.5).abs() < 1e-4));
+            assert!(
+                r.a.twist().to_degrees().abs() < 10.0,
+                "{}",
+                r.a.twist().to_degrees()
+            );
+        }
+    }
+}
+
+/// The twist eases by time, not by update; a slow tick keeps the last
+/// travel.
+#[test]
+fn the_twist_is_frame_rate_free() {
+    let mut at30 = Run::new(rig_bf2());
+    let mut at60 = Run::new(rig_bf2());
+    for _ in 0..13 {
+        at30.a
+            .step(&at30.rig, &at30.clips, &at30.skel, &roll(90.0), 1.0 / 30.0);
+    }
+    at60.steps(&roll(90.0), 26);
+    assert!((at30.a.twist() - at60.a.twist()).abs() < 1e-4);
+    // Too slow to tell: the target stays where it was.
+    let slow = AnimInput {
+        vel: glam::Vec2::ZERO,
+        ..roll(0.0)
+    };
+    at60.steps(&slow, 60);
+    assert!((at60.a.twist().to_degrees() - 90.0).abs() < 0.01);
+}
+
+/// Card ANIMM acceptance 1: the movement chooser against the PS2's rule
+/// (re-soldier-anim-layers 3.5, 7; re-foley 8.2's live rows for the alert
+/// strafes). `v` is (his left, ahead) m/s; `prev` the clip playing.
+#[test]
+fn the_chooser_is_the_ps2s() {
+    use glam::Vec2;
+    let deg = |a: f32| a.to_degrees();
+    let pick = |game, v: Vec2, alert, prev: Legs| {
+        let mut l = prev;
+        choose(game, v, false, alert, 7.0, &mut l).map(|(m, t)| (m, deg(t)))
+    };
+    let from = |mv| Legs {
+        mv,
+        ..Legs::default()
+    };
+    let idle = Legs::default();
+    // BF1, alert: a left strafe is outside -103.5 .. +67.5 and runs
+    // backward with the legs at -45 (limited); a right strafe walks
+    // forward, legs at -45 too (re-foley 8.2: left run, right walk).
+    let (m, t) = pick(Game::Bf1, Vec2::new(4.4, 0.0), true, idle).unwrap();
+    assert_eq!(m, Move::RunBackward);
+    assert!((t + 45.0).abs() < 0.01, "{t}");
+    let (m, t) = pick(Game::Bf1, Vec2::new(-4.5, 0.0), true, idle).unwrap();
+    assert_eq!(m, Move::WalkForward);
+    assert!((t + 45.0).abs() < 0.01, "{t}");
+    // ... at 70 degrees left, alert: backward (past +67.5); plain: forward.
+    let v70 = 4.0 * Vec2::new(70f32.to_radians().sin(), 70f32.to_radians().cos());
+    assert_eq!(
+        pick(Game::Bf1, v70, true, idle).unwrap().0,
+        Move::RunBackward
+    );
+    assert_eq!(
+        pick(Game::Bf1, v70, false, idle).unwrap().0,
+        Move::WalkForward
+    );
+    // Not alert: both strafes run backward from a stand, legs at -+72; a
+    // soldier already walking forward keeps it to 108 degrees.
+    let (m, t) = pick(Game::Bf1, Vec2::new(4.4, 0.0), false, idle).unwrap();
+    assert_eq!((m, t.round()), (Move::RunBackward, -72.0));
+    let (m, t) = pick(Game::Bf1, Vec2::new(-4.4, 0.0), false, idle).unwrap();
+    assert_eq!((m, t.round()), (Move::RunBackward, 72.0));
+    let walking = from(Move::WalkForward);
+    let (m, t) = pick(Game::Bf1, Vec2::new(4.4, 0.0), false, walking).unwrap();
+    assert_eq!((m, t.round()), (Move::WalkForward, 72.0));
+    let v100 = 4.0 * Vec2::new(100f32.to_radians().sin(), 100f32.to_radians().cos());
+    assert_eq!(
+        pick(Game::Bf1, v100, false, walking).unwrap().0,
+        Move::WalkForward
+    );
+    assert_eq!(
+        pick(Game::Bf1, v100, false, idle).unwrap().0,
+        Move::RunBackward
+    );
+    // Walk or run ahead: 5.5 to start running, 5.0 to stay.
+    let ahead = |s| Vec2::new(0.0, s);
+    assert_eq!(
+        pick(Game::Bf1, ahead(5.2), false, idle).unwrap().0,
+        Move::WalkForward
+    );
+    assert_eq!(
+        pick(Game::Bf1, ahead(5.6), false, idle).unwrap().0,
+        Move::RunForward
+    );
+    let running = from(Move::RunForward);
+    assert_eq!(
+        pick(Game::Bf1, ahead(5.2), false, running).unwrap().0,
+        Move::RunForward
+    );
+    assert_eq!(
+        pick(Game::Bf1, ahead(4.9), false, running).unwrap().0,
+        Move::WalkForward
+    );
+    // Backward always asks for the run clip; idle under 0.3 on both axes
+    // and over 8 m/s.
+    assert_eq!(
+        pick(Game::Bf1, ahead(-1.0), false, idle).unwrap().0,
+        Move::RunBackward
+    );
+    assert_eq!(pick(Game::Bf1, Vec2::new(0.29, 0.29), false, idle), None);
+    assert_eq!(pick(Game::Bf1, ahead(8.1), false, running), None);
+    // BF2: the speed mode, 0.78 of MaxSpeed (7.0 -> 5.46) to run, 0.71
+    // (4.97) to stay.
+    let mut l = idle;
+    let mut at = |s: f32| choose(Game::Bf2, ahead(s), false, false, 7.0, &mut l).map(|c| c.0);
+    assert_eq!(at(5.4), Some(Move::WalkForward));
+    assert_eq!(at(5.5), Some(Move::RunForward));
+    assert_eq!(at(5.0), Some(Move::RunForward));
+    assert_eq!(at(4.9), Some(Move::WalkForward));
+    assert_eq!(at(-2.0), Some(Move::WalkBackward));
+    // Idle under 0.3 from a stand, 0.2 once moving (the caller keeps `mv`).
+    assert_eq!(at(0.25), None);
+    let mut l = Legs {
+        mv: Move::WalkForward,
+        ..idle
+    };
+    assert_eq!(
+        choose(Game::Bf2, ahead(0.25), false, false, 7.0, &mut l).map(|c| c.0),
+        Some(Move::WalkForward)
+    );
+    assert_eq!(
+        choose(Game::Bf2, ahead(0.15), false, false, 7.0, &mut l),
+        None
+    );
+    // BF2's forward bit is up from a stand: a strafe takes the wide window
+    // and the forward clip, legs at +-72 (re-roll-picture 4.1's +71).
+    let (m, t) = pick(Game::Bf2, Vec2::new(4.4, 0.0), false, idle).unwrap();
+    assert_eq!((m, t.round()), (Move::WalkForward, 72.0));
+    let back = Legs {
+        bf2_forward: false,
+        ..idle
+    };
+    let (m, t) = pick(Game::Bf2, Vec2::new(4.4, 0.0), false, back).unwrap();
+    assert_eq!((m, t.round()), (Move::WalkBackward, -72.0));
+    // Alert: BF1's window and limits.
+    let (m, t) = pick(Game::Bf2, Vec2::new(4.4, 0.0), true, idle).unwrap();
+    assert_eq!((m, t.round()), (Move::WalkBackward, -45.0));
+    let (m, t) = pick(Game::Bf2, Vec2::new(-4.4, 0.0), true, idle).unwrap();
+    assert_eq!((m, t.round()), (Move::WalkForward, -45.0));
+}
+
+/// A stance with strafe clips (BF1 prone) strafes on them: left walks
+/// under 5.0 (5.5 while walking left), right always asks for the run.
+#[test]
+fn a_stance_with_strafe_clips_strafes() {
+    let mut l = Legs::default();
+    let v = glam::Vec2::new(1.0, 0.2);
+    let (m, t) = choose(Game::Bf1, v, true, false, 7.0, &mut l).unwrap();
+    assert_eq!(m, Move::WalkLeft);
+    assert!((t + 0.2f32.atan2(1.0)).abs() < 1e-5, "{t}");
+    let r = choose(Game::Bf1, -v, true, false, 7.0, &mut l).unwrap();
+    assert_eq!(r.0, Move::RunRight);
+    // Mostly ahead: the forward clip, the whole angle on the legs.
+    let (m, t) = choose(
+        Game::Bf1,
+        glam::Vec2::new(1.0, 1.5),
+        true,
+        false,
+        7.0,
+        &mut l,
+    )
+    .unwrap();
+    assert_eq!(m, Move::WalkForward);
+    assert!((t - 1.0f32.atan2(1.5)).abs() < 1e-5);
+}
+
+/// A movement clip plays at 0.95 v / v_clip + 0.05 of the clock: the
+/// phase moves that much slower or faster than the plain dt (B1:145143).
+#[test]
+fn a_walk_plays_at_its_speed() {
+    let mut sets_rig = rig_bf1();
+    sets_rig.root[WALK] = Some([0.0, 3.687]);
+    sets_rig.root[RUN] = Some([0.0, 6.338]);
+    for (speed, clip, v) in [(2.0, WALK, 3.687), (4.5, WALK, 3.687), (7.0, RUN, 6.338)] {
+        let mut r = Run::new(sets_rig.clone());
+        r.steps(&input(speed), 30);
+        assert_eq!(r.a.lower_clip(), Some(clip));
+        let t0 = r.a.lower.t;
+        r.steps(&input(speed), 1);
+        let got = (r.a.lower.t - t0).rem_euclid(1.0);
+        let plain = DT * 30.0 / 19.0;
+        let want = plain * move_rate(speed, v);
+        assert!((got - want).abs() < 1e-5, "{speed}: {got} not {want}");
+        // The feet's ground speed against his: off by 5 % of the gap only.
+        let feet = v * move_rate(speed, v);
+        assert!((feet - (0.95 * speed + 0.05 * v)).abs() < 1e-4);
+    }
+}
+
+/// Standing, the legs keep their place while the body turns; past the
+/// stance's limit the turn clip takes them 0.2 rad beyond the facing over
+/// its length, then idles (B1:142792-142816).
+#[test]
+fn standing_he_turns_on_the_spot() {
+    const STEP: f32 = 1.0 / 30.0;
+    for (game, rig) in [(Game::Bf1, rig_bf1()), (Game::Bf2, rig_bf2())] {
+        let mut r = Run::new(rig);
+        let mut i = input(0.0);
+        for _ in 0..10 {
+            r.a.step(&r.rig, &r.clips, &r.skel, &i, STEP);
+        }
+        // Turn him right by 0.3 rad: the legs stay, the twist is +0.3.
+        i.yaw = -0.3;
+        r.a.step(&r.rig, &r.clips, &r.skel, &i, STEP);
+        assert!((r.a.twist() - 0.3).abs() < 1e-5, "{game:?} {}", r.a.twist());
+        assert_eq!(r.a.body(), Some(Body::Feet(0, Move::Idle)));
+        // 0.1 more: past 0.3927, the turn right.
+        i.yaw = -0.4;
+        r.a.step(&r.rig, &r.clips, &r.skel, &i, STEP);
+        assert_eq!(r.a.body(), Some(Body::Feet(0, Move::TurnRight)), "{game:?}");
+        // The turn clip's 15 frames time it.
+        assert_eq!(r.a.lower_clip(), Some(TURN));
+        let len = match game {
+            Game::Bf1 => 15.0,
+            Game::Bf2 => 14.0,
+        } / 30.0;
+        let n = (len / STEP).ceil() as usize + 1;
+        for _ in 0..n {
+            r.a.step(&r.rig, &r.clips, &r.skel, &i, STEP);
+        }
+        assert_eq!(r.a.body(), Some(Body::Feet(0, Move::Idle)), "{game:?}");
+        assert!((r.a.twist() + 0.2).abs() < 0.05, "{game:?} {}", r.a.twist());
+        // To his left the limit is -0.7069: 0.6 is held.
+        let mut l = Run::new(r.rig.clone());
+        let mut j = input(0.0);
+        l.a.step(&l.rig, &l.clips, &l.skel, &j, STEP);
+        j.yaw = 0.6;
+        l.a.step(&l.rig, &l.clips, &l.skel, &j, STEP);
+        assert_eq!(l.a.body(), Some(Body::Feet(0, Move::Idle)));
+        j.yaw = 0.75;
+        l.a.step(&l.rig, &l.clips, &l.skel, &j, STEP);
+        assert_eq!(l.a.body(), Some(Body::Feet(0, Move::TurnLeft)));
+    }
+}
+
+/// Strafing, the root turns toward the walk and the aim pose turns the
+/// torso back (`AimStep::aim` is the facing's yaw less the twist).
+#[test]
+fn a_strafe_twists_the_legs_and_the_aim_turns_back() {
+    let mut r = Run::new(rig_bf1());
+    let i = AnimInput {
+        vel: glam::Vec2::new(-3.0, 0.0),
+        alert: true,
+        ..input(0.0)
+    };
+    r.steps(&i, 120);
+    // Alert, right strafe: the forward clip, legs at -45.
+    assert_eq!(r.a.body(), Some(Body::Feet(0, Move::WalkForward)));
+    assert!((r.a.twist().to_degrees() + 45.0).abs() < 0.01);
+    assert!((root_yaw(&r) + 45.0).abs() < 0.01);
+    // The aim's yaw from the legs is +45, within the 36-degree limit.
+    assert!(
+        (r.a.aim().eased().0 - 0.6283).abs() < 1e-3,
+        "{:?}",
+        r.a.aim().eased()
+    );
+}

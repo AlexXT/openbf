@@ -1,0 +1,1426 @@
+//! A hover vehicle's class numbers, typed: the drive / spring props of the
+//! PS2 hover class (analysis/re-vehicles.md §3.1) with its constructor
+//! defaults, the seat ring its sections build (§5), and the damage-effect
+//! slots and `ExplosionName` of its hull (§6). Read from a
+//! [`ClassDb`] — a side class (`imp_hover_speederbike`) or a map-local one
+//! (`tat_hover_skiff`, `ClassDb::load_map`).
+//!
+//! A vehicle ODF is ONE ordered prop list split by `FLYERSECTION` lines:
+//! props before any section, or after `FLYERSECTION = BODY`, are the
+//! vehicle's own (hover drive + the pilot seat); `TURRET1..8` open a
+//! MountedTurret gunner seat whose props (its own `TurnRate`, `PitchLimits`,
+//! weapons) never reach the hover (B1 FUN_001f0648 B1:102492-102537).
+//! `CHUNKSECTION` opens a destruction chunk, read by neither.
+//!
+//! A building turret (`armedbuilding` / `armedbuildingdynamic`, §8, card
+//! VTURB) splits its list the same way with `BuildingSection` (hash
+//! 0xd89b1a5c: B1 FUN_001c4db8 B1:70347, B2 FUN_001e8948 B2:97129), into the
+//! same TURRET1..8 table and MountedTurret setter; it has no seat of its own,
+//! so its ring is its gunner sections alone ([`seats`]).
+//!
+//! BASE chains: the PS2 derives a class from its parent by a copy that keeps
+//! the scalar props but RESETS the spring points to none and the
+//! velocity/omega springs to 15/5/3/1/3/1 (B1 FUN_001f00e0 B1:101527-101534,
+//! B2 FUN_00221e08 B2:136938-136944), so here scalars inherit child-over-
+//! parent and the springs come from the child-most def alone. Every shipped
+//! vehicle derives straight from its engine base, so the entc-parent case is
+//! [H] and untested on data.
+
+mod walker;
+pub use walker::{WalkerClass, WALKER_BASES};
+
+use crate::classdb::{fnv1a_lowercase, ClassDb, ClassDef};
+use core::vehicle::hover::{HoverParams, HullBody, HullShape, JumpParams, Spring};
+use core::weapon::HealthType;
+
+/// Engine bases that construct the PS2 hover class (`treaded` IS a hover on
+/// both discs, re-vehicles §2; BF1's commandhover reuses the integrator §3).
+pub const HOVER_BASES: [&str; 3] = ["hover", "treaded", "commandhover"];
+
+/// Engine bases of a building turret (§8): BF1's `armedbuilding`, BF2's and
+/// its `armedbuildingdynamic` subclass (`portableturret`, `defensegridturret`).
+pub const TURRET_BASES: [&str; 2] = ["armedbuilding", "armedbuildingdynamic"];
+
+/// Is `class` a building turret ([`TURRET_BASES`])?
+pub fn is_turret(db: &ClassDb, class: &str) -> bool {
+    db.engine_base(class)
+        .is_some_and(|b| TURRET_BASES.iter().any(|t| t.eq_ignore_ascii_case(b)))
+}
+
+/// At most this many spring points (`if (5 < count) return`, B1:102074).
+pub const MAX_SPRING_POINTS: usize = 6;
+/// MountedTurret sections per vehicle (TURRET1..8, class+0x2678+4i).
+pub const MAX_TURRET_SECTIONS: usize = 8;
+/// `PassengerSlots` is clamped to 0..=4 (B1:102135-102150).
+pub const MAX_PASSENGERS: usize = 4;
+/// Weapons one seat carries (the MountedTurret setter's four, §5). The pilot
+/// seat's cap is the same number, [H].
+pub use core::vehicle::gun::MAX_SEAT_WEAPONS;
+
+/// One `AddSpringBody = "x y z r"` point and its per-point modifiers, as the
+/// PS2's entry init FUN_001f2030 (B1:102605) leaves them: spring length
+/// 0.5·r (`DAT_00517828` = 0.5, its only writer B1:101892), the velocity and
+/// both damp factors 1, and the two omega SPRING factors a lever-arm sign —
+/// −sign(z) for X (pitch) and sign(x) for Z (roll), 0 inside ±0.1. BF2's
+/// entry init FUN_00224368 (B2:138140-138183) is the same (re-hover §10 [O]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpringPoint {
+    /// Sphere centre in the vehicle's frame, and its radius.
+    pub pos: [f32; 3],
+    pub radius: f32,
+    /// BodySpringLength (entry +0x04).
+    pub length: f32,
+    /// BodyVelocitySpringFactor / BodyVelocityDampFactor (+0x08 / +0x0c).
+    pub velocity_spring: f32,
+    pub velocity_damp: f32,
+    /// BodyOmegaXSpringFactor / BodyOmegaXDampFactor (+0x10 / +0x14).
+    pub omega_x_spring: f32,
+    pub omega_x_damp: f32,
+    /// BodyOmegaZSpringFactor / BodyOmegaZDampFactor (+0x18 / +0x1c).
+    pub omega_z_spring: f32,
+    pub omega_z_damp: f32,
+}
+
+impl SpringPoint {
+    fn new(pos: [f32; 3], radius: f32) -> Self {
+        let sign = |v: f32| {
+            if v > 0.1 {
+                1.0
+            } else if v < -0.1 {
+                -1.0
+            } else {
+                0.0
+            }
+        };
+        Self {
+            pos,
+            radius,
+            length: radius * 0.5,
+            velocity_spring: 1.0,
+            velocity_damp: 1.0,
+            omega_x_spring: -sign(pos[2]),
+            omega_x_damp: 1.0,
+            omega_z_spring: sign(pos[0]),
+            omega_z_damp: 1.0,
+        }
+    }
+}
+
+/// Every §3.1 hover prop, defaulted to the PS2 constructor's value (B1
+/// FUN_001efdd8 B1:101257-101290 = B2 FUN_00221a20 B2:136636-136668) or the
+/// derive copy's (the six body springs, `SpringPoint` list). Units are the
+/// ODF's except `pitch_limits`, which the setter turns from degrees to
+/// radians (B1:101859-101860). BF1's PC* rates are not carried (PC-only);
+/// BF2's boost, energy and jump props (re-hover §1, §6.3, §6.9) are — BF1
+/// authors none, so its classes neither boost nor jump.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HoverClass {
+    pub set_altitude: f32,
+    pub gravity_scale: f32,
+    pub lift_spring: f32,
+    pub lift_damp: f32,
+    pub acceleration: f32,
+    pub deceleration: f32,
+    pub traction: f32,
+    pub forward_speed: f32,
+    pub reverse_speed: f32,
+    pub strafe_speed: f32,
+    pub spin_rate: f32,
+    pub turn_rate: f32,
+    pub pitch_rate: f32,
+    pub turn_filter: f32,
+    /// Radians, [min, max].
+    pub pitch_limits: [f32; 2],
+    pub thrust_pitch_angle: f32,
+    pub strafe_roll_angle: f32,
+    pub bank_angle: f32,
+    pub bank_filter: f32,
+    pub level_spring: f32,
+    pub level_damp: f32,
+    pub collision_threshold: [f32; 3],
+    pub collision_scale: [f32; 3],
+    pub velocity_spring: f32,
+    pub velocity_damp: f32,
+    pub omega_x_spring: f32,
+    pub omega_x_damp: f32,
+    pub omega_z_spring: f32,
+    pub omega_z_damp: f32,
+    /// BF2's BoostSpeed (+0xf6c, ctor 0; setter hash 0xa5900707
+    /// B2:137850-137851). Every BF2 hover authors 17-40; BF1 has no such prop.
+    pub boost_speed: f32,
+    /// BF2's `BoostTurnMultiplier` (+0xf78, ctor 0.5 B2:136648; setter hash
+    /// 0x2c358e68 B2:137255-137256 — the name is our fnv match, [D]): the
+    /// yaw target's scale at BoostSpeed.
+    pub boost_turn_multiplier: f32,
+    /// BF2's `BoostAcceleration` (+0xf70, ctor 0; hash 0x7b001920
+    /// B2:137763).
+    pub boost_acceleration: f32,
+    /// BF2's `EnergyAutoRestore` (+0xf64, ctor 0; B2:137338) and
+    /// `EnergyBoostDrain` (+0xf68, ctor 0; hash 0x645f56f6 B2:137593 — the
+    /// name is our fnv match, [D]); every BF2 hover authors a drain of 20.
+    pub energy_auto_restore: f32,
+    pub energy_boost_drain: f32,
+    /// BF2's jump fields (+0xf88..+0xf98, B2:137483-137949): `JumpTimeMin`
+    /// 0xbff09d80, `JumpTimeMax` 0xd5dd386a (fnv matches, [D]), `JumpForce`
+    /// 0x4aaefdcc, and two unnamed hashes, 0x534dfe50 (the start speed
+    /// fraction, ctor 0.3) and 0x391e36a1 (the jump's drain).
+    pub jump: JumpParams,
+    /// The ×(0.9 + 0.1·rand) spring jitter; `NoRandomSpring` clears it
+    /// (default on: B1 +0x2804 = 1 B1:101328, B2 +0xe90 = 1).
+    pub random_spring: bool,
+    pub springs: Vec<SpringPoint>,
+    /// The bodies in the class model's TERRAIN and BUILDING subsets, by
+    /// lowercase name in the order named (re-hover §13.2 [O]): `GeometryName`
+    /// empties both; a `TerrainCollision` / `BuildingCollision` line adds its
+    /// body (`none` / `clear` empties that layer); every `AddSpringBody`
+    /// names its own sphere, `springbody<n>`, on both lines — so a class with
+    /// a spring holds exactly the bodies named, never the layer default.
+    pub terrain_bodies: Vec<String>,
+    pub building_bodies: Vec<String>,
+}
+
+/// `SetSpringBody` (re-hover §13.2): a spring on an existing primitive.
+const SET_SPRING_BODY: u32 = 0x577b_739e;
+/// The name [`HoverClass`] lists an `AddSpringBody` sphere under.
+const SPRING_BODY: &str = "springbody";
+
+/// One `TerrainCollision` / `BuildingCollision` line (B2 FUN_00216198 /
+/// FUN_00215fb8): the layer's accumulator gains the body, or empties.
+fn name_body(list: &mut Vec<String>, v: &str) {
+    let v = v.trim().to_ascii_lowercase();
+    if v == "none" || v == "clear" {
+        list.clear();
+    } else if !list.contains(&v) {
+        list.push(v);
+    }
+}
+
+impl Default for HoverClass {
+    fn default() -> Self {
+        Self {
+            set_altitude: 1.0,
+            gravity_scale: 1.0,
+            lift_spring: 5.0,
+            lift_damp: 2.0,
+            acceleration: 10.0,
+            deceleration: 5.0,
+            traction: 10.0,
+            forward_speed: 20.0,
+            reverse_speed: 10.0,
+            strafe_speed: 15.0,
+            spin_rate: 3.0,
+            turn_rate: 2.0,
+            pitch_rate: 0.5,
+            turn_filter: 10.0,
+            pitch_limits: [-0.5, 0.5],
+            thrust_pitch_angle: 0.0,
+            strafe_roll_angle: 0.0,
+            bank_angle: 0.0,
+            bank_filter: 2.0,
+            level_spring: 10.0,
+            level_damp: 3.0,
+            collision_threshold: [7.5, 2.5, 0.0],
+            collision_scale: [1.0, 0.0, 0.0],
+            velocity_spring: 15.0,
+            velocity_damp: 5.0,
+            omega_x_spring: 3.0,
+            omega_x_damp: 1.0,
+            omega_z_spring: 3.0,
+            omega_z_damp: 1.0,
+            boost_speed: 0.0,
+            boost_turn_multiplier: 0.5,
+            boost_acceleration: 0.0,
+            energy_auto_restore: 0.0,
+            energy_boost_drain: 0.0,
+            jump: JumpParams::default(),
+            random_spring: true,
+            springs: Vec::new(),
+            terrain_bodies: Vec::new(),
+            building_bodies: Vec::new(),
+        }
+    }
+}
+
+/// Which part of the ODF a prop belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// The vehicle itself: hover drive and the pilot seat.
+    Body,
+    /// MountedTurret section index 0..=7 (TURRET / TURRET1 → 0, TURRETn → n−1).
+    Turret(u8),
+    /// A destruction chunk (`CHUNKSECTION`).
+    Chunk,
+}
+
+fn h(name: &str) -> u32 {
+    fnv1a_lowercase(name)
+}
+
+/// The FLYERSECTION value → scope: TURRET / TURRET1 → 0, TURRET2..8 → 1..7,
+/// anything else → the body (B1:102492-102537).
+fn section_scope(value: &str) -> Scope {
+    let v = value.trim().to_ascii_uppercase();
+    match v.strip_prefix("TURRET") {
+        Some("") | Some("1") => Scope::Turret(0),
+        Some(n) => match n.parse::<u8>() {
+            Ok(k @ 2..=8) => Scope::Turret(k - 1),
+            _ => Scope::Body,
+        },
+        None => Scope::Body,
+    }
+}
+
+/// One def's props with the scope each falls in, in file order. A building
+/// turret's `BuildingSection` and a walker's `WalkerSection` (B2
+/// FUN_00263f68 B2:182865-182869, card WALK) open the same scopes as
+/// `FLYERSECTION`; inside a `WalkerSection` only the props the turret setter
+/// claims ([`walker::TURRET_CLAIMS`]) are the section's, the rest the body's.
+fn scoped(def: &ClassDef) -> Vec<(Scope, u32, &str)> {
+    let (flyer, building, chunk) = (h("FLYERSECTION"), h("BuildingSection"), h("CHUNKSECTION"));
+    let walker = h("WalkerSection");
+    let mut scope = Scope::Body;
+    let mut by_walker = false;
+    let mut out = Vec::with_capacity(def.props.len());
+    for (k, v) in &def.props {
+        if *k == flyer || *k == building || *k == walker {
+            scope = section_scope(v);
+            by_walker = *k == walker;
+        } else if *k == chunk {
+            scope = Scope::Chunk;
+        } else if by_walker
+            && matches!(scope, Scope::Turret(_))
+            && !walker::TURRET_CLAIMS.contains(k)
+            && !is_seat_pose_key(*k)
+        {
+            // The walker setter gives the turret setter first refusal
+            // (B2:182865-182869); what it does not claim is the walker's.
+            out.push((Scope::Body, *k, v.as_str()));
+        } else {
+            out.push((scope, *k, v.as_str()));
+        }
+    }
+    out
+}
+
+fn floats<const N: usize>(v: &str) -> Option<[f32; N]> {
+    let mut out = [0.0; N];
+    let mut it = v.split_whitespace();
+    for slot in &mut out {
+        *slot = it.next()?.parse().ok()?;
+    }
+    Some(out)
+}
+
+/// Fill `out` from as many numbers as the line gives, as the PS2's
+/// three-`%f` sscanf does (B1:101776, B1:101816): the skiff's
+/// `CollisionScale = "30.0"` sets only the first of three.
+fn fill(out: &mut [f32], v: &str) {
+    for (slot, x) in out.iter_mut().zip(v.split_whitespace()) {
+        match x.parse() {
+            Ok(x) => *slot = x,
+            Err(_) => break,
+        }
+    }
+}
+
+/// The first number of a value; ODF lines can carry a trailing `//comment`
+/// (the skiff's `BankFilter = "3//low"`), which the PS2's sscanf stops at.
+fn float(v: &str) -> Option<f32> {
+    let end = v
+        .trim_start()
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
+        .unwrap_or(v.trim_start().len());
+    v.trim_start()[..end].parse().ok()
+}
+
+impl HoverClass {
+    /// `class`'s hover numbers, or `None` if the db lacks it or its BASE
+    /// chain does not end at a [`HOVER_BASES`] engine class.
+    pub fn from_db(db: &ClassDb, class: &str) -> Option<Self> {
+        if !HOVER_BASES.contains(&db.engine_base(class)?) {
+            return None;
+        }
+        let mut c = Self::default();
+        // Root first, so the child's value is the last write.
+        for def in db.chain(class).into_iter().rev() {
+            // The derive copy (FUN_001f00e0): springs reset per class.
+            let d = Self::default();
+            c.springs.clear();
+            c.terrain_bodies.clear();
+            c.building_bodies.clear();
+            c.velocity_spring = d.velocity_spring;
+            c.velocity_damp = d.velocity_damp;
+            c.omega_x_spring = d.omega_x_spring;
+            c.omega_x_damp = d.omega_x_damp;
+            c.omega_z_spring = d.omega_z_spring;
+            c.omega_z_damp = d.omega_z_damp;
+            for (scope, k, v) in scoped(def) {
+                if scope == Scope::Body {
+                    c.set(k, v);
+                }
+            }
+        }
+        Some(c)
+    }
+
+    /// The non-spring bodies that meet the world (card HHUL, re-hover §13):
+    /// each name in [`Self::terrain_bodies`] / [`Self::building_bodies`] that
+    /// is no spring, resolved against the class geometry's baked primitives
+    /// `prims` (the model's body list starts with them, in bake order; the
+    /// first of a name wins) at its `XFRM` — PROVISIONAL: its `PRNT` bone
+    /// taken as identity, as for the hull (`assets::hull_parts`; `p_cube1`'s
+    /// `bone_root` sits at the origin). A name no primitive has is dropped:
+    /// the PS2 writes nothing for it, and `CollisionMesh` never collides as
+    /// the mover (§13.1). On the discs: `p_cube1`, buildings only, on the two
+    /// BF2 fighter tanks. PROVISIONAL: a `SetSpringBody` primitive (no
+    /// shipped class) is a hull body here, not a spring; a layer emptied
+    /// after a spring (none either) still has its springs.
+    pub fn hull(&self, prims: &[manifest::ManifestPrim]) -> Vec<HullBody> {
+        let mut out = Vec::new();
+        let (terrain, building) = self.hull_names();
+        for p in prims {
+            let name = p.name.to_ascii_lowercase();
+            let (t, b) = (
+                terrain.contains(&name.as_str()),
+                building.contains(&name.as_str()),
+            );
+            // The first primitive of a name is the one a line finds.
+            let first = prims
+                .iter()
+                .find(|q| q.name.eq_ignore_ascii_case(&p.name))
+                .is_some_and(|q| std::ptr::eq(q, p));
+            if !(t || b) || !first {
+                continue;
+            }
+            let shape = match p.kind.as_str() {
+                "sphere" => HullShape::Sphere { radius: p.dims[0] },
+                // `dims[1]` is the FULL height (mungefs::coll).
+                "cylinder" => HullShape::Cylinder {
+                    radius: p.dims[0],
+                    half_height: p.dims[1] * 0.5,
+                },
+                "box" => HullShape::Box {
+                    half: p.dims.into(),
+                },
+                _ => continue,
+            };
+            let m = crate::viewer::instance_matrix(p.rotation, p.translation);
+            out.push(HullBody {
+                shape,
+                pos: m.w_axis.truncate(),
+                rot: glam::Mat3::from_mat4(m),
+                terrain: t,
+                building: b,
+            });
+        }
+        out
+    }
+
+    /// The names in the terrain and the building subset that are no
+    /// `AddSpringBody` sphere.
+    pub fn hull_names(&self) -> (Vec<&str>, Vec<&str>) {
+        fn hull(l: &[String]) -> Vec<&str> {
+            l.iter()
+                .map(String::as_str)
+                .filter(|n| !n.starts_with(SPRING_BODY))
+                .collect()
+        }
+        (hull(&self.terrain_bodies), hull(&self.building_bodies))
+    }
+
+    /// Does a line name a body that is no spring ([`Self::hull`] may then
+    /// hold one)?
+    pub fn names_a_hull_body(&self) -> bool {
+        let (t, b) = self.hull_names();
+        !(t.is_empty() && b.is_empty())
+    }
+
+    /// The sim's copy (`core::vehicle::hover`, card HOVR), with no hull
+    /// bodies: [`Self::hull`] needs the geometry's primitives
+    /// (`vehicle_pads::install` fills them in).
+    pub fn params(&self) -> HoverParams {
+        HoverParams {
+            set_altitude: self.set_altitude,
+            gravity_scale: self.gravity_scale,
+            acceleration: self.acceleration,
+            deceleration: self.deceleration,
+            traction: self.traction,
+            forward_speed: self.forward_speed,
+            reverse_speed: self.reverse_speed,
+            strafe_speed: self.strafe_speed,
+            spin_rate: self.spin_rate,
+            turn_rate: self.turn_rate,
+            pitch_rate: self.pitch_rate,
+            turn_filter: self.turn_filter,
+            thrust_pitch_angle: self.thrust_pitch_angle,
+            strafe_roll_angle: self.strafe_roll_angle,
+            bank_angle: self.bank_angle,
+            bank_filter: self.bank_filter,
+            level_spring: self.level_spring,
+            velocity_spring: self.velocity_spring,
+            velocity_damp: self.velocity_damp,
+            omega_x_spring: self.omega_x_spring,
+            omega_x_damp: self.omega_x_damp,
+            omega_z_spring: self.omega_z_spring,
+            omega_z_damp: self.omega_z_damp,
+            boost_speed: self.boost_speed,
+            boost_turn_multiplier: self.boost_turn_multiplier,
+            boost_acceleration: self.boost_acceleration,
+            energy_auto_restore: self.energy_auto_restore,
+            energy_boost_drain: self.energy_boost_drain,
+            jump: self.jump,
+            collision_threshold: self.collision_threshold,
+            collision_scale: self.collision_scale,
+            bf1_ai: false,
+            random_spring: self.random_spring,
+            springs: self
+                .springs
+                .iter()
+                .map(|p| Spring {
+                    pos: p.pos.into(),
+                    radius: p.radius,
+                    length: p.length,
+                    velocity_spring: p.velocity_spring,
+                    velocity_damp: p.velocity_damp,
+                    omega_x_spring: p.omega_x_spring,
+                    omega_x_damp: p.omega_x_damp,
+                    omega_z_spring: p.omega_z_spring,
+                    omega_z_damp: p.omega_z_damp,
+                })
+                .collect(),
+            hull: Vec::new(),
+        }
+    }
+
+    fn set(&mut self, k: u32, v: &str) {
+        if k == h("NoRandomSpring") {
+            self.random_spring = false;
+            return;
+        }
+        let scalars: [(&str, &mut f32); 34] = [
+            ("SetAltitude", &mut self.set_altitude),
+            ("GravityScale", &mut self.gravity_scale),
+            ("LiftSpring", &mut self.lift_spring),
+            ("LiftDamp", &mut self.lift_damp),
+            ("Acceleration", &mut self.acceleration),
+            ("Deceleration", &mut self.deceleration),
+            ("Traction", &mut self.traction),
+            ("ForwardSpeed", &mut self.forward_speed),
+            ("ReverseSpeed", &mut self.reverse_speed),
+            ("StrafeSpeed", &mut self.strafe_speed),
+            ("SpinRate", &mut self.spin_rate),
+            ("TurnRate", &mut self.turn_rate),
+            ("PitchRate", &mut self.pitch_rate),
+            ("TurnFilter", &mut self.turn_filter),
+            ("ThrustPitchAngle", &mut self.thrust_pitch_angle),
+            ("StrafeRollAngle", &mut self.strafe_roll_angle),
+            ("BankAngle", &mut self.bank_angle),
+            ("BankFilter", &mut self.bank_filter),
+            ("LevelSpring", &mut self.level_spring),
+            ("LevelDamp", &mut self.level_damp),
+            ("VelocitySpring", &mut self.velocity_spring),
+            ("VelocityDamp", &mut self.velocity_damp),
+            ("OmegaXSpring", &mut self.omega_x_spring),
+            ("OmegaXDamp", &mut self.omega_x_damp),
+            ("OmegaZSpring", &mut self.omega_z_spring),
+            ("OmegaZDamp", &mut self.omega_z_damp),
+            ("BoostSpeed", &mut self.boost_speed),
+            ("BoostTurnMultiplier", &mut self.boost_turn_multiplier),
+            ("BoostAcceleration", &mut self.boost_acceleration),
+            ("EnergyAutoRestore", &mut self.energy_auto_restore),
+            ("EnergyBoostDrain", &mut self.energy_boost_drain),
+            ("JumpTimeMin", &mut self.jump.time_min),
+            ("JumpTimeMax", &mut self.jump.time_max),
+            ("JumpForce", &mut self.jump.force),
+        ];
+        // The two jump props whose names are not known, by hash.
+        let unnamed: [(u32, &mut f32); 2] = [
+            (0x534d_fe50, &mut self.jump.speed_factor),
+            (0x391e_36a1, &mut self.jump.energy_drain),
+        ];
+        let named = scalars.into_iter().map(|(name, slot)| (h(name), slot));
+        for (key, slot) in named.chain(unnamed) {
+            if k == key {
+                if let Some(x) = float(v) {
+                    *slot = x;
+                }
+                return;
+            }
+        }
+        if k == h("PitchLimits") {
+            if let Some([lo, hi]) = floats::<2>(v) {
+                self.pitch_limits = [lo.to_radians(), hi.to_radians()];
+            }
+        } else if k == h("CollisionThreshold") {
+            fill(&mut self.collision_threshold, v);
+        } else if k == h("CollisionScale") {
+            fill(&mut self.collision_scale, v);
+        } else if k == h("GeometryName") {
+            // The generic parser resets the layer accumulators (§13.2 step 1).
+            self.terrain_bodies.clear();
+            self.building_bodies.clear();
+        } else if k == h("TerrainCollision") {
+            name_body(&mut self.terrain_bodies, v);
+        } else if k == h("BuildingCollision") {
+            name_body(&mut self.building_bodies, v);
+        } else if k == SET_SPRING_BODY {
+            name_body(&mut self.building_bodies, v);
+            name_body(&mut self.terrain_bodies, v);
+        } else if k == h("AddSpringBody") {
+            if self.springs.len() < MAX_SPRING_POINTS {
+                if let Some([x, y, z, r]) = floats::<4>(v) {
+                    self.springs.push(SpringPoint::new([x, y, z], r));
+                    // The sphere names itself on both lines (B2:137561-137564).
+                    let name = format!("{SPRING_BODY}{}", self.springs.len());
+                    name_body(&mut self.building_bodies, &name);
+                    name_body(&mut self.terrain_bodies, &name);
+                }
+            }
+        } else if let Some(p) = self.springs.last_mut() {
+            // The per-point modifiers write the LAST point (B1:102272).
+            let slot = match k {
+                _ if k == h("BodySpringLength") => &mut p.length,
+                _ if k == h("BodyVelocitySpringFactor") => &mut p.velocity_spring,
+                _ if k == h("BodyVelocityDampFactor") => &mut p.velocity_damp,
+                _ if k == h("BodyOmegaXSpringFactor") => &mut p.omega_x_spring,
+                _ if k == h("BodyOmegaXDampFactor") => &mut p.omega_x_damp,
+                _ if k == h("BodyOmegaZSpringFactor") => &mut p.omega_z_spring,
+                _ if k == h("BodyOmegaZDampFactor") => &mut p.omega_z_damp,
+                _ => return,
+            };
+            if let Some(x) = float(v) {
+                *slot = x;
+            }
+        }
+    }
+}
+
+/// `PilotType` (Controllable +0x21c): who drives from the seat. The value is
+/// hashed like a key (B1 FUN_0023da58 B1:156006-156035); an unknown value
+/// leaves the default. BF2 adds `vehicleself`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PilotType {
+    None = 0,
+    SelfPilot = 1,
+    /// A soldier boards the seat — the only kind the enter path accepts.
+    Vehicle = 2,
+    Remote = 3,
+    VehicleSelf = 4,
+}
+
+impl PilotType {
+    /// BF2's Controllable ctor writes 2 (B2:284987). BF1's default is [D]:
+    /// the skiff's four seats name no PilotType and are boardable, which
+    /// needs 2 (§5 seat choice).
+    pub const DEFAULT: PilotType = PilotType::Vehicle;
+
+    fn parse(v: &str) -> Option<Self> {
+        let k = h(v.trim());
+        [
+            ("none", Self::None),
+            ("self", Self::SelfPilot),
+            ("vehicle", Self::Vehicle),
+            ("remote", Self::Remote),
+            ("vehicleself", Self::VehicleSelf),
+        ]
+        .into_iter()
+        .find(|(n, _)| h(n) == k)
+        .map(|(_, t)| t)
+    }
+}
+
+/// Where a seat sits in the ring — the sim's own enum, so a class's ring
+/// feeds `core::vehicle::VehicleSpec::seats` as it is.
+pub use core::vehicle::SeatKind;
+
+/// One weapon a seat fires, `WeaponName` with the `WeaponAmmo` after it
+/// (ammo < 1 = infinite, §5).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeatWeapon {
+    pub class: String,
+    pub ammo: i32,
+}
+
+/// One seat of the ring (§5): the pilot, the gunner sections in index order,
+/// then the passengers — at most 1 + 8 + 4.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeatSpec {
+    pub kind: SeatKind,
+    pub pilot_type: PilotType,
+    /// `PilotPosition`: the hardpoint the rider is posed at.
+    pub pilot_position: Option<String>,
+    /// `AnimatedPilotPosition` (card VRIDE, `analysis/re-vehicle-riders.md`
+    /// 2.1 [O]): a node the rider takes the matrix of as it is animated now,
+    /// with no hardpoint offset (the tauntaun's, the kaadu's, BF2's one-man
+    /// AT-ST's).
+    pub animated_pilot_position: Option<String>,
+    /// `EyePointOffset` (x y z), the seat camera's eye.
+    pub eye_point_offset: Option<[f32; 3]>,
+    /// The seat's third-person camera (card VSEAT; how the PS2 combines them
+    /// is untraced, `crate::walk::vehicle_camera` is PROVISIONAL):
+    /// `TrackCenter` and `TrackOffset` (x y z, the body frame, +z forward),
+    /// `TiltValue` (degrees) and `ThirdPersonFOV` (degrees).
+    pub track_center: Option<[f32; 3]>,
+    pub track_offset: Option<[f32; 3]>,
+    pub tilt_value: Option<f32>,
+    pub third_person_fov: Option<f32>,
+    /// `FirstPersonFOV` (degrees): a building turret's zoomed view takes it
+    /// (card VTURZ: B1 `FUN_00225ba0`, B2 `FUN_002703d0` read the class's
+    /// +0x1bc when the zoom flag is set; the Controllable's default is 48).
+    pub first_person_fov: Option<f32>,
+    pub weapons: Vec<SeatWeapon>,
+    /// Card VTUR (§5, §9): `FirePointName` (the node a bolt leaves),
+    /// `TurretNodeName` (the node the aimer turns), `YawLimits` /
+    /// `PitchLimits` (degrees, "lo hi") and `YawRate` / `PitchRate` (rad/s).
+    pub fire_point: Option<String>,
+    pub turret_node: Option<String>,
+    pub yaw_limits: Option<[f32; 2]>,
+    pub pitch_limits: Option<[f32; 2]>,
+    pub yaw_rate: Option<f32>,
+    pub pitch_rate: Option<f32>,
+    /// Card VTURD (`analysis/re-turret-draw.md` 2.1): what the drawn turret
+    /// turns by. `PitchTurnFactor` scales the pitch the `TurretNodeName`
+    /// node takes (the class default is 1.0; every soldier-seat turret but
+    /// one authors 0.0); `AimerNodeName` is the node that looks along the
+    /// aimer's direction; each `BarrelNodeName` is a node that slides back
+    /// at a shot by its `BarrelRecoil` (`BarrelLength` writes a quarter of
+    /// itself into the same field).
+    pub pitch_turn_factor: Option<f32>,
+    pub aimer_node: Option<String>,
+    pub barrels: Vec<(String, f32)>,
+    /// Card VTURG (`analysis/re-turret-draw.md` 3.1, 3.3): the seated
+    /// soldier's pose key - `PilotAnimation` (a clip played) or
+    /// `Pilot9Pose` (nine frames blended by the gun's angles), the clip
+    /// being `human_<value>` - and `IsPilotExposed` (default 1).
+    pub pilot_pose: Option<PilotPose>,
+    pub pilot_exposed: bool,
+    /// Card VTURL (`analysis/re-turret-draw.md` 2.2, 2.3): the MountedTurret's
+    /// turn law - the full-stick rates (`MaxTurnSpeed` or its alias
+    /// `TurnRate`, `MaxPitchSpeed` or `PitchRate`: the last authored wins,
+    /// B2:191503-191506, 191751-191754), `TurnFilter` / `PitchFilter`, and
+    /// the FIRST aimer's `AimerYawLimits` / `AimerPitchLimits` (degrees) and
+    /// `AimerYawRate` / `AimerPitchRate` (rad/s; B1 `FUN_0026e260`).
+    pub turn_speed: Option<f32>,
+    pub pitch_speed: Option<f32>,
+    pub turn_filter: Option<f32>,
+    pub pitch_filter: Option<f32>,
+    pub aimer_yaw_limits: Option<[f32; 2]>,
+    pub aimer_pitch_limits: Option<[f32; 2]>,
+    pub aimer_yaw_rate: Option<f32>,
+    pub aimer_pitch_rate: Option<f32>,
+    /// A second `AimerNodeName` was read: later aimer keys are its.
+    aimer_second: bool,
+}
+
+/// A seat's pose key: the clip `human_<name>`, and whether it is a nine-pose.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PilotPose {
+    pub name: String,
+    pub nine: bool,
+}
+
+impl PilotPose {
+    /// The clip the soldier is posed with.
+    pub fn clip(&self) -> String {
+        format!("human_{}", self.name.to_ascii_lowercase())
+    }
+}
+
+/// What the PS2 does with a seated soldier (`analysis/re-turret-draw.md`
+/// 3.1 [O]): BF1's seat slot draws him when the seat has a pose key and takes
+/// him out of the scene otherwise (B1:121244-121254); BF2 also hides him on
+/// `IsPilotExposed = 0` (B2:167517-167526). A seat no soldier boards
+/// (`PilotType` self / remote / none: the sim's `SeatSetup::boardable`) has
+/// nobody to draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GunnerDraw {
+    Drawn,
+    Hidden,
+    NoSoldier,
+}
+
+/// The seat setter's pose keys, which a walker's turret section keeps (card
+/// VRIDE): BF2's MountedTurret setter falls through to the Controllable
+/// seat setter `FUN_002f6eb8` and returns its claim (B2:191723-191731), so
+/// the AT-TE's main gunner keeps his `PilotAnimation` and the walker's
+/// pilot gets none (re-vehicle-riders 1: hidden). PROVISIONAL scope: the
+/// seat setter's other keys (`PilotType`, `EyePointOffset`, the camera's)
+/// still fall to the walker's body here - they reach the sim, a later card.
+fn is_seat_pose_key(k: u32) -> bool {
+    [
+        "PilotPosition",
+        "AnimatedPilotPosition",
+        "PilotAnimation",
+        "Pilot9Pose",
+        "IsPilotExposed",
+    ]
+    .iter()
+    .any(|n| h(n) == k)
+}
+
+/// Where a vehicle seat's drawn rider hangs in the vehicle's model frame
+/// (card VRIDE, `analysis/re-vehicle-riders.md` 2.1, 3 [O]): the PS2's seat
+/// function puts him at `L x E x O`, which on a vehicle drawn rigid is the
+/// `PilotPosition` hardpoint's whole model-space BIND matrix (a turret-node
+/// gunner's at the turret's rest, as the drawn gun is, until card VPOSE);
+/// an `AnimatedPilotPosition` rider at that node's matrix NOW (`E x O`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum RiderHang {
+    /// The hardpoint's bind matrix in the model frame.
+    Bind(glam::Mat4),
+    /// The animated node, by name, and its bind matrix for a vehicle not
+    /// drawn posed.
+    Node(String, glam::Mat4),
+}
+
+impl RiderHang {
+    /// The hang of `seat` on a model whose `skel` nodes are `nodes`. A seat
+    /// naming no node the model has sits at the model's origin: the PS2's
+    /// seat keeps its default L there, [H] (re-vehicle-riders 7: BF1's
+    /// hovernaut, whose `hp_pilot` is not in its skeleton).
+    pub fn of(seat: &SeatSpec, nodes: &[manifest::ManifestHardpoint]) -> RiderHang {
+        let bind = |name: Option<&str>| {
+            let name = name?.trim();
+            let n = nodes.iter().find(|n| n.name.eq_ignore_ascii_case(name))?;
+            let ax = n
+                .axes
+                .unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+            Some(glam::Mat4::from_cols(
+                glam::Vec3::from(ax[0]).extend(0.0),
+                glam::Vec3::from(ax[1]).extend(0.0),
+                glam::Vec3::from(ax[2]).extend(0.0),
+                glam::Vec3::from(n.pos).extend(1.0),
+            ))
+        };
+        match &seat.animated_pilot_position {
+            Some(node) => RiderHang::Node(
+                node.trim().to_string(),
+                bind(Some(node)).unwrap_or(glam::Mat4::IDENTITY),
+            ),
+            None => RiderHang::Bind(
+                bind(seat.pilot_position.as_deref()).unwrap_or(glam::Mat4::IDENTITY),
+            ),
+        }
+    }
+}
+
+impl SeatSpec {
+    fn new(kind: SeatKind) -> Self {
+        Self {
+            kind,
+            pilot_type: PilotType::DEFAULT,
+            pilot_position: None,
+            animated_pilot_position: None,
+            eye_point_offset: None,
+            track_center: None,
+            track_offset: None,
+            tilt_value: None,
+            third_person_fov: None,
+            first_person_fov: None,
+            weapons: Vec::new(),
+            fire_point: None,
+            turret_node: None,
+            yaw_limits: None,
+            pitch_limits: None,
+            yaw_rate: None,
+            pitch_rate: None,
+            pitch_turn_factor: None,
+            aimer_node: None,
+            barrels: Vec::new(),
+            pilot_pose: None,
+            pilot_exposed: true,
+            turn_speed: None,
+            pitch_speed: None,
+            turn_filter: None,
+            pitch_filter: None,
+            aimer_yaw_limits: None,
+            aimer_pitch_limits: None,
+            aimer_yaw_rate: None,
+            aimer_pitch_rate: None,
+            aimer_second: false,
+        }
+    }
+
+    /// Is a soldier in this seat drawn ([`GunnerDraw`])? `bf2`: the class
+    /// is a BF2 disc's (BF1 reads `IsPilotExposed` for the body only).
+    pub fn gunner_draw(&self, bf2: bool) -> GunnerDraw {
+        if !matches!(self.pilot_type, PilotType::Vehicle | PilotType::VehicleSelf) {
+            GunnerDraw::NoSoldier
+        } else if self.pilot_pose.is_none() || (bf2 && !self.pilot_exposed) {
+            GunnerDraw::Hidden
+        } else {
+            GunnerDraw::Drawn
+        }
+    }
+
+    fn set(&mut self, k: u32, v: &str) {
+        if k == h("PilotType") {
+            if let Some(t) = PilotType::parse(v) {
+                self.pilot_type = t;
+            }
+        } else if k == h("PilotPosition") {
+            self.pilot_position = Some(v.trim().to_string());
+        } else if k == h("AnimatedPilotPosition") {
+            self.animated_pilot_position = Some(v.trim().to_string());
+        } else if k == h("PilotAnimation") || k == h("Pilot9Pose") {
+            // One slot for both keys: the last one authored wins.
+            self.pilot_pose = Some(PilotPose {
+                name: v.trim().to_string(),
+                nine: k == h("Pilot9Pose"),
+            });
+        } else if k == h("IsPilotExposed") {
+            self.pilot_exposed = float(v).is_none_or(|x| x != 0.0);
+        } else if k == h("EyePointOffset") {
+            self.eye_point_offset = floats::<3>(v);
+        } else if k == h("TrackCenter") {
+            self.track_center = floats::<3>(v);
+        } else if k == h("TrackOffset") {
+            self.track_offset = floats::<3>(v);
+        } else if k == h("TiltValue") {
+            self.tilt_value = v.trim().parse().ok();
+        } else if k == h("ThirdPersonFOV") {
+            self.third_person_fov = v.trim().parse().ok();
+        } else if k == h("FirstPersonFOV") {
+            self.first_person_fov = v.trim().parse().ok();
+        } else if k == h("WeaponName") {
+            if self.weapons.len() < MAX_SEAT_WEAPONS {
+                self.weapons.push(SeatWeapon {
+                    class: v.trim().to_string(),
+                    ammo: 0,
+                });
+            }
+        } else if k == h("FirePointName") {
+            self.fire_point = Some(v.trim().to_string());
+        } else if k == h("TurretNodeName") {
+            self.turret_node = Some(v.trim().to_string());
+        } else if k == h("YawLimits") {
+            self.yaw_limits = floats::<2>(v);
+        } else if k == h("PitchLimits") {
+            self.pitch_limits = floats::<2>(v);
+        } else if k == h("YawRate") {
+            self.yaw_rate = float(v);
+        } else if k == h("PitchRate") {
+            self.pitch_rate = float(v);
+            self.pitch_speed = float(v);
+        } else if k == h("MaxPitchSpeed") {
+            self.pitch_speed = float(v);
+        } else if k == h("MaxTurnSpeed") || k == h("TurnRate") {
+            self.turn_speed = float(v);
+        } else if k == h("TurnFilter") {
+            self.turn_filter = float(v);
+        } else if k == h("PitchFilter") {
+            self.pitch_filter = float(v);
+        } else if k == h("AimerYawLimits") && !self.aimer_second {
+            self.aimer_yaw_limits = floats::<2>(v);
+        } else if k == h("AimerPitchLimits") && !self.aimer_second {
+            self.aimer_pitch_limits = floats::<2>(v);
+        } else if k == h("AimerYawRate") && !self.aimer_second {
+            self.aimer_yaw_rate = float(v);
+        } else if k == h("AimerPitchRate") && !self.aimer_second {
+            self.aimer_pitch_rate = float(v);
+        } else if k == h("PitchTurnFactor") {
+            self.pitch_turn_factor = float(v);
+        } else if k == h("AimerNodeName") {
+            // One aimer chain per weapon section; the first is the drawn one.
+            if self.aimer_node.is_none() {
+                self.aimer_node = Some(v.trim().to_string());
+            } else {
+                self.aimer_second = true;
+            }
+        } else if k == h("BarrelNodeName") {
+            self.barrels.push((v.trim().to_string(), 0.0));
+        } else if k == h("BarrelRecoil") || k == h("BarrelLength") {
+            if let (Some(b), Some(x)) = (self.barrels.last_mut(), float(v)) {
+                b.1 = if k == h("BarrelLength") { 0.25 * x } else { x };
+            }
+        } else if k == h("WeaponAmmo") {
+            if let (Some(w), Ok(a)) = (self.weapons.last_mut(), v.trim().parse()) {
+                w.ammo = a;
+            }
+        }
+    }
+}
+
+/// Engine bases whose vehicles keep their team when the last rider leaves
+/// (re-vehicles §7.1): B1 clears class+0x80 (default 1, FUN_00221b28
+/// B1:135870) for commandhover / commandwalker (B1:224878, 230522); B2 clears
+/// class+0x330 bit 34 (default set, FUN_00269d98 B2:186494) for commandflyer /
+/// commandhover / commandwalker (B2:348465, 348966, 354410) and `mine`.
+pub const KEEPS_TEAM_BASES: [&str; 4] = ["commandhover", "commandwalker", "commandflyer", "mine"];
+
+/// Damage-effect slots per class: 10 × 0x30 bytes from class+0x90 (B1
+/// FUN_00221e48, the `DamageStartPercent` case, B1:136004-136025).
+pub const MAX_DAMAGE_EFFECTS: usize = 10;
+
+/// One visual damage slot (re-vehicles §6): an effect played at a hardpoint
+/// while the hull's health fraction is in its band. Fractions, not percents:
+/// the setter stores the ODF value × 0.01 (B1:136023, 136048).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DamageEffect {
+    /// `DamageStartPercent` × 0.01 (slot +0x0).
+    pub start: f32,
+    /// `DamageStopPercent` × 0.01 (slot +0x4); a new Start resets it to 0
+    /// (B1:136022).
+    pub stop: f32,
+    /// `DamageEffect`: the fx class (slot +0x8).
+    pub effect: String,
+    /// `DamageAttachPoint`: a hardpoint or bone (slot +0xc).
+    pub attach: Option<String>,
+    /// `DamageEffectScale` (slot +0x20), default 1.0.
+    pub scale: f32,
+    /// `DamageInheritVelocity`, default 0 [H].
+    pub inherit_velocity: f32,
+}
+
+impl DamageEffect {
+    /// Is the effect on at `health_frac` (health / max)? PROVISIONAL: the
+    /// runtime reader is not found (re-vehicles §6 [H]); this is the disc's
+    /// plain reading, `stop < f ≤ start` — the speeder bike sparks at 60 %
+    /// and stops at 20 %; a 0 stop runs until the hull dies.
+    pub fn active(&self, health_frac: f32) -> bool {
+        health_frac <= self.start && health_frac > self.stop
+    }
+}
+
+/// `class`'s damage-effect slots, in slot order. The setter's slot pointer
+/// (DAT_00517a68): `DamageStartPercent` takes the first slot whose effect is
+/// still unset — a Start with no Effect is overwritten by the next — and
+/// every other damage prop writes the slot it picked; with all 10 slots
+/// holding an effect, the rest are dropped. The pointer is a global the
+/// PS2 never resets between classes; here it starts empty per class, which
+/// differs only for a class whose first damage prop is not a Start (none
+/// on the discs, [H]). BODY scope, over the BASE chain root first.
+pub fn damage_effects(db: &ClassDb, class: &str) -> Vec<DamageEffect> {
+    // An empty `effect` is the PS2's null effect: the slot is still free.
+    let mut slots: Vec<DamageEffect> = Vec::new();
+    let mut cur: Option<usize> = None;
+    for def in db.chain(class).into_iter().rev() {
+        for (scope, k, v) in scoped(def) {
+            if scope != Scope::Body {
+                continue;
+            }
+            if k == h("DamageStartPercent") {
+                cur = slots.iter().position(|s| s.effect.is_empty());
+                if cur.is_none() && slots.len() < MAX_DAMAGE_EFFECTS {
+                    slots.push(DamageEffect {
+                        start: 0.0,
+                        stop: 0.0,
+                        effect: String::new(),
+                        attach: None,
+                        scale: 1.0,
+                        inherit_velocity: 0.0,
+                    });
+                    cur = Some(slots.len() - 1);
+                }
+                if let Some(i) = cur {
+                    slots[i].start = float(v).unwrap_or(0.0) * 0.01;
+                    slots[i].stop = 0.0;
+                }
+                continue;
+            }
+            let Some(s) = cur.map(|i| &mut slots[i]) else {
+                continue;
+            };
+            match k {
+                _ if k == h("DamageStopPercent") => s.stop = float(v).unwrap_or(0.0) * 0.01,
+                _ if k == h("DamageEffect") => s.effect = v.trim().to_owned(),
+                _ if k == h("DamageAttachPoint") => s.attach = Some(v.trim().to_owned()),
+                _ if k == h("DamageEffectScale") => s.scale = float(v).unwrap_or(0.0),
+                _ if k == h("DamageInheritVelocity") => {
+                    s.inherit_velocity = float(v).unwrap_or(0.0)
+                }
+                _ => {}
+            }
+        }
+    }
+    slots.retain(|s| !s.effect.is_empty());
+    slots
+}
+
+/// The class detonated when its hull pool runs out (`ExplosionName`,
+/// re-vehicles §6), if it names one.
+pub fn explosion_name(db: &ClassDb, class: &str) -> Option<String> {
+    db.prop(class, "ExplosionName")
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// The ODF collision-primitive line (`BldgCylinder aacylinder NULL x y z r h
+/// …`), hash 0x8cf29543 — its name is not recovered; the classes RON keeps
+/// the hash.
+pub const HASH_COLLISION_PRIMITIVE: u32 = 0x8cf2_9543;
+
+/// The sphere a blast measures `class` by (card VDTH,
+/// `analysis/re-vehicle-death.md` §3 [O]): the centre is the model's SPHR
+/// centre `sphr` (model space; the origin without one), the radius `w =
+/// max(SPHR r, the farthest body)` — the EntityGeometry ctor B1 FUN_001e1e18
+/// (B1:91424-91462) over class+0x1498, which grows by `|p − c| + e` for each
+/// ODF collision primitive (FUN_001e3678 B1:93183-93266: `e = r` for a
+/// sphere, `√(2r² + h²/4)` for a cylinder, `√(x² + y² + z²)` of the half
+/// sizes for a box) and each hover `AddSpringBody` (`e = r`, FUN_001f0648
+/// B1:102072-102125). The kind strings are matched by name here: the PS2
+/// compares CRCs, and only `sphere` and `aacylinder` occur on the discs
+/// ([D]: the AT-ST's aacylinder reproduces its RAM w to 3e-5).
+pub fn blast_sphere(db: &ClassDb, class: &str, sphr: Option<[f32; 4]>) -> ([f32; 3], f32) {
+    let [cx, cy, cz, r0] = sphr.unwrap_or([0.0; 4]);
+    let dist =
+        |p: [f32; 3]| ((p[0] - cx).powi(2) + (p[1] - cy).powi(2) + (p[2] - cz).powi(2)).sqrt();
+    let mut w = r0;
+    for line in db.props_all_hash(class, HASH_COLLISION_PRIMITIVE) {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        let n: Vec<f32> = t.iter().skip(3).filter_map(|x| x.parse().ok()).collect();
+        if t.len() < 2 || n.len() < 4 {
+            continue;
+        }
+        let (a, b, c) = (
+            n[3],
+            n.get(4).copied().unwrap_or(0.0),
+            n.get(5).copied().unwrap_or(0.0),
+        );
+        let kind = t[1].to_ascii_lowercase();
+        let e = if kind.contains("cylinder") {
+            (2.0 * a * a + b * b * 0.25).sqrt()
+        } else if kind.contains("box") {
+            (a * a + b * b + c * c).sqrt()
+        } else {
+            a
+        };
+        w = w.max(dist([n[0], n[1], n[2]]) + e);
+    }
+    if let Some(h) = HoverClass::from_db(db, class) {
+        for s in &h.springs {
+            w = w.max(dist(s.pos) + s.radius);
+        }
+    }
+    ([cx, cy, cz], w)
+}
+
+/// Engine bases that construct the PS2 flyer class (`carrier` is a flyer,
+/// re-vehicles §2).
+pub const FLYER_BASES: [&str; 3] = ["flyer", "commandflyer", "carrier"];
+
+/// A flyer class's `LandedHeight` (card VREST, `analysis/re-vehicle-rest.md`
+/// §2 [O]): how far over the pad's spawn point its constructor stands the
+/// origin. The class starts at its parent's value (the root's 0) and its
+/// props are applied in file order: `GeometryName` stores minus the min y of
+/// that model's `modl INFO` vis box when the model is loaded (B1
+/// FUN_001df3f0 B1:89911-89916, B2 FUN_0020fd58 B2:125205-125208) and
+/// `LandedHeight` stores the authored number (B1:90030-90031,
+/// B2:124871-124872), so the later of the two wins. `vis_min_y` answers a
+/// class's baked vis-box floor by its lowercase name
+/// (`ManifestVehicle::vis_min_y`). `None` when `class` is not a flyer.
+pub fn landed_height(
+    db: &ClassDb,
+    class: &str,
+    vis_min_y: impl Fn(&str) -> Option<f32>,
+) -> Option<f32> {
+    let base = db.engine_base(class)?;
+    if !FLYER_BASES.iter().any(|b| b.eq_ignore_ascii_case(base)) {
+        return None;
+    }
+    let mut height = 0.0;
+    for def in db.chain(class).into_iter().rev() {
+        for (scope, k, v) in scoped(def) {
+            if scope != Scope::Body {
+                continue;
+            }
+            if k == h("GeometryName") {
+                if let Some(y) = vis_min_y(&def.name.to_ascii_lowercase()) {
+                    height = -y;
+                }
+            } else if k == h("LandedHeight") {
+                if let Some(x) = float(v) {
+                    height = x;
+                }
+            }
+        }
+    }
+    Some(height)
+}
+
+/// Does `class` go back to team 0 (neutral) when its last rider leaves? True
+/// for every class but a [`KEEPS_TEAM_BASES`] one (and for an unknown class:
+/// the PS2 default).
+pub fn neutral_when_empty(db: &ClassDb, class: &str) -> bool {
+    db.engine_base(class)
+        .is_none_or(|b| !KEEPS_TEAM_BASES.iter().any(|k| k.eq_ignore_ascii_case(b)))
+}
+
+/// The hull pool's `HealthType`: the ODF's over the BASE chain, else the
+/// vehicle default (B1 FUN_00221e48 B1:136172-136195) — BF1's tauntaun is
+/// "animal". A building turret defaults to `building`: its class ctor B1
+/// FUN_001c4cd0 (B1:70300) runs the building ctor FUN_001c08b0, which stores
+/// 4 at class+0x48 (B1:67215) where a vehicle ctor stores 3 (B1:101255).
+pub fn health_type(db: &ClassDb, class: &str) -> HealthType {
+    let default = if is_turret(db, class) {
+        HealthType::Building
+    } else {
+        HealthType::Vehicle
+    };
+    db.prop(class, "HealthType")
+        .and_then(HealthType::parse)
+        .unwrap_or(default)
+}
+
+/// The class's `AISizeType` mask (B1 FUN_00221e48 B1:136104-136134, BF2
+/// FUN_0026a340): the value is compared case-insensitively (FUN_0042bdd8, the
+/// ctype table's upper-case bit adds 0x20) against "SOLDIER" "HOVER" "SMALL"
+/// "MEDIUM" "HUGE" "FLYER" (ELF 0x533ec0, 8 B apart) → 1, 2, 4, 8, 0x10, 0x20;
+/// SOLDIER, an unknown word and an absent key all give 1. The discs author
+/// "hover" and "Huge" as well as the upper-case words.
+pub fn ai_size(db: &ClassDb, class: &str) -> u32 {
+    const WORDS: [(&str, u32); 5] = [
+        ("HOVER", 2),
+        ("SMALL", 4),
+        ("MEDIUM", 8),
+        ("HUGE", 0x10),
+        ("FLYER", 0x20),
+    ];
+    db.prop(class, "AISizeType")
+        .and_then(|v| {
+            let v = v.trim();
+            WORDS
+                .iter()
+                .find(|(w, _)| w.eq_ignore_ascii_case(v))
+                .map(|&(_, m)| m)
+        })
+        .unwrap_or(1)
+}
+
+/// `class`'s seat ring in ring order, or empty if the db lacks it. Seats
+/// merge over the BASE chain root first (a child's section re-authors its
+/// parent's same-index seat) — [H], no shipped vehicle has an entc parent.
+/// A building turret's ring is its gunner sections only ([`is_turret`]).
+pub fn seats(db: &ClassDb, class: &str) -> Vec<SeatSpec> {
+    let mut pilot = SeatSpec::new(SeatKind::Pilot);
+    let mut turrets: [Option<SeatSpec>; MAX_TURRET_SECTIONS] = Default::default();
+    let mut passengers = 0usize;
+    let chain = db.chain(class);
+    if chain.is_empty() {
+        return Vec::new();
+    }
+    for def in chain.into_iter().rev() {
+        for (scope, k, v) in scoped(def) {
+            match scope {
+                Scope::Body if k == h("PassengerSlots") => {
+                    passengers = v.trim().parse::<i64>().unwrap_or(0).clamp(0, 4) as usize;
+                }
+                Scope::Body => pilot.set(k, v),
+                Scope::Turret(i) => turrets[i as usize]
+                    .get_or_insert_with(|| SeatSpec::new(SeatKind::Gunner(i)))
+                    .set(k, v),
+                Scope::Chunk => {}
+            }
+        }
+    }
+    // A building turret has no seat of its own (§8: neither Controllable
+    // setter's callers include it) and, [D], no PassengerSlot: its setter
+    // hands everything but the sections to the building's (FUN_001c0b10).
+    let turret = is_turret(db, class);
+    let mut ring = if turret { Vec::new() } else { vec![pilot] };
+    ring.extend(turrets.into_iter().flatten());
+    if turret {
+        return ring;
+    }
+    ring.extend(
+        (0..passengers.min(MAX_PASSENGERS)).map(|i| SeatSpec::new(SeatKind::Passenger(i as u8))),
+    );
+    ring
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Card VRIDE: the seat setter's pose keys by the hashes it compares
+    /// (B2 `FUN_002f6eb8`, re-vehicle-riders 2.1).
+    #[test]
+    fn the_seat_pose_keys_are_the_setters_hashes() {
+        for (n, want) in [
+            ("PilotPosition", 0x51ca39a6u32),
+            ("AnimatedPilotPosition", 0x11ce2025),
+            ("PilotAnimation", 0x6e4fc069),
+            ("Pilot9Pose", 0xa976d065),
+            ("IsPilotExposed", 0x2b60e217),
+        ] {
+            assert_eq!(h(n), want, "{n}");
+            assert!(is_seat_pose_key(want));
+        }
+        assert!(!is_seat_pose_key(h("PilotType")));
+    }
+
+    /// Card VTURG (re-turret-draw.md 3.1): a seat's pose key and
+    /// `IsPilotExposed` decide whether its soldier is drawn - the exposure
+    /// only on BF2 - and a seat no soldier boards has none to draw.
+    #[test]
+    fn a_seat_draws_its_gunner_by_its_pose_key() {
+        let seat = |keys: &[(&str, &str)]| {
+            let mut s = SeatSpec::new(SeatKind::Gunner(0));
+            for (k, v) in keys {
+                s.set(h(k), v);
+            }
+            s
+        };
+        let nine = seat(&[("Pilot9Pose", "minigun_9pose")]);
+        assert_eq!(
+            nine.pilot_pose,
+            Some(PilotPose {
+                name: "minigun_9pose".into(),
+                nine: true
+            })
+        );
+        assert_eq!(
+            nine.pilot_pose.as_ref().unwrap().clip(),
+            "human_minigun_9pose"
+        );
+        assert_eq!(nine.gunner_draw(false), GunnerDraw::Drawn);
+        assert_eq!(nine.gunner_draw(true), GunnerDraw::Drawn);
+        let drive = seat(&[("PilotAnimation", " drive ")]);
+        assert_eq!(
+            drive.pilot_pose.as_ref().map(|p| (p.clip(), p.nine)),
+            Some(("human_drive".into(), false))
+        );
+        assert_eq!(seat(&[]).gunner_draw(true), GunnerDraw::Hidden);
+        let shut = seat(&[("PilotAnimation", "drive"), ("IsPilotExposed", "0")]);
+        assert_eq!(shut.gunner_draw(true), GunnerDraw::Hidden, "BF2 hides him");
+        assert_eq!(
+            shut.gunner_draw(false),
+            GunnerDraw::Drawn,
+            "BF1 reads it for the body only"
+        );
+        assert_eq!(
+            seat(&[("PilotAnimation", "drive"), ("IsPilotExposed", "1")]).gunner_draw(true),
+            GunnerDraw::Drawn
+        );
+        for t in ["self", "remote", "none"] {
+            let s = seat(&[("PilotType", t), ("PilotAnimation", "drive")]);
+            assert_eq!(s.gunner_draw(true), GunnerDraw::NoSoldier, "{t}");
+        }
+        let s = seat(&[("PilotType", "vehicleself"), ("Pilot9Pose", "barc_9pose")]);
+        assert_eq!(s.gunner_draw(true), GunnerDraw::Drawn);
+    }
+
+    #[test]
+    fn section_values_map_to_the_ps2_indices() {
+        assert_eq!(section_scope("BODY"), Scope::Body);
+        assert_eq!(section_scope("TURRET"), Scope::Turret(0));
+        assert_eq!(section_scope("TURRET1"), Scope::Turret(0));
+        assert_eq!(section_scope("turret2"), Scope::Turret(1));
+        assert_eq!(section_scope("TURRET8"), Scope::Turret(7));
+        assert_eq!(section_scope("TURRET9"), Scope::Body);
+        assert_eq!(section_scope("WINGS"), Scope::Body);
+    }
+
+    #[test]
+    fn spring_point_defaults_follow_the_lever_arm() {
+        let p = SpringPoint::new([-1.8, -0.7, 1.7], 2.0);
+        assert_eq!(p.length, 1.0);
+        assert_eq!((p.omega_x_spring, p.omega_z_spring), (-1.0, -1.0));
+        let p = SpringPoint::new([0.0, 0.3, -2.0], 3.0);
+        assert_eq!((p.omega_x_spring, p.omega_z_spring), (1.0, 0.0));
+        assert_eq!(
+            (
+                p.velocity_spring,
+                p.velocity_damp,
+                p.omega_x_damp,
+                p.omega_z_damp
+            ),
+            (1.0, 1.0, 1.0, 1.0)
+        );
+    }
+
+    /// The setter's slot pointer: a Start with no Effect is overwritten by
+    /// the next Start; a Start resets Stop; chunk-section props never reach
+    /// a slot; the band is `stop < f ≤ start`.
+    #[test]
+    fn damage_slots_follow_the_setters_pointer() {
+        let props: Vec<(u32, String)> = [
+            ("DamageStopPercent", "50"), // no slot yet: dropped
+            ("DamageStartPercent", "90"),
+            ("DamageStopPercent", "70"), // orphaned with its Start
+            ("DamageStartPercent", "60.0"),
+            ("DamageStopPercent", "20.0"),
+            ("DamageEffect", "vehiclespark"),
+            ("DamageEffectScale", "0.4"),
+            ("DamageInheritVelocity", "0.75"),
+            ("DamageAttachPoint", "hp_damage_1"),
+            ("DamageStartPercent", "2.0"),
+            ("DamageEffect", "vehicleflame"),
+            ("CHUNKSECTION", "CHUNK1"),
+            ("DamageStartPercent", "40"),
+            ("DamageEffect", "chunkfx"),
+        ]
+        .iter()
+        .map(|(k, v)| (h(k), v.to_string()))
+        .collect();
+        let def = ClassDef {
+            name: "t_hover".into(),
+            kind: "entc".into(),
+            base: "hover".into(),
+            props,
+        };
+        let path = std::env::temp_dir().join(format!("openbf-dmgslots-{}.ron", std::process::id()));
+        std::fs::write(&path, ron::to_string(&vec![def]).unwrap()).unwrap();
+        let mut db = ClassDb::default();
+        db.load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let fx = damage_effects(&db, "t_hover");
+        assert_eq!(fx.len(), 2, "{fx:#?}");
+        let pct = |p: f32| p * 0.01;
+        assert_eq!((fx[0].start, fx[0].stop), (pct(60.0), pct(20.0)));
+        assert_eq!(fx[0].effect, "vehiclespark");
+        assert_eq!(fx[0].attach.as_deref(), Some("hp_damage_1"));
+        assert_eq!((fx[0].scale, fx[0].inherit_velocity), (0.4, 0.75));
+        assert_eq!((fx[1].start, fx[1].stop, fx[1].scale), (pct(2.0), 0.0, 1.0));
+        assert_eq!(fx[1].attach, None);
+        assert!(!fx[0].active(1.0) && fx[0].active(fx[0].start) && fx[0].active(0.3));
+        assert!(!fx[0].active(fx[0].stop) && !fx[0].active(0.1));
+        assert!(fx[1].active(0.01) && !fx[1].active(0.0));
+    }
+
+    /// FUN_00221e48's AISizeType: case-insensitive words, 1 for anything else.
+    #[test]
+    fn ai_size_reads_the_six_words_in_any_case() {
+        let classes: Vec<ClassDef> = [
+            ("a", Some("MEDIUM")),
+            ("b", Some("hover")),
+            ("c", Some("Huge")),
+            ("d", Some("SOLDIER")),
+            ("e", Some("tank")),
+            ("f", None),
+        ]
+        .iter()
+        .map(|&(n, v)| ClassDef {
+            name: n.into(),
+            kind: "entc".into(),
+            base: "hover".into(),
+            props: v
+                .map(|v| (h("AISizeType"), v.to_string()))
+                .into_iter()
+                .collect(),
+        })
+        .collect();
+        let path = std::env::temp_dir().join(format!("openbf-aisize-{}.ron", std::process::id()));
+        std::fs::write(&path, ron::to_string(&classes).unwrap()).unwrap();
+        let mut db = ClassDb::default();
+        db.load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let got: Vec<u32> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|c| ai_size(&db, c))
+            .collect();
+        assert_eq!(got, [8, 2, 0x10, 1, 1, 1]);
+    }
+
+    #[test]
+    fn values_with_a_trailing_comment_parse() {
+        assert_eq!(float("3//low"), Some(3.0));
+        assert_eq!(float(" .85"), Some(0.85));
+        assert_eq!(float("-0.01"), Some(-0.01));
+        assert_eq!(
+            PilotType::parse("VehicleSelf"),
+            Some(PilotType::VehicleSelf)
+        );
+        assert_eq!(PilotType::parse("bogus"), None);
+    }
+}

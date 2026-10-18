@@ -1,0 +1,40 @@
+---
+id: SHASH
+title: A per-tick sim-state hash stream: the port writes one canonical record per tick (unit positions and health, the game LCG state, team scores and tickets, post owners, round timers) as a trace file, and a headless replay of a recorded pad log (InputLog) reproduces it byte for byte - the port half of the PS2 state-diff oracle (research rec. 6)
+milestone: M0
+value: 3
+phase: build
+status: todo
+deps:
+files: engine/crates/core/src/sim/trace.rs,engine/crates/core/src/sim/mod.rs,engine/crates/game/src/main.rs,scripts/sim_gates.sh
+declares:
+needs:
+effort:
+branch:
+resume:
+created: 2026-10-08
+---
+
+## Why
+`research/decomp_landscape_20261008/README.md` rec. 6: every decomp project that works has an objective oracle the agent cannot argue with; ours is behavioural and today only prose plus aggregate sweeps. The port already has two coarse determinism hashes (`game --sim-hash N` -> `hash100` / `hash600` in `gates.toml [sim]`, one number after N ticks) which say "something moved" but not which tick or which field. A per-tick stream of per-FIELD hashes is the port half of a first-divergence differ (FDIFF) against the PS2 (PSHASH). It is also a better "did this landing move the sim" gate than one end-of-run number.
+
+## Evidence
+- `core::sim::input::InputLog` records `PadState` per tick per slot (`slot_count`, `frames()`) and `Sim::step(&[PadState])` (`core/src/sim/step.rs:73`) is the one tick entry: a replay already exists, the trace hooks into it.
+- `core::lcg::GameLcg::state()` (`core/src/lcg.rs:75`) already exposes the shared LCG state (the PS2's: BF1 `DAT_0066eed0`, BF2 `DAT_0073d870`, `analysis/re-blaster-damage.md` section 3).
+- The existing gate: `scripts/gates.py` `g_sim` runs `scripts/sim_gates.sh` and `game --sim-hash 100`; the new stream must not change those numbers (it only reads).
+
+## Design (decide the open ones in the card; do not widen)
+- **Record** per tick t: `t`, then FOUR group hashes + a short field list so a differ can say which field: `units` (per unit by stable id: x,y,z quantized to 1/16 m, health quantized to 1/4, team, alive), `rng` (the LCG state, raw u32), `score` (tickets per team, kills, casualties), `posts` (owner team + capture progress quantized per post), `timers` (round clock, respawn timers). Hash = FNV-1a 64 over little-endian fixed-width fields, canonical order (unit id ascending).
+- **Quantization is the contract**: the PS2 side (PSHASH) can only match to what a float read gives; the quantum is a constant in ONE place (`trace.rs`) that FDIFF reads from the trace header (so the differ can compare two traces with different quanta only via the coarser one).
+- **Trace file** = a text header (`# openbf-trace 1`, map, seed, quanta, tick rate, field list) + one line per tick `t unitsH rngH scoreH postsH timersH`; optional `--trace-full` adds the raw tuples per tick for the differ to print the offending field's two values (cap the file; tests run 600 ticks).
+- **CLI**: `game --sim-trace <out> <ticks> [--input <inputlog>] [--seed S] [--map M]`; replay of the same InputLog + seed twice gives identical files.
+
+## Acceptance
+- A test: the same (map, seed, InputLog, 600 ticks) run twice writes byte-identical trace files, and changing one pad byte on tick 300 changes the trace first at tick 300 or 301 (paste the first differing line).
+- `game --sim-hash 100` / `600` and `gates.toml [sim]` are byte-identical before and after (the trace is read-only), pasted.
+- The record reads, not writes, sim state; tracing off costs nothing measurable (`sim_gates.sh` wall time within 2 %, pasted).
+- A short `engine/artifacts/oracle/README.md` section names the format (header, fields, quanta) for the PS2 reader to write the SAME format.
+- No `declares`: nothing in the sim moves.
+
+## Notes
+Filed 2026-10-08 from the research note. Group order and the quanta are decided HERE; SHSRE/PSHASH/FDIFF conform. Does not need PCSX2 at all - ships and is useful (landing bisect) by itself.

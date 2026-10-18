@@ -1,0 +1,9 @@
+# Project-owned SDL game-controller mappings for pads SDL_GameControllerDB lacks
+# (card PADM). One SDL mapping line per pad, same format as the DB. Loaded by
+# `input::open_gilrs` BEFORE gilrs's bundled DB, which wins on a shared GUID;
+# `SDL_GAMECONTROLLERCONFIG` wins over both.
+#
+# GameSir G7 Pro (USB 3537:1022, generic HID): right stick is ABS_Z/ABS_RZ.
+# The same-layout GameSir mapping on this GUID; verified by the maintainer on the real pad
+# 2026-09-28.
+03000000373500002210000010010000,GameSir G7 Pro,a:b0,b:b1,back:b10,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b12,leftshoulder:b6,leftstick:b13,lefttrigger:a5,leftx:a0,lefty:a1,rightshoulder:b7,rightstick:b14,righttrigger:a4,rightx:a2,righty:a3,start:b11,x:b3,y:b4,platform:Linux,

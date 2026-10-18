@@ -1,0 +1,32 @@
+---
+id: HNEAR
+title: A hover rides to the hub nearest its post when its graph ends short (ai::HOVER_NEAREST, built by VDROP and off): BF2 POL1's riders get out over no floor and tat1's speeder bikes crash
+milestone: M2
+value: 3
+phase: build
+status: done
+deps: VDROP
+files: engine/crates/core/src/ai/ride.rs,engine/crates/core/src/ai/route.rs,engine/crates/core/src/ai/hover_drive.rs
+declares: sim; sweep
+needs:
+effort:
+branch:
+resume: MERGED into VBAIL by the planner 2026-10-03 07:15 (the batch rule: both M2 value 3, both ai/ride.rs, both sim; sweep) - not built; its Why / Evidence / Acceptance are VBAIL's part 2
+created: 2026-10-03
+---
+## Why
+Card VDROP built the rule for hovers and left it off. With it on (8 seeds, `lead_tmp/vdrop/sw_near` against
+`sw_law3`): rides 3753 -> 5366 (BF2 POL1's combat speeder 0 -> 304, BF1 NAB2 188 -> 348), crashes a ride unchanged
+(0.06 -> 0.05), rounds finished 255 -> 256 of 256, recycled 230 -> 190. Against it: tat1's `veh` deaths 16 -> 61
+(5.6 a round; its bikes crash 28 times in 450 rides against 8 in 297) and BF2 POL1 gets 22 floor deaths in 8 rounds
+(none before): riders leaving the speeder at a drop hub with no floor under the exit point.
+
+## Evidence
+`lead_tmp/vdrop/sw_near/seeds.md`, `sw_law3/seeds.md`; `python3 lead_tmp/vdrop/hov.py <dir> [map]`;
+`lead_tmp/wai/build/cmp.py <a>/seeds.md <b>/seeds.md`. Neither Hoth has a hover class: nothing to gain there.
+
+## Acceptance
+1. BF2 POL1: find where the 22 fall (HOVER_LOSS_LOG=1 and SWEEP_DEATHS=1 with the const on) and fix the exit point
+   or the drop hub's test; floor deaths 0 in 8 seeds.
+2. tat1: `veh` deaths rise by at most 5 a round over 8 seeds against the const off.
+3. Then `HOVER_NEAREST = true`: no map's finish count drops, no map's `veh` deaths rise by more than 5 a round.

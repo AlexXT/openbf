@@ -1,0 +1,164 @@
+all_bldg_inf_autoturret [portableturret]: 1:all_weap_inf_autoturret x0 ch0
+all_hero_chewbacca [soldier]: 1:all_weap_inf_bowcaster x6 ch0; 2:all_weap_hero_rocket_launcher x4 ch0; 3:all_weap_inf_timebomb x3 ch1; 4:all_weap_inf_buff_damage x1 ch1
+all_hero_hansolo_storm [soldier]: 1:all_weap_hero_hanpistol x4 ch0; 2:all_weap_inf_fusioncutter x0 ch0; 3:all_weap_inf_buff_defense x3 ch1; 4:all_weap_inf_fusioncutter x0 ch1
+all_hero_hansolo_tat [soldier]: 1:all_weap_hero_hanpistol x4 ch0; 2:all_weap_inf_fusioncutter x1 ch0; 3:all_weap_inf_detpack x5 ch1; 4:all_weap_inf_buff_defense x1 ch1
+all_hero_leia [soldier]: 1:all_weap_hero_targetpistol x0 ch0; 2:all_weap_inf_thermaldetonator x3 ch1; 3:all_weap_inf_buff_invuln x1 ch1
+all_hero_luke_jedi [soldier]: 1:all_weap_lightsaber x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1; 3:com_weap_inf_force_push x1 ch1
+all_hero_luke_pilot [soldier]: 1:all_weap_lightsaber_blue x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1; 3:com_weap_inf_force_push x1 ch1
+all_hero_luke_storm [soldier]: 1:all_weap_inf_rifle x6 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x3 ch1
+all_inf_default_engineer [soldier]: 1:all_weap_inf_shotgun x6 ch0; 2:all_weap_inf_fusioncutter x0 ch0; 3:all_weap_inf_detpack x3 ch1; 4:all_weap_inf_powerup_dispenser x5 ch1; 5:all_weap_award_shotgun x4 ch0
+all_inf_default_marine [soldier]: 1:all_weap_inf_rifle x4 ch0; 2:all_weap_inf_rocket_launcher x4 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_award_rifle x4 ch0
+all_inf_default_officer [soldier]: 1:all_weap_inf_incinerator x10 ch0; 2:all_weap_inf_invisibility x0 ch0; 3:all_weap_inf_buff_health x1 ch1; 4:all_weap_inf_timebomb x3 ch1
+all_inf_default_pilot [soldier]: 1:all_weap_inf_commando_pistol x4 ch0; 2:all_weap_inf_fusioncutter xNone ch0; 3:all_weap_inf_timebomb x3 ch1; 4:all_weap_award_pistol x4 ch0
+all_inf_default_rifleman [soldier]: 1:all_weap_inf_rifle x6 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_award_pistol x6 ch0; 5:all_weap_award_rifle x6 ch0
+all_inf_default_rocketeer [soldier]: 1:all_weap_inf_rocket_launcher x7 ch0; 2:all_weap_inf_pistol x4 ch0; 3:all_weap_inf_thermaldetonator x2 ch1; 4:all_weap_inf_mine_dispenser x4 ch1; 5:all_weap_award_pistol x6 ch0; 6:all_weap_award_rocket_launcher x5 ch0
+all_inf_default_sniper [soldier]: 1:all_weap_inf_sniper_rifle x7 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x2 ch1; 4:all_weap_inf_autoturret_dispenser x1 ch1; 5:all_weap_award_sniper_rifle x6 ch0; 6:all_weap_award_pistol x6 ch0
+all_inf_default_wookiee [soldier]: 1:all_weap_inf_bowcaster x6 ch0; 2:all_weap_inf_mortar_launcher x3 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_inf_remotedroid x1 ch1
+all_inf_engineer [soldier]: 1:all_weap_inf_shotgun x6 ch0; 2:all_weap_inf_fusioncutter x0 ch0; 3:all_weap_inf_detpack x3 ch1; 4:all_weap_inf_powerup_dispenser x5 ch1; 5:all_weap_award_shotgun x4 ch0
+all_inf_engineer_fleet [soldier]: 1:all_weap_inf_shotgun x6 ch0; 2:all_weap_inf_fusioncutter x0 ch0; 3:all_weap_inf_detpack x3 ch1; 4:all_weap_inf_powerup_dispenser x5 ch1; 5:all_weap_award_shotgun x4 ch0
+all_inf_engineer_jungle [soldier]: 1:all_weap_inf_shotgun x6 ch0; 2:all_weap_inf_fusioncutter x0 ch0; 3:all_weap_inf_detpack x3 ch1; 4:all_weap_inf_powerup_dispenser x5 ch1; 5:all_weap_award_shotgun x4 ch0
+all_inf_engineer_snow [soldier]: 1:all_weap_inf_shotgun x6 ch0; 2:all_weap_inf_fusioncutter x0 ch0; 3:all_weap_inf_detpack x3 ch1; 4:all_weap_inf_powerup_dispenser x5 ch1; 5:all_weap_award_shotgun x4 ch0
+all_inf_marine [soldier]: 1:all_weap_inf_rifle x4 ch0; 2:all_weap_inf_rocket_launcher x4 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_award_rifle x4 ch0
+all_inf_officer [soldier]: 1:all_weap_inf_incinerator x10 ch0; 2:all_weap_inf_invisibility x0 ch0; 3:all_weap_inf_buff_health x1 ch1; 4:all_weap_inf_timebomb x3 ch1
+all_inf_officer_jungle [soldier]: 1:all_weap_inf_incinerator x10 ch0; 2:all_weap_inf_invisibility x0 ch0; 3:all_weap_inf_buff_health x1 ch1; 4:all_weap_inf_timebomb x3 ch1
+all_inf_officer_snow [soldier]: 1:all_weap_inf_incinerator x10 ch0; 2:all_weap_inf_invisibility x0 ch0; 3:all_weap_inf_buff_health x1 ch1; 4:all_weap_inf_timebomb x3 ch1
+all_inf_pilot [soldier]: 1:all_weap_inf_commando_pistol x4 ch0; 2:all_weap_inf_fusioncutter xNone ch0; 3:all_weap_inf_timebomb x3 ch1; 4:all_weap_award_pistol x4 ch0
+all_inf_rifleman [soldier]: 1:all_weap_inf_rifle x6 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_award_pistol x6 ch0; 5:all_weap_award_rifle x6 ch0
+all_inf_rifleman_desert [soldier]: 1:all_weap_inf_rifle x6 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_award_pistol x6 ch0; 5:all_weap_award_rifle x6 ch0
+all_inf_rifleman_fleet [soldier]: 1:all_weap_inf_rifle x6 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_award_pistol x6 ch0; 5:all_weap_award_rifle x6 ch0
+all_inf_rifleman_jungle [soldier]: 1:all_weap_inf_rifle x6 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_award_pistol x6 ch0; 5:all_weap_award_rifle x6 ch0
+all_inf_rifleman_snow [soldier]: 1:all_weap_inf_rifle x6 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_award_pistol x6 ch0; 5:all_weap_award_rifle x6 ch0
+all_inf_rifleman_urban [soldier]: 1:all_weap_inf_rifle x6 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_award_pistol x6 ch0; 5:all_weap_award_rifle x6 ch0
+all_inf_rocketeer [soldier]: 1:all_weap_inf_rocket_launcher x7 ch0; 2:all_weap_inf_pistol x4 ch0; 3:all_weap_inf_thermaldetonator x2 ch1; 4:all_weap_inf_mine_dispenser x4 ch1; 5:all_weap_award_pistol x6 ch0; 6:all_weap_award_rocket_launcher x5 ch0
+all_inf_rocketeer_fleet [soldier]: 1:all_weap_inf_rocket_launcher x7 ch0; 2:all_weap_inf_pistol x4 ch0; 3:all_weap_inf_thermaldetonator x2 ch1; 4:all_weap_inf_mine_dispenser x4 ch1; 5:all_weap_award_pistol x6 ch0; 6:all_weap_award_rocket_launcher x5 ch0
+all_inf_rocketeer_jungle [soldier]: 1:all_weap_inf_rocket_launcher x7 ch0; 2:all_weap_inf_pistol x4 ch0; 3:all_weap_inf_thermaldetonator x2 ch1; 4:all_weap_inf_mine_dispenser x4 ch1; 5:all_weap_award_pistol x6 ch0; 6:all_weap_award_rocket_launcher x5 ch0
+all_inf_rocketeer_snow [soldier]: 1:all_weap_inf_rocket_launcher x7 ch0; 2:all_weap_inf_pistol x4 ch0; 3:all_weap_inf_thermaldetonator x2 ch1; 4:all_weap_inf_mine_dispenser x4 ch1; 5:all_weap_award_pistol x6 ch0; 6:all_weap_award_rocket_launcher x5 ch0
+all_inf_sniper [soldier]: 1:all_weap_inf_sniper_rifle x7 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x2 ch1; 4:all_weap_inf_autoturret_dispenser x1 ch1; 5:all_weap_award_sniper_rifle x6 ch0; 6:all_weap_award_pistol x6 ch0
+all_inf_sniper_fleet [soldier]: 1:all_weap_inf_sniper_rifle x7 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x2 ch1; 4:all_weap_inf_autoturret_dispenser x1 ch1; 5:all_weap_award_sniper_rifle x6 ch0; 6:all_weap_award_pistol x6 ch0
+all_inf_sniper_jungle [soldier]: 1:all_weap_inf_sniper_rifle x7 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x2 ch1; 4:all_weap_inf_autoturret_dispenser x1 ch1; 5:all_weap_award_sniper_rifle x6 ch0; 6:all_weap_award_pistol x6 ch0
+all_inf_sniper_snow [soldier]: 1:all_weap_inf_sniper_rifle x7 ch0; 2:all_weap_inf_pistol x0 ch0; 3:all_weap_inf_thermaldetonator x2 ch1; 4:all_weap_inf_autoturret_dispenser x1 ch1; 5:all_weap_award_sniper_rifle x6 ch0; 6:all_weap_award_pistol x6 ch0
+all_inf_wookiee [soldier]: 1:all_weap_inf_bowcaster x6 ch0; 2:all_weap_inf_mortar_launcher x3 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_inf_remotedroid x1 ch1
+all_inf_wookiee_snow [soldier]: 1:all_weap_inf_bowcaster x6 ch0; 2:all_weap_inf_mortar_launcher x3 ch0; 3:all_weap_inf_thermaldetonator x4 ch1; 4:all_weap_inf_remotedroid x1 ch1
+all_weap_inf_remotedroid_ord [droid]: 1:all_weap_inf_remotedroid_blaster x0 ch0; 2:all_weap_inf_remotedroid_destruct x1 ch1
+cis_bldg_inf_autoturret [portableturret]: 1:cis_weap_inf_autoturret x0 ch0
+cis_hero_countdooku [soldier]: 1:cis_weap_lightsaber x0 ch0; 2:com_weap_inf_force_lightning x0 ch1; 3:com_weap_inf_force_choke x0 ch1
+cis_hero_darthmaul [soldier]: 1:cis_weap_doublesaber x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1; 3:com_weap_inf_force_push x0 ch1
+cis_hero_grievous [soldier]: 1:cis_weap_grievoussabers x0 ch0; 2:cis_weap_inf_buff_damage x0 ch1
+cis_hero_jangofett [soldier]: 1:cis_weap_hero_jangopistol x8 ch0; 2:cis_weap_hero_flamethrower x3 ch0; 3:cis_weap_inf_wrist_rocket_fett x6 ch1; 4:cis_weap_inf_timebomb x3 ch1
+cis_inf_default_engineer [soldier]: 1:cis_weap_inf_shotgun x8 ch0; 2:cis_weap_inf_fusioncutter x0 ch0; 3:cis_weap_inf_detpack x3 ch1; 4:cis_weap_inf_powerup_dispenser x5 ch1; 5:cis_weap_award_shotgun x6 ch0
+cis_inf_default_marine [soldier]: 1:cis_weap_inf_rifle x4 ch0; 2:cis_weap_inf_rocket_launcher x4 ch0; 3:cis_weap_inf_thermaldetonator x2 ch1; 4:cis_weap_award_rifle x4 ch0
+cis_inf_default_officer [soldier]: 1:cis_weap_inf_bulldog x5 ch0; 2:cis_weap_inf_mortar_launcher x3 ch0; 3:cis_weap_inf_debuff_poison x1 ch1; 4:cis_weap_inf_remotedroid x1 ch1
+cis_inf_default_pilot [soldier]: 1:cis_weap_inf_commando_pistol x0 ch0; 2:cis_weap_inf_fusioncutter x1 ch0; 3:cis_weap_inf_timebomb x3 ch1; 4:cis_weap_award_pistol x6 ch0
+cis_inf_default_rifleman [soldier]: 1:cis_weap_inf_wrist_blaster x5 ch0; 2:cis_weap_inf_wrist_trishot x0 ch0; 3:cis_weap_inf_wrist_rocket x3 ch1; 4:cis_weap_award_wrist_blaster x4 ch0
+cis_inf_default_rocketeer [soldier]: 1:cis_weap_inf_rocket_launcher x7 ch0; 2:cis_weap_inf_pistol x0 ch0; 3:cis_weap_inf_thermaldetonator x2 ch1; 4:cis_weap_inf_mine_dispenser x4 ch1; 5:cis_weap_award_pistol x6 ch0; 6:cis_weap_award_rocket_launcher x4 ch0
+cis_inf_default_sniper [soldier]: 1:cis_weap_inf_sniper_rifle x7 ch0; 2:cis_weap_inf_pistol x0 ch0; 3:cis_weap_inf_thermaldetonator x2 ch1; 4:cis_weap_inf_autoturret_dispenser x1 ch1; 5:cis_weap_award_sniper_rifle x6 ch0; 6:cis_weap_award_pistol x6 ch0
+cis_inf_droideka [walkerdroid]: 1:cis_weap_inf_repeater x0 ch0; 2:cis_weap_walk_droideka_shield x0 ch0
+cis_inf_engineer [soldier]: 1:cis_weap_inf_shotgun x8 ch0; 2:cis_weap_inf_fusioncutter x0 ch0; 3:cis_weap_inf_detpack x3 ch1; 4:cis_weap_inf_powerup_dispenser x5 ch1; 5:cis_weap_award_shotgun x6 ch0
+cis_inf_marine [soldier]: 1:cis_weap_inf_rifle x4 ch0; 2:cis_weap_inf_rocket_launcher x4 ch0; 3:cis_weap_inf_thermaldetonator x2 ch1; 4:cis_weap_award_rifle x4 ch0
+cis_inf_officer [soldier]: 1:cis_weap_inf_bulldog x5 ch0; 2:cis_weap_inf_mortar_launcher x3 ch0; 3:cis_weap_inf_debuff_poison x1 ch1; 4:cis_weap_inf_remotedroid x1 ch1
+cis_inf_officer_hunt [soldier]: 1:cis_weap_inf_bulldog x5 ch0; 2:cis_weap_inf_mortar_launcher x3 ch0; 3:cis_weap_inf_debuff_poison x1 ch1; 4:cis_weap_inf_remotedroid x1 ch1
+cis_inf_pilot [soldier]: 1:cis_weap_inf_commando_pistol x0 ch0; 2:cis_weap_inf_fusioncutter x1 ch0; 3:cis_weap_inf_timebomb x3 ch1; 4:cis_weap_award_pistol x6 ch0
+cis_inf_rifleman [soldier]: 1:cis_weap_inf_wrist_blaster x5 ch0; 2:cis_weap_inf_wrist_trishot x0 ch0; 3:cis_weap_inf_wrist_rocket x3 ch1; 4:cis_weap_award_wrist_blaster x4 ch0
+cis_inf_rocketeer [soldier]: 1:cis_weap_inf_rocket_launcher x7 ch0; 2:cis_weap_inf_pistol x0 ch0; 3:cis_weap_inf_thermaldetonator x2 ch1; 4:cis_weap_inf_mine_dispenser x4 ch1; 5:cis_weap_award_pistol x6 ch0; 6:cis_weap_award_rocket_launcher x4 ch0
+cis_inf_sniper [soldier]: 1:cis_weap_inf_sniper_rifle x7 ch0; 2:cis_weap_inf_pistol x0 ch0; 3:cis_weap_inf_thermaldetonator x2 ch1; 4:cis_weap_inf_autoturret_dispenser x1 ch1; 5:cis_weap_award_sniper_rifle x6 ch0; 6:cis_weap_award_pistol x6 ch0
+cis_weap_inf_remotedroid_ord [droid]: 1:cis_weap_inf_remotedroid_blaster x0 ch0; 2:cis_weap_inf_remotedroid_destruct x1 ch1
+com_bldg_inf_defenseturret [defensegridturret]: 1:com_weap_inf_defenseturret x0 ch0
+ewk_inf_repair [soldier]: 1:ewk_weap_inf_tool x0 ch0; 2:ewk_weap_inf_rock x50 ch1
+ewk_inf_scout [soldier]: 1:ewk_weap_inf_spear x30 ch0; 2:ewk_weap_inf_rock x50 ch1
+ewk_inf_trooper [soldier]: 1:ewk_weap_inf_spear x30 ch0; 2:ewk_weap_inf_rock x50 ch1
+gam_inf_gamorreanguard [soldier]: 1:gam_weap_inf_axe x0 ch0
+gar_inf_naboo_queen [soldier]: 1:gar_weap_inf_targetpistol x0 ch0; 2:gar_weap_inf_thermaldetonator x8 ch1
+gar_inf_soldier [soldier]: 1:gar_weap_inf_rifle x4 ch0; 2:gar_weap_inf_thermaldetonator x3 ch1
+gar_inf_temple_soldier [soldier]: 1:gar_weap_inf_rifle x4 ch0; 2:gar_weap_inf_thermaldetonator x3 ch1
+gar_inf_temple_vanguard [soldier]: 1:gar_weap_inf_torpedo_launcher x7 ch0; 2:gar_weap_inf_pistol x4 ch0
+gar_inf_vanguard [soldier]: 1:gar_weap_inf_torpedo_launcher x7 ch0; 2:gar_weap_inf_pistol x4 ch0
+geo_inf_acklay [soldier]: 1:geo_weap_lightsaber_acklay x1 ch0
+geo_inf_agro_geonosian [soldier]: 1:geo_weap_inf_bulldog x0 ch0
+geo_inf_geonosian [soldier]: 1:geo_weap_inf_blunderbuss x0 ch0
+gun_inf_defender [soldier]: 1:gun_weap_inf_fusioncutter x0 ch0; 2:gun_weap_inf_thermaldetonator x20 ch1
+gun_inf_rider [soldier]: 1:gun_weap_inf_fusioncutter x0 ch0; 2:gun_weap_inf_thermaldetonator x20 ch1
+gun_inf_soldier [soldier]: 1:gun_weap_inf_fusioncutter x0 ch0; 2:gun_weap_inf_thermaldetonator x20 ch1
+imp_bldg_inf_autoturret [portableturret]: 1:imp_weap_inf_autoturret x0 ch0
+imp_hero_bobafett [soldier]: 1:imp_weap_hero_bobarifle x4 ch0; 2:imp_weap_hero_flamethrower x3 ch0; 3:imp_weap_inf_wrist_rocket x5 ch1; 4:imp_weap_inf_detpack x4 ch1
+imp_hero_darthvader [soldier]: 1:imp_weap_lightsaber x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1; 3:com_weap_inf_force_choke x0 ch1
+imp_hero_emperor [soldier]: 1:imp_weap_sidioussaber x0 ch0; 2:com_weap_inf_force_lightning x0 ch1; 3:com_weap_inf_force_choke x0 ch1
+imp_inf_dark_trooper [soldier]: 1:imp_weap_inf_arccaster x5 ch0; 2:imp_weap_inf_commando_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x4 ch1; 4:imp_weap_award_pistol x6 ch0
+imp_inf_dark_trooper_hunt [soldier]: 1:imp_weap_inf_arccaster x5 ch0; 2:imp_weap_inf_commando_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x4 ch1; 4:imp_weap_award_pistol x6 ch0
+imp_inf_default_dark_trooper [soldier]: 1:imp_weap_inf_arccaster x5 ch0; 2:imp_weap_inf_commando_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x4 ch1; 4:imp_weap_award_pistol x6 ch0
+imp_inf_default_engineer [soldier]: 1:imp_weap_inf_shotgun x8 ch0; 2:imp_weap_inf_fusioncutter x0 ch0; 3:imp_weap_inf_detpack x3 ch1; 4:imp_weap_inf_powerup_dispenser x5 ch1; 5:imp_weap_award_shotgun x6 ch0
+imp_inf_default_marine [soldier]: 1:imp_weap_inf_rifle x4 ch0; 2:imp_weap_inf_rocket_launcher x4 ch0; 3:imp_weap_inf_thermaldetonator x4 ch1; 4:imp_weap_award_rifle x4 ch0
+imp_inf_default_officer [soldier]: 1:imp_weap_inf_sonic_blaster x5 ch0; 2:imp_weap_inf_mortar_launcher x5 ch0; 3:imp_weap_inf_buff_damage x1 ch1; 4:imp_weap_inf_remotedroid x1 ch1
+imp_inf_default_pilot [soldier]: 1:imp_weap_inf_commando_pistol x3 ch0; 2:imp_weap_inf_fusioncutter x0 ch0; 3:imp_weap_inf_timebomb x3 ch1; 4:imp_weap_award_pistol x6 ch0
+imp_inf_default_rifleman [soldier]: 1:imp_weap_inf_rifle x5 ch0; 2:imp_weap_inf_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x4 ch1; 4:imp_weap_award_rifle x5 ch0; 5:imp_weap_award_pistol x6 ch0
+imp_inf_default_rocketeer [soldier]: 1:imp_weap_inf_rocket_launcher x7 ch0; 2:imp_weap_inf_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x2 ch1; 4:imp_weap_inf_mine_dispenser x4 ch1; 5:imp_weap_award_pistol x6 ch0; 6:imp_weap_award_rocket_launcher x4 ch0
+imp_inf_default_sniper [soldier]: 1:imp_weap_inf_sniper_rifle x7 ch0; 2:imp_weap_inf_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x2 ch1; 4:imp_weap_inf_autoturret_dispenser x1 ch1; 5:imp_weap_award_sniper_rifle x6 ch0; 6:imp_weap_award_pistol x6 ch0
+imp_inf_engineer [soldier]: 1:imp_weap_inf_shotgun x8 ch0; 2:imp_weap_inf_fusioncutter x0 ch0; 3:imp_weap_inf_detpack x3 ch1; 4:imp_weap_inf_powerup_dispenser x5 ch1; 5:imp_weap_award_shotgun x6 ch0
+imp_inf_engineer_snow [soldier]: 1:imp_weap_inf_shotgun x8 ch0; 2:imp_weap_inf_fusioncutter x0 ch0; 3:imp_weap_inf_detpack x3 ch1; 4:imp_weap_inf_powerup_dispenser x5 ch1; 5:imp_weap_award_shotgun x6 ch0
+imp_inf_marine [soldier]: 1:imp_weap_inf_rifle x4 ch0; 2:imp_weap_inf_rocket_launcher x4 ch0; 3:imp_weap_inf_thermaldetonator x4 ch1; 4:imp_weap_award_rifle x4 ch0
+imp_inf_officer [soldier]: 1:imp_weap_inf_sonic_blaster x5 ch0; 2:imp_weap_inf_mortar_launcher x5 ch0; 3:imp_weap_inf_buff_damage x1 ch1; 4:imp_weap_inf_remotedroid x1 ch1
+imp_inf_officer_gray [soldier]: 1:imp_weap_inf_sonic_blaster x5 ch0; 2:imp_weap_inf_mortar_launcher x5 ch0; 3:imp_weap_inf_buff_damage x1 ch1; 4:imp_weap_inf_remotedroid x1 ch1
+imp_inf_officer_hunt [soldier]: 1:imp_weap_inf_sonic_blaster x5 ch0; 2:imp_weap_inf_mortar_launcher x5 ch0; 3:imp_weap_inf_buff_damage x1 ch1; 4:imp_weap_inf_remotedroid x1 ch1
+imp_inf_officer_snow [soldier]: 1:imp_weap_inf_sonic_blaster x5 ch0; 2:imp_weap_inf_mortar_launcher x5 ch0; 3:imp_weap_inf_buff_damage x1 ch1; 4:imp_weap_inf_remotedroid x1 ch1
+imp_inf_pilot [soldier]: 1:imp_weap_inf_commando_pistol x3 ch0; 2:imp_weap_inf_fusioncutter x0 ch0; 3:imp_weap_inf_timebomb x3 ch1; 4:imp_weap_award_pistol x6 ch0
+imp_inf_rifleman [soldier]: 1:imp_weap_inf_rifle x5 ch0; 2:imp_weap_inf_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x4 ch1; 4:imp_weap_award_rifle x5 ch0; 5:imp_weap_award_pistol x6 ch0
+imp_inf_rifleman_desert [soldier]: 1:imp_weap_inf_rifle x5 ch0; 2:imp_weap_inf_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x4 ch1; 4:imp_weap_award_rifle x5 ch0; 5:imp_weap_award_pistol x6 ch0
+imp_inf_rifleman_snow [soldier]: 1:imp_weap_inf_rifle x5 ch0; 2:imp_weap_inf_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x4 ch1; 4:imp_weap_award_rifle x5 ch0; 5:imp_weap_award_pistol x6 ch0
+imp_inf_rocketeer [soldier]: 1:imp_weap_inf_rocket_launcher x7 ch0; 2:imp_weap_inf_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x2 ch1; 4:imp_weap_inf_mine_dispenser x4 ch1; 5:imp_weap_award_pistol x6 ch0; 6:imp_weap_award_rocket_launcher x4 ch0
+imp_inf_rocketeer_snow [soldier]: 1:imp_weap_inf_rocket_launcher x7 ch0; 2:imp_weap_inf_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x2 ch1; 4:imp_weap_inf_mine_dispenser x4 ch1; 5:imp_weap_award_pistol x6 ch0; 6:imp_weap_award_rocket_launcher x4 ch0
+imp_inf_sniper [soldier]: 1:imp_weap_inf_sniper_rifle x7 ch0; 2:imp_weap_inf_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x2 ch1; 4:imp_weap_inf_autoturret_dispenser x1 ch1; 5:imp_weap_award_sniper_rifle x6 ch0; 6:imp_weap_award_pistol x6 ch0
+imp_inf_sniper_snow [soldier]: 1:imp_weap_inf_sniper_rifle x7 ch0; 2:imp_weap_inf_pistol x0 ch0; 3:imp_weap_inf_thermaldetonator x2 ch1; 4:imp_weap_inf_autoturret_dispenser x1 ch1; 5:imp_weap_award_sniper_rifle x6 ch0; 6:imp_weap_award_pistol x6 ch0
+imp_weap_inf_remotedroid_ord [droid]: 1:imp_weap_inf_remotedroid_blaster x0 ch0; 2:imp_weap_inf_remotedroid_destruct x1 ch1
+jed_knight_01 [soldier]: 1:jed_weap_lightsaber_aalya x0 ch0
+jed_knight_02 [soldier]: 1:jed_weap_lightsaber_obiwan x0 ch0
+jed_knight_03 [soldier]: 1:jed_weap_lightsaber_green x0 ch0
+jed_knight_04 [soldier]: 1:jed_weap_doublesaber x0 ch0
+jed_master_01 [soldier]: 1:jed_weap_lightsaber_aalya_master x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1
+jed_master_02 [soldier]: 1:jed_weap_doublesaber_master x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1
+jed_master_03 [soldier]: 1:jed_weap_lightsaber_aalya_master x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1
+jed_runner [soldier]: 1:jed_weap_lightsaber_aalya_master x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1
+jed_sith_01 [soldier]: 1:sit_weap_doublesaber x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1
+rep_bldg_inf_autoturret [portableturret]: 1:rep_weap_inf_autoturret x0 ch0
+rep_hero_aalya [soldier]: 1:rep_weap_lightsaber_aalya x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1; 3:com_weap_inf_force_pull x0 ch1
+rep_hero_anakin [soldier]: 1:rep_weap_lightsaber_anakin x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1; 3:com_weap_inf_force_choke x0 ch1
+rep_hero_cloakedanakin [soldier]: 1:rep_weap_lightsaber_anakin x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1; 3:com_weap_inf_force_choke x0 ch1
+rep_hero_kiyadimundi [soldier]: 1:rep_weap_lightsaber_kiyadi x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1; 3:com_weap_inf_force_pull x0 ch1
+rep_hero_macewindu [soldier]: 1:rep_weap_lightsaber x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1; 3:com_weap_inf_force_push x0 ch1
+rep_hero_macewindu_obi [soldier]: 1:rep_weap_lightsaber_obiwanv x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1; 3:com_weap_inf_force_push x0 ch1
+rep_hero_obiwan [soldier]: 1:rep_weap_lightsaber_obiwan x0 ch0; 2:com_weap_inf_sabre_throw x0 ch1; 3:com_weap_inf_force_push x0 ch1
+rep_hero_yoda [soldier]: 1:rep_weap_lightsaber_yoda x0 ch0; 2:com_weap_inf_force_pull x0 ch1; 3:com_weap_inf_force_push x0 ch1
+rep_inf_default_engineer [soldier]: 1:rep_weap_inf_shotgun x8 ch0; 2:rep_weap_inf_fusioncutter x0 ch0; 3:rep_weap_inf_detpack x3 ch1; 4:rep_weap_inf_powerup_dispenser x5 ch1; 5:rep_weap_award_shotgun x8 ch0
+rep_inf_default_jettrooper [soldier]: 1:rep_weap_inf_emp_launcher x4 ch0; 2:rep_weap_inf_commando_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x4 ch1; 4:rep_weap_award_pistol x6 ch0
+rep_inf_default_marine [soldier]: 1:rep_weap_inf_rifle x4 ch0; 2:rep_weap_inf_rocket_launcher x4 ch0; 3:rep_weap_inf_thermaldetonator x4 ch1; 4:rep_weap_award_rifle x4 ch0
+rep_inf_default_officer [soldier]: 1:rep_weap_inf_chaingun x0 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_buff_defense x1 ch1; 4:rep_weap_inf_remotedroid x1 ch1; 5:rep_weap_award_pistol x6 ch0
+rep_inf_default_pilot [soldier]: 1:rep_weap_inf_commando_pistol x0 ch0; 2:rep_weap_inf_fusioncutter x1 ch0; 3:rep_weap_inf_timebomb x3 ch1; 4:rep_weap_award_pistol x6 ch0
+rep_inf_default_rifleman [soldier]: 1:rep_weap_inf_rifle x4 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x4 ch1; 4:rep_weap_award_rifle x4 ch0; 5:rep_weap_award_pistol x6 ch0
+rep_inf_default_rocketeer [soldier]: 1:rep_weap_inf_rocket_launcher x7 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x2 ch1; 4:rep_weap_inf_mine_dispenser x4 ch1; 5:rep_weap_award_pistol x6 ch0; 6:rep_weap_award_rocket_launcher x4 ch0
+rep_inf_default_sniper [soldier]: 1:rep_weap_inf_sniper_rifle x7 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x2 ch1; 4:rep_weap_inf_autoturret_dispenser x1 ch1; 5:rep_weap_award_sniper_rifle x6 ch0; 6:rep_weap_award_pistol x6 ch0
+rep_inf_ep2_engineer [soldier]: 1:rep_weap_inf_shotgun x8 ch0; 2:rep_weap_inf_fusioncutter x0 ch0; 3:rep_weap_inf_detpack x3 ch1; 4:rep_weap_inf_powerup_dispenser x5 ch1; 5:rep_weap_award_shotgun x8 ch0
+rep_inf_ep2_jettrooper [soldier]: 1:rep_weap_inf_emp_launcher x4 ch0; 2:rep_weap_inf_commando_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x4 ch1; 4:rep_weap_award_pistol x6 ch0
+rep_inf_ep2_jettrooper_rifleman [soldier]: 1:rep_weap_inf_rifle x4 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x4 ch1; 4:rep_weap_inf_fusioncutter x1 ch1
+rep_inf_ep2_jettrooper_sniper [soldier]: 1:rep_weap_inf_sniper_rifle x7 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x2 ch1; 4:rep_weap_award_pistol x6 ch0
+rep_inf_ep2_jettrooper_training [soldier]: 1:rep_weap_inf_emp_launcher x4 ch0; 2:rep_weap_inf_commando_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x4 ch1; 4:rep_weap_award_pistol x6 ch0
+rep_inf_ep2_marine [soldier]: 1:rep_weap_inf_rifle x4 ch0; 2:rep_weap_inf_rocket_launcher x4 ch0; 3:rep_weap_inf_thermaldetonator x4 ch1; 4:rep_weap_award_rifle x4 ch0
+rep_inf_ep2_pilot [soldier]: 1:rep_weap_inf_commando_pistol x0 ch0; 2:rep_weap_inf_fusioncutter x1 ch0; 3:rep_weap_inf_timebomb x3 ch1; 4:rep_weap_award_pistol x6 ch0
+rep_inf_ep2_rifleman [soldier]: 1:rep_weap_inf_rifle x4 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x4 ch1; 4:rep_weap_award_rifle x4 ch0; 5:rep_weap_award_pistol x6 ch0
+rep_inf_ep2_rocketeer [soldier]: 1:rep_weap_inf_rocket_launcher x7 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x2 ch1; 4:rep_weap_inf_mine_dispenser x4 ch1; 5:rep_weap_award_pistol x6 ch0; 6:rep_weap_award_rocket_launcher x4 ch0
+rep_inf_ep2_rocketeer_chaingun [soldier]: 1:rep_weap_inf_chaingun x5 ch0; 2:rep_weap_inf_pistol x3 ch0; 3:rep_weap_inf_thermaldetonator x2 ch1; 4:rep_weap_inf_thermaldetonator x2 ch1; 5:rep_weap_award_pistol x6 ch0; 6:rep_weap_award_rocket_launcher x4 ch0
+rep_inf_ep2_sniper [soldier]: 1:rep_weap_inf_sniper_rifle x7 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x2 ch1; 4:rep_weap_inf_autoturret_dispenser x1 ch1; 5:rep_weap_award_sniper_rifle x6 ch0; 6:rep_weap_award_pistol x6 ch0
+rep_inf_ep3_engineer [soldier]: 1:rep_weap_inf_shotgun x8 ch0; 2:rep_weap_inf_fusioncutter x0 ch0; 3:rep_weap_inf_detpack x3 ch1; 4:rep_weap_inf_powerup_dispenser x5 ch1; 5:rep_weap_award_shotgun x8 ch0
+rep_inf_ep3_jettrooper [soldier]: 1:rep_weap_inf_emp_launcher x4 ch0; 2:rep_weap_inf_commando_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x4 ch1; 4:rep_weap_award_pistol x6 ch0
+rep_inf_ep3_marine [soldier]: 1:rep_weap_inf_rifle x4 ch0; 2:rep_weap_inf_rocket_launcher x4 ch0; 3:rep_weap_inf_thermaldetonator x4 ch1; 4:rep_weap_award_rifle x4 ch0
+rep_inf_ep3_officer [soldier]: 1:rep_weap_inf_chaingun x0 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_buff_defense x1 ch1; 4:rep_weap_inf_remotedroid x1 ch1; 5:rep_weap_award_pistol x6 ch0
+rep_inf_ep3_pilot [soldier]: 1:rep_weap_inf_commando_pistol x0 ch0; 2:rep_weap_inf_fusioncutter x1 ch0; 3:rep_weap_inf_timebomb x3 ch1; 4:rep_weap_award_pistol x6 ch0
+rep_inf_ep3_rifleman [soldier]: 1:rep_weap_inf_rifle x4 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x4 ch1; 4:rep_weap_award_rifle x4 ch0; 5:rep_weap_award_pistol x6 ch0
+rep_inf_ep3_rocketeer [soldier]: 1:rep_weap_inf_rocket_launcher x7 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x2 ch1; 4:rep_weap_inf_mine_dispenser x4 ch1; 5:rep_weap_award_pistol x6 ch0; 6:rep_weap_award_rocket_launcher x4 ch0
+rep_inf_ep3_sniper [soldier]: 1:rep_weap_inf_sniper_rifle x7 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x2 ch1; 4:rep_weap_inf_autoturret_dispenser x1 ch1; 5:rep_weap_award_sniper_rifle x6 ch0; 6:rep_weap_award_pistol x6 ch0
+rep_inf_ep3_sniper_felucia [soldier]: 1:rep_weap_inf_sniper_rifle x7 ch0; 2:rep_weap_inf_pistol x0 ch0; 3:rep_weap_inf_thermaldetonator x2 ch1; 4:rep_weap_inf_autoturret_dispenser x1 ch1; 5:rep_weap_award_sniper_rifle x6 ch0; 6:rep_weap_award_pistol x6 ch0
+rep_weap_inf_remotedroid_ord [droid]: 1:rep_weap_inf_remotedroid_blaster x0 ch0; 2:rep_weap_inf_remotedroid_destruct x1 ch1
+snw_inf_wampa [soldier]: 1:hot_weap_lightsaber_wampa x0 ch0
+tat_inf_jawa [soldier]: 1:tat_weap_inf_jawa_arccaster x0 ch0; 2:tat_weap_inf_jawa_fusioncutter x0 ch0
+tat_inf_tuskenhunter [soldier]: 1:tat_weap_inf_tuskensniperrifle x0 ch0
+tat_inf_tuskenraider [soldier]: 1:tat_weap_inf_tuskenrifle x0 ch0
+wok_inf_mechanic [soldier]: 1:wok_weap_inf_bowcaster x5 ch0; 2:wok_weap_inf_fusioncutter x1 ch0
+wok_inf_rocketeer [soldier]: 1:wok_weap_inf_torpedo_launcher x7 ch0; 2:wok_weap_inf_bowcaster x6 ch0
+wok_inf_warrior [soldier]: 1:wok_weap_inf_bowcaster x6 ch0; 2:wok_weap_inf_thermaldetonator x4 ch1

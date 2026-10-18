@@ -1,0 +1,82 @@
+---
+id: BOTD
+title: The bot design: what the best AI soldier for this game is - one architecture note (layers, one owner per output, where we match the PS2 and where we deliberately beat it, difficulty tiers), reviewed by the maintainer, then the build cards cut from it
+milestone: M3
+value: 5
+phase: re
+status: done
+deps: SAIR,BOTM
+files: analysis/bot-design.md
+declares:
+needs:
+effort:
+branch:
+resume: the maintainer read it: 'BOTD read, go' (INBOX 2026-10-03 14:08), all eight defaults; filed on the build cards by the planner of 2026-10-05. First build card: SPL11.
+created: 2026-10-02
+alpha: yes
+first: 5
+---
+
+## Why
+The maintainer, 2026-10-02: "are we just implementing so many bandaid fixes to a fundamentally flawed bot algorithm ... have opus think more about high level what the best ai bot looks like for this game, and then implement and fix by going into the details or spawning subagents." Do not start a rewrite before this note exists and the maintainer has read it (STATUS "For the maintainer").
+
+## The starting sketch (Claude + the maintainer, 2026-10-02 - argue with it, measure, replace)
+**Keep (works, is the PS2's):** the commander's goals (re-conquest-goal), routing on the disc's hubs / connections / weights, barriers as the obstacles, hint nodes, the difficulty table, the walker steering, the deterministic 0-alloc sim, the sweep + black box.
+**Wrong today:** (a) several rules write the same output (move goal, stick, fire) with no arbitration and no commitment -> stutter (JITR); (b) the local layer senses collision with sweeps and patches cases (ramp, rail, steep, drop, fan, slide) instead of following the PS2's model (waypoints across a connection + barrier corners) plus one general avoidance; (c) no awareness of friends (FFLN, stacking), vehicles, turrets, props (OBST); (d) failure is hidden by recycle / lost / stuck timers (RCYC) rather than prevented; (e) no positional sense in a fight - bots hold in the open or pinball; (f) tiers scale chances, not competence.
+**The shape to design:**
+1. **Layers with one owner each**: Commander (team goal -> post) -> Squad / role (who goes, who defends, who takes the turret or vehicle) -> Navigator (hub route, waypoints, barrier corners) -> Tactician (where to stand in a fight: scored positions) -> Mover (ONE writer of the stick: follow, arrive, avoid; commit times; speed fits the step) -> Gunner (target, line of fire, bursts, tier). Each layer reads the one above and writes only its own output.
+2. **Behaviour selection with commitment** (a small state machine or behaviour tree per bot: advance, fight from position, take cover, flank, retreat / heal, capture, defend, board, special per class), entry AND exit conditions, minimum dwell - no rule fires every tick.
+3. **Local avoidance, general**: one steering that treats barriers, props with collision, vehicles, turrets and other soldiers as obstacles (velocity-obstacle / ORCA style or the PS2's corner rule extended), with side hysteresis. Replaces fan / slide / sidestep patches.
+4. **Tactical positions**: score candidate spots near the fight (authored Cover / Snipe hints first, then sampled points): cover from the known enemy, line of fire to him, distance band for the weapon, not occupied / reserved by a friend, not in a friend's line, on the level. Reservation gives spacing for free.
+5. **Team sense**: friends' positions and lines of fire, do not stack, do not all pick the same post or the same spot, cover a friend capturing, follow the human's squad order.
+6. **Difficulty as competence** (the maintainer wants better tiers): reaction time, aim error and tracking, burst discipline, use of cover and flanking, grenade and secondary use, target priority, awareness radius - Easy is slow and plain, Elite uses everything; never by cheating on damage or sight through walls.
+7. **Named deviations**: where the design departs from SAIR's table, list it as a NAMED deviation with the reason (the PS2 behaviour that annoys), so nothing is changed by accident. **No 'classic bots' menu option** (the maintainer, 2026-10-02: "Ours will be better, there is no need") - the list is a record, not a switch.
+**Outside references to read and cite in the note** (ideas, never code): Bungie's GDC talks on Halo's AI (Griesemer / Butcher 'The Illusion of Intelligence'; Isla 'Handling Complexity in the Halo 2 AI' - behaviour trees, firing positions, commitment), Guerrilla's Killzone position evaluation (Straatman et al.), F.E.A.R.'s planner (Orkin, 'Three States and a Plan'), Reynolds' steering behaviours, ORCA / RVO2 (van den Berg), Recast / Detour crowd; Battlefield-style bot write-ups if found. The maintainer mentioned a Halo CE decompilation - not verified by Claude; if it exists it is reading material only.
+
+## The maintainer's list: what annoys him in the ORIGINALS' bots (2026-10-02, "off the top of my head, I'm sure there are other things") - each is a deviation to design for
+1. **Turrets are a bot trap.** "If there is an empty turret, they'll get in the turret and rarely leave unless they're being shot at or die. On maps like Kamino with lots of turrets, the last few bots to kill are hiding somewhere sitting in a turret. I like bots using turrets, but there should be more purpose ... it can take the turret, sit in it for a while whether for defense or offense or it's a good spot, but as the game changes they should move on. On Coruscant there is one part of the map that is outside and no fighting ever takes place out there, but there is almost always one bot hanging in the turret outside and it doesn't leave."
+   Design: a turret is a POSITION scored like any other (is there an enemy it can see or a post it defends? when did it last have a target?), taken with a purpose (defend this post / cover this approach), left after a quiet time or when the fight moves or the team is nearly out of units; never the last soldiers' hiding place (endgame: get out and hunt). SAIR: find the PS2's turret-boarding rule and its leave rule (the mod docs: "turrets ... are treated like Hint Nodes by the AI").
+2. **Dead parts of maps, and always the same hotspots.** "Some maps have totally unused parts - the one outside part of Coruscant (not where a cp is), no one ever goes there. On some maps you just know where everyone is going to go. That is sometimes really fun ... but other parts of the map are being neglected."
+   His idea, with his own cautions: modern hardware allows more units - e.g. 16 -> 32 alive per team and a larger reinforcement count (maybe ~400 total) - and bots that use the space better; plus a LITTLE per-match randomness that tips the route weights (the planning connections' weights) so each match prefers slightly different ways. "We'd have to be careful: some changes could make the bots actually dumb or some maps way worse, especially big maps - if everyone is more spread out than they already are that wouldn't be as fun. And some tipping would give the bots a horrible attack / defence strategy. It is still fun to have fighting hotspots."
+   Design: (a) measure first - a per-map heat map of unit-time and of kills over 8 seeds, PS2 beside the port (BOTM), naming the unused hubs / connections / hint nodes; (b) a per-match seeded tilt of connection weights within a small band (order +-10-20 %), bounded so the shortest route to an objective is never abandoned and never on a map whose contact rate falls; flanking routes get their share through the squad / role layer rather than through everyone wandering; (c) unit counts as a per-map setting scaled by map area and contact rate, a separate card with its own perf and feel measurements (sim cost per bot, 30 Hz with 64-128 bots, frame time) - the bars: contact (enemy within 20 m share) and kills / min must not fall, hotspots must still exist (the top 3 cells keep a large share of the kills), round length stays in band. The maintainer decides the defaults from a table.
+3. **BF1 bots that just stop.** "In BF1 some bots just stop moving ... towards the end of a match when the enemy has 2 or 3 units left, you find them standing somewhere random like a corner of the map - not stuck or out of bounds, just stopped. When you get close they start moving and shooting again. I don't see that in BF2 as much. We don't want a bot that stops in a corner and shuts down waiting for the action to come to it."
+   Design: no behaviour has 'idle' as an end state - a bot with no enemy and no order always has a goal (advance on a post, hunt the last known enemy, regroup with friends), and the endgame (few units left) switches both teams to hunt. SAIR: find why BF1's bot stops (likely an AI level-of-detail / sleep when far from any player, or a goal with no target) and whether BF2 changed it; the port must not copy it, and the sweep counts 'alive, not fighting, not moving for 20 s' per map (BOTM).
+
+## Deliverable
+`analysis/bot-design.md`: the layer diagram and each layer's inputs / outputs / owner; the behaviour list with entry / exit / dwell; SAIR's table with a verdict per row (match / deviate + why); the tiers; BOTM's bars (which numbers must equal the PS2's, which must beat it); what of today's `core/src/ai` is kept, moved, deleted; the build order as cards (each landable alone, the sweep green at each step: mover first, then avoidance, then positions, then team sense, then tiers); risks (determinism, 0-alloc, 64 bots at 30 Hz - a budget per layer).
+A summary for the maintainer in STATUS with the decisions that are his (the deviations list, the tiers' feel).
+
+## Acceptance
+- The note; the maintainer's read recorded (INBOX) before any build card from it is taken; the build cards opened with deps.
+- No engine code in this card.
+
+## The bot programme (the maintainer, 2026-10-02) - five cards, read together
+`JITR` (stop the tweaking now) -> `FFLN` (teammates in the line of fire) -> `BOTM` (bot-quality numbers, PS2 beside the port) -> `SAIR` (RE the PS2 foot soldier's own AI) -> `BOTD` (the design: what the best bot for this game is, then the build cards). `OBST` (walking into props) belongs to the same family.
+The maintainer: "If the bots suck, the whole game is worthless so we NEED to get this right." He agrees to RE the PS2 soldier AI FIRST, then keep what is good and DELIBERATELY do better where the originals annoy (the originals' bots are not perfect; better difficulty levels, more awareness). The port's soldier brain today is ~9,200 lines (`core/src/ai`, `commander.rs`) of rules added one symptom at a time (hold, shuffle, strafe, dodge, slide, fan, stuck, stall, lost, recycle), most of them OURS/PROVISIONAL: no RE note exists for the soldier's second-to-second movement and combat.
+Reference pulled 2026-10-02: the official mod-tools documentation as markdown, `community_mods/gametoast_lua/doc/StarWarsBattlefrontII/documentation/` (`game.md`, `ZeroEditor_guide.md` - barriers, planning hubs/connections/weights/filters, hint nodes; `odf_guide.md`; `Battlefront2_scripting_system.md`), executable strings per platform `community_mods/gametoast_lua/doc/StarWarsBattlefrontII/StringsFromExecutable/` (the PS2's too), a PC DEBUG build `community_mods/gametoast_lua/doc/StarWarsBattlefrontII/Debugger_exes/`, 15 years of Gametoast forum posts `community_mods/gametoast_lua/doc/Archives/Gametoast.com/*.json`.
+
+
+## Planner 2026-10-02 17:45 - how the build cards are wired (the maintainer's INBOX 17:20 / 17:40)
+- **Every build card you cut goes into BOTV's `deps:`** in the same session (`loopctl.py set BOTV deps=<current>,<new>`). PERF and UCNT depend on BOTV, so they wait for the redesigned bots on main, as the maintainer ordered. Give each build card `deps: BOTD`.
+- **The maintainer reads the note before any build card is taken:** when the note is written, set this card `needs=maintainer - read analysis/bot-design.md (STATUS For the maintainer)` and leave `status=in-progress`; it closes when the maintainer's read is in INBOX. The build cards wait on it through `deps: BOTD`.
+- **Cards held for you** (deps BOTD added today; adopt, rewrite or close each): OBST, FGHT (its RE folded into SAIR), LLEG, GRAI, RETW, PWAI, TIER, SPL11. `files:` here is now only the note (`analysis/bot-design.md`): the `core/src/ai/` entry was a prefix the picker cannot match.
+
+## Result (2026-10-03, lane 2; report `reports/20261003_0020_card_BOTD.md`) - the note is written; WAITING FOR THE MAINTAINER'S READ
+- **`analysis/bot-design.md`** (commit 230693e, 806 lines; section 0 is the one page for the maintainer). One owner per output on the PS2's own skeleton: Commander (kept) -> Team board -> Behaviour (one runs; entry, exit, minimum time; no idle state) -> Navigator + Tactician (a position table with real cover, built at load) -> Mover (the only writer of the stick: arrive and stand; barriers every step, never entered; one sampled avoidance; a probe every 5th tick instead of the sweep) + Gunner.
+- **Measured for it** (tools `lead_tmp/botd/tools/`, output `lead_tmp/botd/out/`): the steering is 53-71 % of the sim's CPU; the PS2's bots stand inside a soldier barrier 0.3-1.2 % of their time (the port's 1.1-3.9 %), and a port bot stalled against a body is inside one in 36 %, inside its 0.5 m margin in 72 %, within 1 m in 84 %; the route table has a second way toward a post at 0-2 % of its entries (the maintainer's weight tilt has nothing to tilt) but another route within +35 % exists for most post pairs on most maps; 82 of 185 posts have a covered authored Cover hint within 30 m, 154 have five covered positions with barrier-edge points; a ray test costs 0.94 us.
+- **Verifier:** 81 claims - 65 SUPPORTED, 16 PARTLY (folded in), 0 NOT. It sank the first headline ("96 % of stalls cross a barrier": a random line does in 90 %) and two wrong inputs (TAT1's post hubs, UTA1's plan); the lead re-derived each corrected figure and added the PS2-against-barriers measurement.
+- **Cards:** 6 new (MOVR, TPOS, TEAM, TURR, FLNK, TCMP), 10 adopted with a "BOTD (2026-10-03)" section and new deps (SPL11 = the seams, HUBP, OBST = the avoidance, LLEG, RETW, FGHT, GRAI, TIER, ENGR, PWAI). All have `deps: BOTD`; BOTV's deps name all but ENGR and PWAI. HUBM (the audit's card) is not held.
+- **The maintainer's eight decisions** are in the note's section 0 and in STATUS "For the maintainer: the bot design"; each has a default, so the build can start on his "read, go" alone.
+- **To close this card** (planner, when the maintainer's read is in INBOX): record his answers on the cards they touch (TCMP: the damage bonus; TPOS: decision 3; FLNK: the share; a garrison card only if he wants one), `loopctl.py set BOTD needs= status=done`. Until then no build card of section 12 is eligible (deps BOTD).
+
+## Planner 2026-10-03 03:35 - for the planner who files the maintainer's answer
+Since this card was written: (1) **LOC3** (audit HUBM, value 4, `deps: BOTD`, now in BOTV's deps) is a seventeenth
+bot build card - the PS2's locate in 3-D with the arc kept as an arc. Rank it against HUBP when the maintainer has answered:
+both edit `ai/route.rs`, and LOC3 changes which hub a route starts from, so it belongs before MOVR's stuck test is
+tuned. The audit calls it "one open design point for your BOTD read"; the default is that nothing changes until then.
+(2) AQD (BF1 YAV1's aqueduct re-plan) is merged into LOC3. (3) BLKF is raised to 5 so the black box is right before
+SPL11 splits `brain.rs`. (4) BOTV carries the rule for the relative bars' baseline.
+
+## The maintainer's read (2026-10-03 14:08, INBOX) - "BOTD read, go"
+All eight decisions take the bracketed defaults of bot-design.md section 0: (1) the 16 deviations D1-D16 all on; (2) tiers as competence, Hard / Elite lose the damage bonus; (3) the shuffle / strafe chances are replaced by the peek cycle and a new position every 5-12 s; (4) no garrison; (5) flankers 20 % per match (10-30); (6) no sprint on long walks; (7) the corpse shot not built; (8) one think rate everywhere. His other defaults in STATUS "Questions for the maintainer" stand, and the 17:40 order: no PERF baseline before the redesign.
+Filed by the planner of 2026-10-05 15:40 on SPL11, HUBP, LOC3, MOVR, OBST, LLEG, RETW, FGHT, TPOS, TEAM, TURR, FLNK, GRAI, TIER, TCMP, ENGR, PWAI and BOTV (a dated note on each); this card closed. Order: SPL11 first, then HUBP, LOC3, MOVR, OBST ... BOTV, PERF, UCNT.

@@ -1,0 +1,449 @@
+//! Pickups (card PWUP, `analysis/re-powerups.md`): what a dead soldier drops,
+//! the item on the ground and who takes it. Step 5c of the tick.
+//!
+//! - The drop (§3.2, §3.4): a class with a drop table spends ONE draw of the
+//!   game's LCG at its death; the table is walked subtracting each
+//!   probability and the first entry that takes it below zero is the item —
+//!   unless the pool is full. It starts 1.0 m over the feet, upright, facing
+//!   the soldier's heading, with the soldier's velocity (BF1), or (BF2) with
+//!   it when it is faster than 3 m/s, else 3 m/s to the soldier's left.
+//! - The item (§4): gravity -9.8, lands on the first floor it reaches
+//!   (`Rebound` 0, `Friction` 1), life `LifeSpan` -> -1 s, then gone.
+//! - The pickup (§5.2): any living soldier or droid of EITHER team whose
+//!   body touches the item's box, once it has landed or is 0.5 s old; health
+//!   to the cap, clips to every weapon's cap, BF2 energy and the offense /
+//!   defense timers; taken only when it gave something.
+//!
+//! PROVISIONAL (ours): the port's death is immediate, so the drop is too (the
+//! PS2 waits out a thrown or tumbling body, §3.3); the item lands by a floor
+//! ray, with no wall contact; the touch is tested every tick for every unit
+//! (the PS2 needs one of the two to move, §5.7); a weapon's reserve cap is
+//! the reserve it spawned with. Heroes (no health, a wasted buff, §5.3, §5.5)
+//! and the dispenser weapon's skip (§5.4) wait for those units to exist.
+
+use super::state::{DeathCause, Event, Sim};
+use crate::fmath;
+use crate::soldier::GroundRules;
+use crate::unit::{Unit, UnitHandle, UnitSpec};
+use crate::weapon::{HealthType, WeaponClass, WeaponState, SPARE_INFINITE};
+use glam::Vec3;
+
+/// The slots of a soldier class's drop table (both discs, §3.1).
+pub const MAX_DROPS: usize = 8;
+/// The `PowerupItem` pool's default capacity (both games, §2.4).
+pub const ITEM_POOL_DEFAULT: usize = 25;
+/// How far over the feet an item starts (§3.4).
+pub const DROP_HEIGHT: f32 = 1.0;
+/// BF2: a victim slower than this sends its item to its left at this speed
+/// (m/s; the PS2 compares the squared speed with 9.0, §3.4).
+pub const DROP_SIDE_SPEED: f32 = 3.0;
+/// An item's gravity (m/s2 x its class's `Gravity` 1.0, §3.4).
+pub const ITEM_GRAVITY: f32 = -9.8;
+/// An item in flight is taken only once it is older than this (s, §5.2).
+pub const TAKE_AGE: f32 = 0.5;
+/// The item is removed when its life reaches this (s, §4).
+pub const LIFE_END: f32 = -1.0;
+/// The taker's body: a soldier's collision sphere (`re-soldier-walls.md`),
+/// its radius and how far ahead of the feet its centre is (§5.7).
+pub const BODY_RADIUS: f32 = 0.57;
+pub const BODY_AHEAD: f32 = 0.15;
+/// The height of the body the box is tested against (m; PROVISIONAL, the
+/// standing soldier's).
+const BODY_HEIGHT: f32 = 1.8;
+
+/// One `powerupitem` class (§2.1), built by `game::roster` from the disc.
+/// SETUP data like `Sim::weapon_classes`: not hashed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ItemClass {
+    pub name: String,
+    /// `SoldierHealth`: points given to a person or a droid, up to its cap.
+    pub health: f32,
+    /// `SoldierAmmo`: clips added to every weapon's reserve.
+    pub ammo: u32,
+    /// BF2 `SoldierEnergy`.
+    pub energy: f32,
+    /// BF2 `BuffOffenseTimer` (s) and `BuffOffenseMult`.
+    pub offense: (f32, f32),
+    /// BF2 `BuffDefenseTimer` (s) and `BuffDefenseMult`.
+    pub defense: (f32, f32),
+    /// `LifeSpan` (s; 30 on every disc item).
+    pub life_span: f32,
+    /// The collision box, from the model's bounds (§2.3): half extents and
+    /// centre in the item's frame.
+    pub half: Vec3,
+    pub centre: Vec3,
+    /// What the game layer draws and plays (the sim reads none of it):
+    /// `GeometryName`, `PowerupSound` (at the item when it is taken) and
+    /// BF1's `CollisionOtherSound` (when it lands).
+    pub geometry: String,
+    pub pickup_sound: Option<String>,
+    pub land_sound: Option<String>,
+}
+
+impl ItemClass {
+    /// An item that gives `health` and `ammo`, with the smallest disc box.
+    pub fn basic(name: &str, health: f32, ammo: u32) -> Self {
+        ItemClass {
+            name: name.to_owned(),
+            health,
+            ammo,
+            energy: 0.0,
+            offense: (0.0, 1.0),
+            defense: (0.0, 1.0),
+            life_span: 30.0,
+            half: Vec3::new(0.0965, 0.2381, 0.0965),
+            centre: Vec3::new(0.0, 0.237, 0.0),
+            geometry: String::new(),
+            pickup_sound: None,
+            land_sound: None,
+        }
+    }
+}
+
+/// A soldier class's drop table (§3.1): up to [`MAX_DROPS`] (item class,
+/// probability) pairs in slot order. `item` indexes `Sim::item_classes`;
+/// `u8::MAX` is a slot with a probability and no class (it spends its share
+/// and drops nothing).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DropTable {
+    pub count: u8,
+    pub item: [u8; MAX_DROPS],
+    pub prob: [f32; MAX_DROPS],
+}
+
+impl DropTable {
+    pub fn from_pairs(pairs: &[(u8, f32)]) -> Self {
+        let mut t = DropTable::default();
+        for (i, (item, prob)) in pairs.iter().take(MAX_DROPS).enumerate() {
+            t.item[i] = *item;
+            t.prob[i] = *prob;
+            t.count = i as u8 + 1;
+        }
+        t
+    }
+
+    /// The walk (§3.2): the slot a roll `r` in [0, 1) picks, if any.
+    pub fn pick(&self, mut r: f32) -> Option<u8> {
+        for i in 0..usize::from(self.count) {
+            r -= self.prob[i];
+            if r < 0.0 {
+                return (self.item[i] != u8::MAX).then_some(self.item[i]);
+            }
+        }
+        None
+    }
+}
+
+/// An item on the field (`Sim::pickups`). HASHED.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pickup {
+    /// Index into `Sim::item_classes`.
+    pub class: u8,
+    /// The item's origin (the bottom of its model).
+    pub pos: Vec3,
+    pub vel: Vec3,
+    /// Its heading (the dead soldier's).
+    pub yaw: f32,
+    /// Runs from the class's `LifeSpan` down to [`LIFE_END`].
+    pub life: f32,
+    pub landed: bool,
+}
+
+impl Pickup {
+    pub fn hash_into(&self, eat: &mut impl FnMut(&[u8])) {
+        eat(&[self.class, self.landed as u8]);
+        for v in [
+            self.pos.x, self.pos.y, self.pos.z, self.vel.x, self.vel.y, self.vel.z, self.yaw,
+            self.life,
+        ] {
+            eat(&v.to_bits().to_le_bytes());
+        }
+    }
+}
+
+/// The reserve (rounds) the weapon in class slot `slot` spawned with: the
+/// cap an ammo item fills it to.
+fn reserve_cap(spec: &UnitSpec, slot: u8, class: &WeaponClass) -> u32 {
+    let clips = if slot == spec.weapon_slot {
+        spec.spare_clips
+    } else {
+        spec.slots
+            .iter()
+            .find(|s| s.slot == slot)
+            .map_or(0, |s| s.clips.saturating_sub(1))
+    };
+    clips.saturating_mul(class.rounds_per_clip)
+}
+
+/// §5.4 for one weapon: `clips` more in reserve, up to `cap` rounds. A
+/// weapon with an endless reserve is unchanged.
+fn give_clips(w: &mut WeaponState, class: &WeaponClass, clips: u32, cap: u32) -> bool {
+    if clips == 0 || class.infinite_ammo() || w.spare == SPARE_INFINITE {
+        return false;
+    }
+    let new = w
+        .spare
+        .saturating_add(clips.saturating_mul(class.rounds_per_clip))
+        .min(cap.max(w.spare));
+    let changed = new != w.spare;
+    w.spare = new;
+    changed
+}
+
+/// Does `u`'s body touch `p`'s box (§5.7)? The body is an upright capsule of
+/// [`BODY_RADIUS`] whose axis stands [`BODY_AHEAD`] in front of the feet.
+fn touches(u: &Unit, p: &Pickup, c: &ItemClass) -> bool {
+    let (sy, cy) = fmath::sin_cos(u.soldier.yaw);
+    let axis = u.soldier.pos + Vec3::new(-sy, 0.0, -cy) * BODY_AHEAD;
+    // Into the item's frame (yaw about +Y, forward = -Z at yaw 0).
+    let (si, ci) = fmath::sin_cos(p.yaw);
+    let d = axis - p.pos;
+    let local = Vec3::new(d.x * ci - d.z * si, d.y, d.x * si + d.z * ci) - c.centre;
+    let dx = (local.x.abs() - c.half.x).max(0.0);
+    let dz = (local.z.abs() - c.half.z).max(0.0);
+    // The capsule's axis runs from one radius over the feet to one under the
+    // head; the vertical gap between that span and the box.
+    let (lo, hi) = (local.y + BODY_RADIUS, local.y + BODY_HEIGHT - BODY_RADIUS);
+    let dy = (lo - c.half.y).max(-c.half.y - hi).max(0.0);
+    dx * dx + dy * dy + dz * dz <= BODY_RADIUS * BODY_RADIUS
+}
+
+impl Sim {
+    /// Register an item class (one entry per name) and return its index.
+    pub fn add_item_class(&mut self, c: ItemClass) -> u8 {
+        if let Some(i) = self.item_classes.iter().position(|x| x.name == c.name) {
+            return i as u8;
+        }
+        self.item_classes.push(c);
+        (self.item_classes.len() - 1) as u8
+    }
+
+    /// A soldier died (§3.2): its class's roll and, with room in the pool,
+    /// the item. Called before the unit leaves its seat, with the body where
+    /// the death left it. `cause` is `None` for damage.
+    pub(super) fn drop_item(&mut self, h: UnitHandle, cause: Option<DeathCause>) {
+        // The port's recycles remove a bot; they are not deaths.
+        if matches!(cause, Some(DeathCause::Lost | DeathCause::Stalled)) {
+            return;
+        }
+        let u = &self.units[h.index as usize];
+        let table = u.spec.drops;
+        if table.count == 0 {
+            return;
+        }
+        let (feet, vel, yaw) = (u.soldier.pos, u.soldier.vel, u.soldier.yaw);
+        // One roll, spent whether or not anything comes of it.
+        let r = self.lcg.unit();
+        let Some(class) = table.pick(r) else {
+            return;
+        };
+        let Some(ic) = self.item_classes.get(usize::from(class)) else {
+            return;
+        };
+        if self.pickups.len() >= self.item_pool {
+            return;
+        }
+        // BF2's create gate (§3.2): nothing is made while the game is held.
+        // [H] what the hold is; the port takes "the round is decided".
+        let bf2 = self.ground_rules == GroundRules::Bf2;
+        if bf2 && self.outcome.is_some() {
+            return;
+        }
+        let vel = if bf2 && vel.length_squared() <= DROP_SIDE_SPEED * DROP_SIDE_SPEED {
+            // Row 0 of the soldier's matrix = up x forward: its left.
+            let (sy, cy) = fmath::sin_cos(yaw);
+            Vec3::new(-cy, 0.0, sy) * DROP_SIDE_SPEED
+        } else {
+            vel
+        };
+        let pos = feet + Vec3::Y * DROP_HEIGHT;
+        self.pickups.push(Pickup {
+            class,
+            pos,
+            vel,
+            yaw,
+            life: ic.life_span,
+            landed: false,
+        });
+        self.events.push(Event::ItemDropped { item: class, pos });
+    }
+
+    /// Step 5c: every item's flight and life, then the pickups.
+    pub(super) fn tick_pickups(&mut self, dt: f32) {
+        // The buffs run down whether or not an item is on the field (§5.5).
+        for u in &mut self.units {
+            u.buffs.tick(dt);
+        }
+        if self.pickups.is_empty() {
+            return;
+        }
+        for i in 0..self.pickups.len() {
+            let mut p = self.pickups[i];
+            p.life -= dt;
+            if !p.landed {
+                let from_y = p.pos.y;
+                p.vel.y += ITEM_GRAVITY * dt;
+                p.pos += p.vel * dt;
+                let floor = self.floor_point_under(p.pos, from_y);
+                if p.pos.y <= floor {
+                    p.pos.y = floor;
+                    p.vel = Vec3::ZERO;
+                    p.landed = true;
+                    self.events.push(Event::ItemLanded {
+                        item: p.class,
+                        pos: p.pos,
+                    });
+                }
+            }
+            self.pickups[i] = p;
+        }
+        // Gone: the life ran out, or it fell out of the world (§4).
+        self.pickups
+            .retain(|p| p.life > LIFE_END && p.pos.y > -500.0);
+        let mut i = 0;
+        while i < self.pickups.len() {
+            if self.take_item(i) {
+                self.pickups.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// §5.2 for item `i`: the first living soldier (in slot order) that
+    /// touches it and gains something takes it.
+    fn take_item(&mut self, i: usize) -> bool {
+        let p = self.pickups[i];
+        let Some(c) = self.item_classes.get(usize::from(p.class)) else {
+            return false;
+        };
+        if !p.landed && c.life_span - p.life <= TAKE_AGE {
+            return false;
+        }
+        for ui in 0..self.units.len() {
+            let u = &self.units[ui];
+            // A rider is not in the world; an animal, a vehicle and a
+            // building get nothing from any disc item (§2.2).
+            if !u.alive
+                || u.mount.is_some()
+                || !matches!(u.health.health_type, HealthType::Person | HealthType::Droid)
+                || !touches(u, &p, c)
+            {
+                continue;
+            }
+            let c = c.clone();
+            let classes = &self.weapon_classes;
+            let u = &mut self.units[ui];
+            let health = c.health != 0.0 && u.health.cur < u.health.max;
+            if health {
+                u.health.cur = (u.health.cur + c.health).min(u.health.max);
+            }
+            let mut ammo = false;
+            if c.ammo > 0 {
+                let wc = &classes[u.weapon_class];
+                let cap = reserve_cap(&u.spec, u.weapon_slot, wc);
+                ammo |= give_clips(&mut u.weapon, wc, c.ammo, cap);
+                let spec = u.spec.clone();
+                for w in &mut u.held {
+                    let wc = &classes[w.class];
+                    let cap = reserve_cap(&spec, w.slot, wc);
+                    ammo |= give_clips(&mut w.state, wc, c.ammo, cap);
+                }
+            }
+            let energy = c.energy > 0.0 && u.soldier.energy < u.consts.energy_bar;
+            if energy {
+                u.soldier.energy = (u.soldier.energy + c.energy).min(u.consts.energy_bar);
+            }
+            // A buff item is always taken (§5.5); the timer and its number
+            // are replaced only by a longer timer.
+            let buff = c.offense.0 > 0.0 || c.defense.0 > 0.0;
+            if c.offense.0 > u.buffs.offense.0 {
+                u.buffs.offense = c.offense;
+            }
+            if c.defense.0 > u.buffs.defense.0 {
+                u.buffs.defense = c.defense;
+            }
+            if health || ammo || energy || buff {
+                let unit = UnitHandle {
+                    index: ui as u32,
+                    gen: u.gen,
+                };
+                self.events.push(Event::ItemTaken {
+                    unit,
+                    item: p.class,
+                    pos: p.pos,
+                    health,
+                    ammo,
+                    energy,
+                });
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// BF2's timed buffs on a unit (§5.5): each a timer (s) and its multiplier.
+/// HASHED while one runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Buffs {
+    /// Damage dealt x the multiplier while the timer runs.
+    pub offense: (f32, f32),
+    /// Damage taken x the multiplier while the timer runs.
+    pub defense: (f32, f32),
+}
+
+impl Default for Buffs {
+    fn default() -> Self {
+        Buffs {
+            offense: (0.0, 1.0),
+            defense: (0.0, 1.0),
+        }
+    }
+}
+
+impl Buffs {
+    fn tick(&mut self, dt: f32) {
+        for b in [&mut self.offense, &mut self.defense] {
+            if b.0 > 0.0 {
+                b.0 = (b.0 - dt).max(0.0);
+            }
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        self.offense.0 > 0.0 || self.defense.0 > 0.0
+    }
+
+    /// The factor on damage this unit deals.
+    pub fn dealt(&self) -> f32 {
+        if self.offense.0 > 0.0 {
+            self.offense.1
+        } else {
+            1.0
+        }
+    }
+
+    /// The factor on damage this unit takes.
+    pub fn taken(&self) -> f32 {
+        if self.defense.0 > 0.0 {
+            self.defense.1
+        } else {
+            1.0
+        }
+    }
+
+    pub fn hash_into(&self, eat: &mut impl FnMut(&[u8])) {
+        for v in [
+            self.offense.0,
+            self.offense.1,
+            self.defense.0,
+            self.defense.1,
+        ] {
+            eat(&v.to_bits().to_le_bytes());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

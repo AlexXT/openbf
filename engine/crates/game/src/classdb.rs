@@ -1,0 +1,533 @@
+//! Runtime entity-class database: baked classes.ron files (from `bake
+//! classes`) with BF2-style BASE-chain inheritance.
+//!
+//! BF2 munges class hierarchies as entc→entc references (RE_LOG §BF2 soldier
+//! defaults: all_inf_default_rifleman → all_inf_default → com_inf_default →
+//! engine base "soldier"); BF1 classes point straight at engine bases. A
+//! property lookup walks the chain child-first, so a subclass overrides its
+//! parent. Multiple files load into one db (SIDE + INGAME commons).
+
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::path::Path;
+
+/// FNV-1a-32 over `byte | 0x20` — the PROP key / chunk-tag hash used
+/// throughout the munged data (same function as mungefs::fnv1a_lowercase and
+/// the engine's FUN_00444b30; duplicated here so the runtime keeps zero
+/// LVL-parsing dependencies).
+///
+/// Note `| 0x20` is NOT `to_ascii_lowercase`: it also flips punctuation and
+/// digits, so the two disagree on any key with an underscore
+/// ("ValueBleed_Alliance" → 0xFDE7C9D2 here vs 0x60FFCE72 lowercased).
+pub fn fnv1a_lowercase(name: &str) -> u32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for b in name.bytes() {
+        h ^= u32::from(b | 0x20);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+// One record of a classes.ron — `manifest`'s struct, the same one
+// `bake::classes` writes (queue item CT), so the reader cannot drift.
+pub use manifest::ClassDef;
+
+/// A map's own classes file, beside its `manifest.ron` (`bake::map::bake_map`
+/// writes it).
+pub const MAP_CLASSES_FILE: &str = "classes.ron";
+
+/// The slot arrays of a soldier class are 8 long on both discs
+/// (`analysis/re-grenades.md` §2.1).
+pub const MAX_WEAPON_SLOTS: usize = 8;
+
+/// The slots of a soldier class's drop table, both discs
+/// (`analysis/re-powerups.md` §3.1).
+pub const MAX_DROP_SLOTS: usize = 8;
+
+/// One weapon slot of a soldier class ([`ClassDb::weapon_slots`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeaponSlot {
+    /// The PS2's slot index (`WeaponName1` / `WEAPONSECTION 1` = 0).
+    pub slot: u8,
+    /// The weapon class, as the disc spells it.
+    pub weapon: String,
+    /// `WeaponAmmo`, in clips: `Some(0)` = infinite (a written value < 1),
+    /// `None` = the chain authors none for this slot.
+    pub ammo: Option<u32>,
+    /// `WeaponChannel`: 0 = the primary trigger's, 1 = the secondary's.
+    pub channel: u8,
+}
+
+/// Class store keyed by **name only**, with the source `kind` kept on each
+/// def. Assumption (checked against BF1 ALL/IMP/COMMON and BF2 REP/CIS/INGAME:
+/// zero collisions): class names are unique across entc/wpnc/ordc/expc, so a
+/// weapon and an entity never contend for the same key. `prop` therefore
+/// ignores kind and BASE chains resolve within a kind naturally
+/// (wpnc rep_weap_inf_rifle -> wpnc com_weap_inf_rifle). `bake classes` still
+/// dedups on (kind, name), so a future collision arrives here as a first-wins
+/// drop, not a silent merge — use [`ClassDb::get_kind`] to assert the kind.
+#[derive(Default)]
+pub struct ClassDb {
+    classes: HashMap<String, ClassDef>,
+    /// A `bf2_*` class file was loaded: the db is a BF2 disc's.
+    bf2: bool,
+}
+
+impl ClassDb {
+    /// Load one classes.ron into the db. First definition of a name wins
+    /// (load order: map-specific before shared commons, mirroring the game's
+    /// level-stacking).
+    pub fn load(&mut self, path: &Path) -> Result<usize> {
+        let defs: Vec<ClassDef> =
+            ron::from_str(&pak::read_to_string(path).with_context(|| path.display().to_string())?)
+                .context("parse classes.ron")?;
+        self.bf2 |= path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("bf2_"));
+        let mut added = 0;
+        for d in defs {
+            if !self.classes.contains_key(&d.name) {
+                self.classes.insert(d.name.clone(), d);
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
+    /// Load a map's own classes (`<map_dir>/classes.ron`) — the map-local
+    /// vehicles and props no side LVL carries (TAT1's `tat_hover_skiff`,
+    /// BF1 BES1's cloud car). Call it BEFORE the side files, the order
+    /// [`ClassDb::load`] names. `Ok(0)` when the map's bake predates the file.
+    pub fn load_map(&mut self, map_dir: &Path) -> Result<usize> {
+        let p = map_dir.join(MAP_CLASSES_FILE);
+        if !pak::exists(&p) {
+            return Ok(0);
+        }
+        self.load(&p)
+    }
+
+    /// `class` and its BASE chain, child first, down to the last def the db
+    /// holds (an engine base such as "hover" has none). Cycle-guarded.
+    pub fn chain(&self, class: &str) -> Vec<&ClassDef> {
+        let mut out = Vec::new();
+        let mut cur = class;
+        while let Some(def) = self.classes.get(cur) {
+            if out.len() == 16 {
+                break;
+            }
+            out.push(def);
+            cur = &def.base;
+        }
+        out
+    }
+
+    /// The db was loaded from a BF2 disc's class files (`bf2_*.ron`) — the
+    /// game whose engine rules its classes take where the two differ (the
+    /// muzzle flash's model, `core::flash`).
+    pub fn is_bf2(&self) -> bool {
+        self.bf2
+    }
+
+    /// Every class name the db holds, in no particular order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.classes.keys().map(String::as_str)
+    }
+
+    pub fn get(&self, class: &str) -> Option<&ClassDef> {
+        self.classes.get(class)
+    }
+
+    /// The stored name of `class`, matched exactly or else ignoring ASCII
+    /// case — the PS2 finds a class by its lower-cased fnv hash, so an
+    /// instance may spell it differently (BF1 BES1 places
+    /// `bes_bldg_aaa_turret`, its classes define `bes_bldg_AAA_turret`).
+    pub fn resolve<'a>(&'a self, class: &'a str) -> Option<&'a str> {
+        if self.classes.contains_key(class) {
+            return Some(class);
+        }
+        self.classes
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case(class))
+            .min()
+            .map(String::as_str)
+    }
+
+    /// `get`, but only if the stored def came from the given chunk kind
+    /// ("entc" | "wpnc" | "ordc" | "expc").
+    pub fn get_kind(&self, kind: &str, class: &str) -> Option<&ClassDef> {
+        self.classes.get(class).filter(|d| d.kind == kind)
+    }
+
+    /// First value for `key` on `class` or its BASE chain (child overrides
+    /// parent). The chain ends at an engine base ("soldier", "hover", ...)
+    /// that has no entc of its own. Cycle-guarded.
+    pub fn prop<'a>(&'a self, class: &str, key: &str) -> Option<&'a str> {
+        self.prop_hash(class, fnv1a_lowercase(key))
+    }
+
+    /// `prop` for a key whose hash is known but whose name is not (the BF2
+    /// ordnance falloff keys, re-blaster-damage §7.3).
+    pub fn prop_hash(&self, class: &str, h: u32) -> Option<&str> {
+        let mut cur = class;
+        for _ in 0..16 {
+            let def = self.classes.get(cur)?;
+            if let Some(p) = def.props.iter().find(|p| p.0 == h) {
+                return Some(p.1.as_str());
+            }
+            cur = &def.base;
+        }
+        None
+    }
+
+    /// EVERY value for `key` on the child-most class of the chain that
+    /// defines it, in FILE ORDER ([`ClassDb::prop`] can only see the first).
+    /// Child-most wins whole. This is NOT how the PS2 builds a soldier's
+    /// weapon list — a class is a copy of its parent with its own PROPs
+    /// applied slot by slot — so weapons go through [`ClassDb::weapon_slots`].
+    pub fn props_all(&self, class: &str, key: &str) -> Vec<&str> {
+        self.props_all_hash(class, fnv1a_lowercase(key))
+    }
+
+    /// [`ClassDb::props_all`] for a key known only by its hash.
+    pub fn props_all_hash(&self, class: &str, h: u32) -> Vec<&str> {
+        let mut cur = class;
+        for _ in 0..16 {
+            let Some(def) = self.classes.get(cur) else {
+                return Vec::new();
+            };
+            let vals: Vec<&str> = def
+                .props
+                .iter()
+                .filter(|p| p.0 == h)
+                .map(|p| p.1.as_str())
+                .collect();
+            if !vals.is_empty() {
+                return vals;
+            }
+            cur = &def.base;
+        }
+        Vec::new()
+    }
+
+    /// A class's weapon slots the PS2's way (`analysis/re-grenades.md` §2.1,
+    /// `analysis/unit-audit-bf2.md` §1.1; B1 `FUN_0020f2e0`, B2
+    /// `FUN_00252bb0`): the class starts as a copy of its parent, then its
+    /// own PROPs are applied in file order. `WEAPONSECTION n` moves the
+    /// cursor to slot n-1 (it starts at 0 in every class) for the unnumbered
+    /// `WeaponName` / `WeaponAmmo` / `WeaponChannel`; the numbered keys
+    /// `…1..4` write slots 0..3 whatever the cursor. Slots with no weapon
+    /// are left out; the rest come in slot order.
+    pub fn weapon_slots(&self, class: &str) -> Vec<WeaponSlot> {
+        let numbered = |stem: &str| -> [u32; 4] {
+            std::array::from_fn(|i| fnv1a_lowercase(&format!("{stem}{}", i + 1)))
+        };
+        let (h_sec, h_name, h_ammo, h_chan) = (
+            fnv1a_lowercase("WEAPONSECTION"),
+            fnv1a_lowercase("WeaponName"),
+            fnv1a_lowercase("WeaponAmmo"),
+            fnv1a_lowercase("WeaponChannel"),
+        );
+        let (n_name, n_ammo, n_chan) = (
+            numbered("WeaponName"),
+            numbered("WeaponAmmo"),
+            numbered("WeaponChannel"),
+        );
+        let num = |v: &str| v.trim().parse::<f32>().unwrap_or(0.0);
+        let mut names: [Option<&str>; MAX_WEAPON_SLOTS] = [None; MAX_WEAPON_SLOTS];
+        let mut ammo: [Option<u32>; MAX_WEAPON_SLOTS] = [None; MAX_WEAPON_SLOTS];
+        let mut chan = [0u8; MAX_WEAPON_SLOTS];
+        for def in self.chain(class).iter().rev() {
+            let mut cur = 0usize;
+            for (h, v) in &def.props {
+                let (h, v) = (*h, v.as_str());
+                // A value < 1 is "infinite" (B1 stores 0x7fffffff, B2 bit 29).
+                let clips = |v: &str| Some(if num(v) < 1.0 { 0 } else { num(v) as u32 });
+                if h == h_sec {
+                    cur = (num(v) as usize)
+                        .saturating_sub(1)
+                        .min(MAX_WEAPON_SLOTS - 1);
+                } else if h == h_name {
+                    names[cur] = Some(v.trim());
+                } else if h == h_ammo {
+                    ammo[cur] = clips(v);
+                } else if h == h_chan {
+                    chan[cur] = num(v) as u8;
+                } else if let Some(i) = n_name.iter().position(|k| *k == h) {
+                    names[i] = Some(v.trim());
+                } else if let Some(i) = n_ammo.iter().position(|k| *k == h) {
+                    ammo[i] = clips(v);
+                } else if let Some(i) = n_chan.iter().position(|k| *k == h) {
+                    chan[i] = num(v) as u8;
+                }
+            }
+        }
+        (0..MAX_WEAPON_SLOTS)
+            .filter_map(|i| {
+                Some(WeaponSlot {
+                    slot: i as u8,
+                    weapon: names[i].filter(|n| !n.is_empty())?.to_owned(),
+                    ammo: ammo[i],
+                    channel: chan[i],
+                })
+            })
+            .collect()
+    }
+
+    /// A soldier class's drop table the PS2's way (card PWUP,
+    /// `analysis/re-powerups.md` §3.1; B1 `FUN_0020f2e0`, B2 `FUN_00252bb0`):
+    /// the class starts as a copy of its parent's table with the write index
+    /// at 0, then its own PROPs in file order — `DropItemClass` and
+    /// `DropItemProbability` write the slot at the index, `NextDropItem`
+    /// moves it on. So a child overrides its parent's entries by position and
+    /// keeps the rest. Returns the slots up to the count, each (item class
+    /// name — empty when none was written —, probability). Whether the class
+    /// is a soldier is the caller's question: a droideka authors the keys
+    /// and its class never reads them.
+    pub fn drop_table(&self, class: &str) -> Vec<(String, f32)> {
+        let (h_class, h_prob, h_next) = (
+            fnv1a_lowercase("DropItemClass"),
+            fnv1a_lowercase("DropItemProbability"),
+            fnv1a_lowercase("NextDropItem"),
+        );
+        let mut slots: [(String, f32); MAX_DROP_SLOTS] = Default::default();
+        let mut count = 0usize;
+        for def in self.chain(class).iter().rev() {
+            let mut cur = 0usize;
+            for (h, v) in &def.props {
+                if *h == h_next {
+                    cur += 1;
+                } else if cur < MAX_DROP_SLOTS && (*h == h_class || *h == h_prob) {
+                    if *h == h_class {
+                        slots[cur].0 = v.trim().to_ascii_lowercase();
+                    } else {
+                        slots[cur].1 = v.trim().parse().unwrap_or(0.0);
+                    }
+                    count = count.max(cur + 1);
+                }
+            }
+        }
+        slots.into_iter().take(count).collect()
+    }
+
+    pub fn prop_f32(&self, class: &str, key: &str) -> Option<f32> {
+        self.prop(class, key)?.trim().parse().ok()
+    }
+
+    pub fn prop_hash_f32(&self, class: &str, h: u32) -> Option<f32> {
+        self.prop_hash(class, h)?.trim().parse().ok()
+    }
+
+    /// The engine base at the end of the BASE chain ("soldier", "hover", ...).
+    pub fn engine_base<'a>(&'a self, class: &'a str) -> Option<&'a str> {
+        let mut cur = class;
+        for _ in 0..16 {
+            match self.classes.get(cur) {
+                Some(def) => cur = &def.base,
+                None => return (cur != class).then_some(cur),
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_matches_the_munge_scheme() {
+        assert_eq!(fnv1a_lowercase("GeometryName"), 0x47C8_6B4A);
+        assert_eq!(fnv1a_lowercase("CAMERASECTION"), 0xBACA_6BF1);
+        // `| 0x20`, not to_ascii_lowercase: underscores hash differently
+        // (to_ascii_lowercase would give 0x60FFCE72). Cross-checked against
+        // the manifest key ValueBleed = 0x4EBF97DA, where both agree.
+        assert_eq!(fnv1a_lowercase("ValueBleed_Alliance"), 0xFDE7_C9D2);
+        assert_eq!(fnv1a_lowercase("ValueBleed"), 0x4EBF_97DA);
+    }
+
+    fn db() -> ClassDb {
+        let mut db = ClassDb::default();
+        for (name, base, key, val) in [
+            ("rifleman", "inf_default", "MaxHealth", "350.0"),
+            ("inf_default", "com_default", "MaxSpeed", "7.0"),
+            ("com_default", "soldier", "MaxHealth", "400.0"),
+        ] {
+            db.classes.insert(
+                name.to_string(),
+                ClassDef {
+                    name: name.to_string(),
+                    kind: "entc".to_string(),
+                    base: base.to_string(),
+                    props: vec![(fnv1a_lowercase(key), val.to_string())],
+                },
+            );
+        }
+        db
+    }
+
+    #[test]
+    fn base_chain_lookup_child_overrides_parent() {
+        let db = db();
+        // Inherited two levels up.
+        assert_eq!(db.prop_f32("rifleman", "MaxSpeed"), Some(7.0));
+        // Child override shadows the com_default value.
+        assert_eq!(db.prop_f32("rifleman", "MaxHealth"), Some(350.0));
+        // Chain end = engine base.
+        assert_eq!(db.engine_base("rifleman"), Some("soldier"));
+        // Unknown key/class.
+        assert_eq!(db.prop("rifleman", "NoSuchKey"), None);
+        assert_eq!(db.prop("nobody", "MaxSpeed"), None);
+        assert_eq!(db.engine_base("nobody"), None);
+    }
+
+    /// `props_all` returns every value the CHILD-MOST definer authored, in
+    /// file order, and stops there (the BF2 repeated-`WeaponName` shape).
+    #[test]
+    fn props_all_walks_child_first_and_keeps_file_order() {
+        let mut db = db();
+        let h = fnv1a_lowercase("WeaponName");
+        db.classes.get_mut("com_default").unwrap().props.extend([
+            (h, "base_rifle".to_string()),
+            (h, "base_pistol".to_string()),
+        ]);
+        assert_eq!(
+            db.props_all("rifleman", "WeaponName"),
+            ["base_rifle", "base_pistol"],
+            "inherited from two levels up, in order"
+        );
+        db.classes.get_mut("rifleman").unwrap().props.extend([
+            (h, "child_rifle".to_string()),
+            (h, "child_grenade".to_string()),
+        ]);
+        assert_eq!(
+            db.props_all("rifleman", "WeaponName"),
+            ["child_rifle", "child_grenade"],
+            "the child's own list REPLACES the parent's, it does not append"
+        );
+        assert_eq!(db.props_all("rifleman", "NoSuchKey"), Vec::<&str>::new());
+        assert_eq!(db.props_all("nobody", "WeaponName"), Vec::<&str>::new());
+    }
+
+    fn push(db: &mut ClassDb, class: &str, props: &[(&str, &str)]) {
+        db.classes.get_mut(class).unwrap().props.extend(
+            props
+                .iter()
+                .map(|(k, v)| (fnv1a_lowercase(k), (*v).to_string())),
+        );
+    }
+
+    fn slot(slot: u8, weapon: &str, ammo: Option<u32>, channel: u8) -> WeaponSlot {
+        WeaponSlot {
+            slot,
+            weapon: weapon.to_string(),
+            ammo,
+            channel,
+        }
+    }
+
+    /// The section model: a child is its parent's copy, `WEAPONSECTION`
+    /// moves the cursor, a numbered key writes its own slot.
+    #[test]
+    fn weapon_slots_copy_the_parent_then_apply_the_child() {
+        let mut db = db();
+        push(
+            &mut db,
+            "com_default",
+            &[
+                ("WEAPONSECTION", "1"),
+                ("WeaponName", "rifle"),
+                ("WeaponAmmo", "6"),
+                ("WEAPONSECTION", "2"),
+                ("WeaponName", "pistol"),
+                ("WeaponAmmo", "0"),
+                ("WEAPONSECTION", "3"),
+                ("WeaponName", "grenade"),
+                ("WeaponAmmo", "4"),
+                ("WeaponChannel", "1"),
+            ],
+        );
+        let base = [
+            slot(0, "rifle", Some(6), 0),
+            slot(1, "pistol", Some(0), 0),
+            slot(2, "grenade", Some(4), 1),
+        ];
+        assert_eq!(db.weapon_slots("rifleman"), base, "inherited whole");
+        // A numbered key replaces one slot and keeps the rest of the copy.
+        push(
+            &mut db,
+            "inf_default",
+            &[("WeaponName2", "shotgun"), ("WeaponAmmo2", "3")],
+        );
+        // An unnumbered key with no section writes slot 0; a new slot is
+        // appended where its section says.
+        push(
+            &mut db,
+            "rifleman",
+            &[
+                ("WeaponName", "carbine"),
+                ("WEAPONSECTION", "5"),
+                ("WeaponName", "mine"),
+                ("WeaponChannel", "1"),
+            ],
+        );
+        assert_eq!(
+            db.weapon_slots("rifleman"),
+            [
+                slot(0, "carbine", Some(6), 0),
+                slot(1, "shotgun", Some(3), 0),
+                slot(2, "grenade", Some(4), 1),
+                slot(4, "mine", None, 1),
+            ]
+        );
+        assert_eq!(db.weapon_slots("nobody"), []);
+    }
+
+    /// The drop table: the parent's copy, the child's keys from index 0.
+    #[test]
+    fn drop_table_copies_the_parent_and_overrides_by_position() {
+        let mut db = db();
+        let entry = |c: &str, p: f32| (c.to_string(), p);
+        push(
+            &mut db,
+            "com_default",
+            &[
+                ("DropItemClass", "Item_Ammo"),
+                ("DropItemProbability", "0.25"),
+                ("NextDropItem", "-"),
+                ("DropItemClass", "item_health"),
+                ("DropItemProbability", "0.15"),
+                ("NextDropItem", "-"),
+                ("DropItemClass", "item_dual"),
+                ("DropItemProbability", "0.08"),
+                ("NextDropItem", "-"),
+            ],
+        );
+        let base = vec![
+            entry("item_ammo", 0.25),
+            entry("item_health", 0.15),
+            entry("item_dual", 0.08),
+        ];
+        assert_eq!(db.drop_table("rifleman"), base, "inherited whole");
+        // The child writes slot 0's probability and slot 1's class only.
+        push(
+            &mut db,
+            "rifleman",
+            &[
+                ("DropItemProbability", "0.5"),
+                ("NextDropItem", "-"),
+                ("DropItemClass", "item_energy"),
+            ],
+        );
+        assert_eq!(
+            db.drop_table("rifleman"),
+            [
+                entry("item_ammo", 0.5),
+                entry("item_energy", 0.15),
+                entry("item_dual", 0.08),
+            ]
+        );
+        assert_eq!(db.drop_table("inf_default"), base);
+        assert!(db.drop_table("nobody").is_empty());
+    }
+}

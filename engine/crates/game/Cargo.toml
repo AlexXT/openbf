@@ -1,0 +1,42 @@
+[package]
+name = "game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+bake = { path = "../bake" }
+mungefs = { path = "../mungefs" }
+image.workspace = true
+
+[dependencies]
+core = { path = "../core" }
+manifest = { path = "../manifest" }
+pak = { path = "../pak" }
+input = { path = "../input" }
+render = { path = "../render" }
+ui = { path = "../ui" }
+audio = { path = "../audio" }
+glam.workspace = true
+winit.workspace = true
+gilrs.workspace = true
+anyhow.workspace = true
+ron.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+gltf.workspace = true
+ktx2.workspace = true
+wgpu.workspace = true
+
+[[bin]]
+name = "game"
+path = "src/main.rs"
+
+# Phase C D14. The arena's acceptance is that two in-process runs are the same
+# run, and the rig that has to be pinned is the example's own — so this one
+# example is declared explicitly with `test = true` (every other example is
+# still auto-discovered) and `cargo test` runs its `#[cfg(test)]` module.
+[[example]]
+name = "arena"
+path = "examples/arena.rs"
+test = true

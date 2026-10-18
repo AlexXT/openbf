@@ -1,0 +1,462 @@
+//! Seat guns (card VTUR, `analysis/re-vehicles.md` §5, §9 [O]; the model is
+//! `crate::vehicle::gun`): a rider's look, the camera ray, the aimer and
+//! the seat's weapons fired through the soldier's weapon code
+//! (`WeaponState::update`, `Bolt::spawn`), and the seat switch.
+//!
+//! - **Switch seats** (B1 FUN_0020b5e8, §5): on the SWITCH_WEAPON edge a
+//!   rider walks the ring from its seat to the next seat that boards a
+//!   soldier and is empty; a passenger never moves to another passenger
+//!   seat. Which PS2 button is the switch is [H]; the port's is a feel call.
+//! - **The gun** (§9): the look moves with the right stick; a 512 m ray
+//!   from the eye along the look finds the aim point; the aimer turns
+//!   toward it at its rates, inside its limits; the bolt leaves the fire
+//!   point along the aimer. A building turret's look and aimer follow the
+//!   PS2's MountedTurret law (card VTURL, `gun::Turn`, `Aimer::chase`).
+//!
+//! A bot rider aims and fires through the same pad (card VTAI): its think
+//! (`ai::gunner`) moves the look stick toward its perceived target and
+//! presses FIRE, and the shot is held to the on-foot fairness rule here,
+//! where it is made. A vehicle's gun states are made when anyone first
+//! rides one of its armed seats.
+
+use super::input::{buttons, PadState};
+use super::state::{Event, Sim};
+use crate::collision::{Capsule, HullFilter, Layers};
+use crate::projectile::{Bolt, Shooter};
+use crate::unit::{Controller, UnitHandle};
+use crate::vehicle::gun::{self, GunSetup, GunState, AIM_RAY};
+use crate::vehicle::VehicleHandle;
+use crate::vehicle::{SeatKind, VehicleKind};
+use crate::weapon::{shot_direction, FireInput, WeaponState};
+use crate::TICK_DT;
+use glam::{Quat, Vec3};
+
+/// Where a rider's seat gun looks and points now (card VTAI): read by a bot's
+/// perception and aim. Before the vehicle is armed the look and the aim are
+/// the aimer's rest.
+#[derive(Clone, Debug)]
+pub struct SeatLook {
+    pub gun: GunSetup,
+    /// The camera's (yaw, pitch), model frame.
+    pub look: (f32, f32),
+    /// The aimer's (yaw, pitch), model frame.
+    pub aim: (f32, f32),
+    /// The vehicle's rotation.
+    pub rot: Quat,
+    /// The eye the camera ray leaves, world ([`GunSetup::ray_eye`]).
+    pub eye: Vec3,
+    /// A building turret's zoomed eye, world (card VTURZ, re-turret-draw 4
+    /// [O]): `EyePointOffset` on the AIM frame (the look's yaw AND pitch,
+    /// [`gun::frame`]) from the pivot - where the PS2's zoomed camera
+    /// stands; [`SeatLook::eye`] while the seat is zoomed.
+    pub scope_eye: Vec3,
+    /// The look's direction, world.
+    pub view: Vec3,
+    /// The fire point, world.
+    pub muzzle: Vec3,
+    /// The barrel's direction, world.
+    pub barrel: Vec3,
+}
+
+impl Sim {
+    /// `u`'s seat gun as it stands, or `None` for a seat with no gun.
+    pub fn seat_look(&self, u: UnitHandle) -> Option<SeatLook> {
+        let m = self.unit(u)?.mount?;
+        let gun = self.seat_gun_setup(u)?;
+        let v = self.vehicle(m.vehicle)?;
+        let (look, _, aim) = gun.rest();
+        let (look, aim, zoomed) = v
+            .guns
+            .get(usize::from(m.seat))
+            .and_then(Option::as_ref)
+            .map_or((look, aim, false), |g| (g.look, g.aim, g.zoom.is_some()));
+        let (pos, rot) = (v.pos, v.rot);
+        let eye = pos + rot * gun.ray_eye(look, zoomed);
+        let scope_eye = pos + rot * gun.scope_eye(look);
+        Some(SeatLook {
+            look,
+            aim,
+            rot,
+            eye,
+            scope_eye,
+            view: (rot * gun::dir(look.0, look.1)).normalize(),
+            muzzle: pos + rot * gun.muzzle(aim),
+            barrel: (rot * gun::dir(aim.0, aim.1)).normalize(),
+            gun,
+        })
+    }
+
+    /// The seat `u` would switch to (FUN_0020b5e8), or `None`.
+    pub fn next_seat(&self, u: UnitHandle) -> Option<u8> {
+        let m = self.unit(u)?.mount?;
+        let v = self.vehicle(m.vehicle)?;
+        let setup = self.seat_setup.get(v.class as usize)?.as_ref()?;
+        let n = v.seats.len();
+        let from = usize::from(m.seat);
+        let passenger = |k: SeatKind| matches!(k, SeatKind::Passenger(_));
+        (1..n)
+            .map(|k| (from + k) % n)
+            .find(|&j| {
+                setup.boardable.get(j).copied().unwrap_or(false)
+                    && v.seats[j].occupant.is_none()
+                    && !(passenger(v.seats[from].kind) && passenger(v.seats[j].kind))
+            })
+            .map(|j| j as u8)
+    }
+
+    /// Step 1c: every SWITCH_WEAPON edge of a mounted soldier moves it to
+    /// [`Sim::next_seat`] (instant, like enter and exit).
+    pub(super) fn switch_pass(&mut self, unit_pads: &[PadState]) {
+        for i in 0..self.units.len() {
+            let u = &self.units[i];
+            // A bot changes seats through its own requests (card VAI).
+            if !u.alive || u.mount.is_none() || !matches!(u.controller, Controller::Player { .. }) {
+                continue;
+            }
+            let Some(p) = unit_pads.get(i) else { continue };
+            let edge = p.pressed(buttons::SWITCH_WEAPON)
+                && u.soldier.prev_buttons() & buttons::SWITCH_WEAPON == 0;
+            if !edge {
+                continue;
+            }
+            let h = self.handle(i);
+            let (Some(seat), Some(m)) = (self.next_seat(h), self.units[i].mount) else {
+                continue;
+            };
+            self.unseat_unit(h);
+            self.seat_unit(h, m.vehicle, seat);
+        }
+    }
+
+    /// A building turret's zoom (card VTURZ, `analysis/re-turret-draw.md` 4
+    /// [O]): a human gunner's press of ZOOM steps the turret's zoom flag
+    /// through the first weapon's toggle (B1:137361-137368, B2:189166-189183:
+    /// the weapon has `ZoomMax` > 1; the soldier's toggle B1 `FUN_00283c80`,
+    /// `WeaponClass::zoom_press`): on at `ZoomMin`, then on to `ZoomMax` when
+    /// the two differ and `ZoomRate` is 0, else off. BF2's turret also runs
+    /// the continuous zoom when `ZoomRate` != 0 (B2 `FUN_003258f8` called at
+    /// 189182 with T+0x7c, the controllable's (T+0x10) +0x6c: the throttle
+    /// slot, re-hover 5) - zoom += `throttle` x zoom x `ZoomRate` x dt inside
+    /// [`ZoomMin`, `ZoomMax`]; BF1's turret calls only the toggle (its three
+    /// callers of `FUN_00283c18` are the soldier and two vehicle updates). A
+    /// seat whose weapon cannot zoom holds none. The port's seat fires its
+    /// first weapon on FIRE and has no weapon switch, so the PS2's switch
+    /// cancel is the seat switch's pilot change (`Sim::unseat_unit`). Only
+    /// a building turret (a [`gun::Turn`]) zooms: a vehicle's turret seat is
+    /// not read. PROVISIONAL (not read): the look's turn is not divided by
+    /// the zoom's divisor as a soldier's is.
+    pub(super) fn tick_seat_zoom(&mut self, i: usize, press: bool, throttle: f32) {
+        if !matches!(self.units[i].controller, Controller::Player { .. }) {
+            return;
+        }
+        let h = self.handle(i);
+        let (Some(m), Some(g)) = (self.units[i].mount, self.seat_gun_setup(h)) else {
+            return;
+        };
+        let bf2 = self.ground_rules == crate::soldier::GroundRules::Bf2;
+        let wc = g
+            .weapons
+            .first()
+            .map(|w| &self.weapon_classes[w.class])
+            .filter(|wc| g.turn.is_some() && wc.zooms());
+        let Some(Some(st)) = self.vehicles[m.vehicle.index as usize]
+            .guns
+            .get_mut(usize::from(m.seat))
+        else {
+            return;
+        };
+        let Some(wc) = wc else {
+            st.zoom = None;
+            return;
+        };
+        if press {
+            let step = st.zoom.map(|z| u8::from(z != wc.zoom_min));
+            st.zoom = wc.zoom_press(step).map(|s| wc.zoom_at(s).0);
+        }
+        if let Some(z) = st.zoom.as_mut().filter(|_| bf2 && wc.zoom_rate != 0.0) {
+            *z = (*z + throttle * *z * wc.zoom_rate * TICK_DT).clamp(wc.zoom_min, wc.zoom_max);
+        }
+    }
+
+    /// `u`'s seat zoom as the camera takes it (card VTURZ): the turret's
+    /// zoom value; `step` 0 at `ZoomMin`, else 1, and the divisor that
+    /// step's (the seat's turn does not read it); `scope` is set (the view is
+    /// the eye point's, along the look).
+    pub fn seat_zoom(&self, u: UnitHandle) -> Option<crate::unit::Zoom> {
+        let m = self.unit(u)?.mount?;
+        let value = self
+            .vehicle(m.vehicle)?
+            .guns
+            .get(usize::from(m.seat))?
+            .as_ref()?
+            .zoom?;
+        let g = self.seat_gun_setup(u)?;
+        let wc = &self.weapon_classes[g.weapons.first()?.class];
+        let step = u8::from(value != wc.zoom_min);
+        Some(crate::unit::Zoom {
+            step,
+            value,
+            divisor: wc.zoom_at(step).1,
+            scope: true,
+        })
+    }
+
+    /// The gun setup of `u`'s seat, if it has one.
+    fn seat_gun_setup(&self, u: UnitHandle) -> Option<GunSetup> {
+        let m = self.unit(u)?.mount?;
+        let v = self.vehicle(m.vehicle)?;
+        let setup = self.seat_setup.get(v.class as usize)?.as_ref()?;
+        setup.guns.get(usize::from(m.seat))?.clone()
+    }
+
+    /// Make every seat's gun state of vehicle `vi` from its class's setup
+    /// (each gun at rest, each weapon full), once.
+    fn arm(&mut self, vi: usize) {
+        if !self.vehicles[vi].guns.is_empty() {
+            return;
+        }
+        let class = self.vehicles[vi].class as usize;
+        let Some(setup) = self.seat_setup.get(class).and_then(|s| s.as_ref()) else {
+            return;
+        };
+        let n = self.vehicles[vi].seats.len();
+        let guns = (0..n)
+            .map(|s| {
+                let g = setup.guns.get(s)?.as_ref()?;
+                let (look, rel, aim) = g.rest();
+                Some(GunState {
+                    look,
+                    aim,
+                    rate: (0.0, 0.0),
+                    rel,
+                    weapons: g
+                        .weapons
+                        .iter()
+                        .map(|w| {
+                            WeaponState::new(&self.weapon_classes[w.class], true, w.spare_clips)
+                        })
+                        .collect(),
+                    zoom: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        if guns.iter().any(Option::is_some) {
+            self.vehicles[vi].guns = guns;
+        }
+    }
+
+    /// The first surface or soldier along the camera ray, else its end —
+    /// past the seat's own vehicle's hull (card VHULL).
+    fn aim_point(&self, eye: Vec3, dir: Vec3, riders: &[UnitHandle], own: VehicleHandle) -> Vec3 {
+        let mut t = AIM_RAY;
+        if let Some(h) = self.terrain_ray(eye, dir, t, 0.5) {
+            t = t.min(h);
+        }
+        if let Some(h) =
+            self.collision
+                .ray_with(eye, dir, t, Layers::ORDNANCE, HullFilter::except(Some(own)))
+        {
+            t = t.min(h.t);
+        }
+        for (h, u) in self.alive_units() {
+            if riders.contains(&h) {
+                continue;
+            }
+            if let Some(hit) = u.capsule().ray_hit(eye, dir, t) {
+                t = t.min(hit);
+            }
+        }
+        eye + dir * t
+    }
+
+    /// Step 4, for a rider: move its seat's look and aimer and fire the
+    /// seat's weapons (FIRE the first, SECONDARY_FIRE the second). A bot's
+    /// pad is its think's (`ai::gunner`).
+    pub(super) fn seat_gun(&mut self, i: usize, p: &PadState) {
+        let ai = match self.units[i].controller {
+            Controller::Player { .. } => false,
+            Controller::Ai => true,
+            _ => return,
+        };
+        let h = self.handle(i);
+        let Some(m) = self.units[i].mount else { return };
+        let Some(g) = self.seat_gun_setup(h) else {
+            return;
+        };
+        let vi = m.vehicle.index as usize;
+        self.arm(vi);
+        let seat = usize::from(m.seat);
+        let dt = TICK_DT;
+        let (pos, rot) = (self.vehicles[vi].pos, self.vehicles[vi].rot);
+        let riders: Vec<UnitHandle> = self.vehicles[vi]
+            .seats
+            .iter()
+            .filter_map(|s| s.occupant)
+            .collect();
+        let Some(mut st) = self.vehicles[vi].guns.get(seat).cloned().flatten() else {
+            return;
+        };
+
+        // The look: a building turret's by its turn law (card VTURL);
+        // otherwise the stick at the aimer's rates, inside its limits. A
+        // walker's pilot looks along the walker's own aim (card WALK: the
+        // controllable's E+0x50c / +0x510, re-walker §3 I7-I15), which its
+        // integrator moved this tick; the aimer then follows it.
+        let a = g.aimer;
+        let rx = PadState::axis(p.rx);
+        let ry = PadState::axis(p.ry);
+        let walker = g.pilot && self.vehicles[vi].kind == VehicleKind::Walker;
+        if let Some(t) = g.turn {
+            (st.look, st.rate) = t.step(st.look, st.rate, (rx, ry), dt);
+        } else if walker {
+            let w = &self.vehicles[vi].walker;
+            st.look = (w.aim_yaw, w.aim_pitch);
+        } else {
+            st.look.0 = if g.pilot {
+                0.0
+            } else {
+                (st.look.0 - rx * a.yaw_rate * dt).clamp(a.yaw[0], a.yaw[1])
+            };
+            st.look.1 = (st.look.1 + ry * a.pitch_rate * dt).clamp(a.pitch[0], a.pitch[1]);
+        }
+
+        // The camera ray and the aimer (zoomed, from the zoomed eye).
+        let eye = pos + rot * g.ray_eye(st.look, st.zoom.is_some());
+        let target = self.aim_point(
+            eye,
+            rot * gun::dir(st.look.0, st.look.1),
+            &riders,
+            m.vehicle,
+        );
+        let pivot = pos + rot * g.pivot;
+        if g.turn.is_some() {
+            // The PS2's aimer, in the turret's aim frame or the model's.
+            let w = (rot.inverse() * (target - pivot)).normalize_or_zero();
+            let w = if g.framed {
+                let [x, y, z] = gun::frame(st.look);
+                Vec3::new(w.dot(x), w.dot(y), w.dot(z))
+            } else {
+                w
+            };
+            st.rel = a.chase(st.rel, w, dt);
+            st.aim = g.aim_of(st.look, st.rel);
+        } else {
+            let mut want = gun::angles(rot.inverse() * (target - pivot));
+            let hold_yaw = g.pilot && !walker;
+            if hold_yaw {
+                want.0 = 0.0;
+            }
+            st.aim = a.turn(st.aim, want, dt);
+            if hold_yaw {
+                st.aim.0 = 0.0;
+            }
+            st.rel = st.aim;
+        }
+
+        // The weapons.
+        let origin = pos + rot * g.muzzle(st.aim);
+        let fwd = (rot * gun::dir(st.aim.0, st.aim.1)).normalize();
+        let right = fwd.cross(Vec3::Y).try_normalize().unwrap_or(Vec3::X);
+        let up = right.cross(fwd).normalize();
+        let is_player = self.units[i].is_player;
+        let team = self.units[i].team;
+        let infinite_cheat = self.cheats.infinite_ammo && is_player;
+        // On foot's D9 spread multiplier and the fairness record (step 4).
+        let ai_spread_mult = ai.then(|| self.difficulty.skill_at(self.units[i].skill).spread_mult);
+        let perceived = !ai || {
+            let st = &self.units[i].ai;
+            st.target
+                .is_some_and(|t| st.contacts.iter().flatten().any(|c| c.handle == t))
+        };
+        let targets: Vec<(UnitHandle, Capsule)> = self
+            .alive_units()
+            .filter(|(h, _)| !riders.contains(h))
+            .map(|(h, u)| (h, u.capsule()))
+            .collect();
+        let mut shots = Vec::new();
+        for (k, w) in g.weapons.iter().enumerate() {
+            let held = match k {
+                0 => p.pressed(buttons::FIRE),
+                1 => p.pressed(buttons::SECONDARY_FIRE),
+                _ => false,
+            };
+            let wc = &self.weapon_classes[w.class];
+            let ws = &mut st.weapons[k];
+            // A seat stands still: the class's standing, unmoving spread.
+            ws.set_posture(wc, 0, 0.0, false);
+            if let Some(m) = ai_spread_mult {
+                ws.spread_mult = m;
+            }
+            let input = FireInput {
+                held,
+                blocked: false,
+                infinite_ammo: w.infinite || infinite_cheat,
+                ai_dispersion: None,
+            };
+            shots.clear();
+            ws.update(dt, wc, input, &mut self.lcg, &mut shots);
+            if shots.is_empty() {
+                continue;
+            }
+            self.units[i].last_shot_tick = self.tick;
+            let who = Shooter {
+                owner: h,
+                team,
+                weapon_class: w.class,
+                is_player,
+            };
+            let (speed, life) = (wc.ordnance.velocity, wc.ordnance.life_span);
+            for spec in &shots {
+                let d = shot_direction(
+                    &mut self.lcg,
+                    fwd,
+                    right,
+                    up,
+                    spec.pitch_spread,
+                    spec.yaw_spread,
+                    (0.0, 0.0),
+                );
+                let bolt = Bolt::spawn(
+                    origin,
+                    d,
+                    speed,
+                    life,
+                    who,
+                    self.heightfield.as_ref(),
+                    &self.collision,
+                    HullFilter::except(Some(m.vehicle)),
+                    targets.iter().copied(),
+                );
+                if ai {
+                    self.nav_stats.ai_shots += 1;
+                    self.nav_stats.seat_shots += 1;
+                    // Design decision 2's rule, as on foot: a pressed shot
+                    // goes only at a contact this bot's perception holds.
+                    if held {
+                        debug_assert!(
+                            perceived,
+                            "AI rider {i} fired at an unperceived target at tick {}",
+                            self.tick
+                        );
+                        if !perceived {
+                            self.nav_stats.unperceived_shots += 1;
+                        }
+                    } else {
+                        self.nav_stats.carry_shots += 1;
+                    }
+                }
+                self.events.push(Event::Shot {
+                    unit: h,
+                    weapon_class: w.class as u32,
+                    origin,
+                    dir: d,
+                });
+                self.bolts.push(bolt);
+            }
+        }
+        self.vehicles[vi].guns[seat] = Some(st);
+    }
+}
+
+#[cfg(test)]
+mod tests;

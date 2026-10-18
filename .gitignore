@@ -7,3 +7,10 @@ assets_baked/
 target/
 __pycache__/
 *.pyc
+
+# Written by the export (card PACK): data and build output stay local
+engine/assets_baked/
+engine/missions/
+engine/artifacts/
+engine/target/
+dist/

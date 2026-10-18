@@ -1,0 +1,34 @@
+# leak_census's accepted leaks (card LEAK). One line each: `<map|*> <class|*> [<x> <z>]  # <reason>`.
+# A site (a class and a 4 m end cell, `x z` its centre in whole metres as the sites file prints it) is ACCEPTED
+# when a line covers it; every other site is NEW and fails the `leak` gate. The per-map counts on the census's
+# stdout are pinned byte for byte (<baseline_dir>/leak_main_1.txt), so an accepted class still fails the gate when
+# its count moves: a change that moves it declares `leak`.
+#
+# 2026-09-29, the first census: every class below is a named mechanism with a card that fixes it. A fix removes
+# its line here (or narrows it to the named residue) in the same landing.
+
+# The census's positive control, a KAS2 jump-in: from the deck of the platform at (5, 16.65, -7), a jump at the
+# hut's bamboo wall (body 386, kas2_bldg_platform_roof) ended inside the ring at y 17.38 — the wall pass pushed the
+# soldier through (tick 20: 0.84 m toward the hut's axis, re-soldier-walls §4.1, M3). Card WPSH fixed it: that
+# contact (triangle 5, the flare's inner skin, met from behind) is no longer taken. One sprint-jump site at the hut
+# stays in the residue below (a sliver triangle, card WPSR).
+# Replay: LEAK_NEAR=4.9,-7.06,14 LEAK_TRACE=1.28,4.66,jump leak_census bf1_kas2.
+
+# push: the wall pass itself moves the soldier's axis across a wall face (a push >= 0.25 m on the crossing tick).
+# WPSH took it 48,415 -> 1,212 runs (sub-steps, no far-side push, starts already inside a solid skipped); the
+# residue is several mechanisms (an eave's lower edge, a sloped step, a sliver triangle) — card WPSR.
+* push      # WPSR: the residue after WPSH (re-soldier-walls §4.2)
+# tunnel: the axis crosses a wall face with (almost) no push — the wall pass never answered. WTUN took it 9,587 -> 1,427
+# runs: a mesh body's deepest WALL contact now wins over a deeper overhang underside (BF1 BES1 body 26), and a
+# ceiling-like contact pushes by its horizontal part (BF2 DAG1's leaning boxes). The residue sampled is geometry
+# thinner or narrower than the soldier (a 0.54 m slot between a low slab and a sheet, BF1 NAB2 (-13, 17); a prop
+# of 0.2-0.4 m parts, BF2 POL1 body 837) where one contact per body fights itself — card WTHIN.
+* tunnel    # WTHIN: the residue after WTUN — thin and narrow geometry (re-soldier-walls §4.3)
+# ceiling / floor: the axis crosses a downward / upward face — push_out has no vertical response by design.
+* ceiling   # VCOL: no ceiling stop — heads through roofs, eaves and deck undersides
+* floor     # VCOL: crossings of upward faces — mechanism to name
+# end-state classes the first census did not validate.
+* closed    # LEAK2: ray parity breaks on open meshes (Endor's trees and rocks); the KAS2 control reads 4
+* buried    # LEAK2: under an uncut terrain it started above — triage
+* float     # LEAK2: not grounded after a 420-tick settle — triage
+* offmap    # LEAK2: none today; the census drives no run at the map edge yet

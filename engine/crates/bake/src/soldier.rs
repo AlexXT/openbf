@@ -1,0 +1,1100 @@
+//! Bake a skinned soldier (skel + bone-space modl) from a SIDE LVL into a
+//! model-space skinned GLB (`skin_glb`) plus its textures as KTX2:
+//! `<outdir>/soldiers/<model>.glb`, `<outdir>/textures/<tex>.ktx2`.
+//! Vertices are moved from bone bind space to model space at bake time
+//! (`mungefs::model::to_model_space`), so the runtime uses standard
+//! `joint_global × inverse_bind` skinning (analysis/re-softskin.md §5).
+//!
+//! **ALPHA RULE v2 does not reach this path, and the soldiers follow the
+//! disc's own rule instead** (design D6, answered for them by queue SKA:
+//! `analysis/re-side-alpha.md`, `[O]`). A soldier segment's material carries
+//! the GS state the disc gives that segment ([`segment_blends`]): `BLEND` when
+//! its `MTRL` word has 0x04, and no `alphaMode` — glTF's OPAQUE — otherwise,
+//! because the disc alpha-tests no side model. The TEXTURES are still decided
+//! per texture: the side bake ORs the material flags of every segment naming
+//! one and force-opaques those no material marks (`bake_textures_flagged`
+//! below) — the disc's "the alpha is ignored", in the only place the port can
+//! say it (§6.4) — except a sheet a specular-pass segment draws, whose alpha
+//! is the pass's gloss weight and is kept (queue DSHN, `bake_flags`). The WEAPON GLBs carry that per-texture OR as their
+//! `alphaMode` (`crate::alpha::legacy_per_texture_or`); no baked weapon
+//! segment has 0x02 or 0x04 (§1), so every weapon draws OPAQUE.
+
+use crate::anim_sets;
+use crate::skin_glb::{skinned_to_glb, Bone, Clip, ClipTrack, SkinnedModel, SkinnedSegment};
+use anyhow::{anyhow, bail, Context, Result};
+use glam::{Mat3, Quat, Vec3};
+use mungefs::anim::{crc32_lower, AnimBank, DecodedClip};
+use mungefs::model::Model;
+use mungefs::skel::Skeleton;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+pub struct BakedSoldier {
+    pub name: String,
+    pub clips: usize,
+    pub missing_clips: Vec<String>,
+    pub bones: usize,
+    pub vertices: usize,
+    pub triangles: usize,
+    pub textures: Vec<String>,
+    /// The cloths baked as extra segments (BF2, `crate::cloth`).
+    pub cloths: Vec<String>,
+    /// Model-space AABB (should equal the modl vis box).
+    pub aabb: ([f32; 3], [f32; 3]),
+}
+
+/// Find the modl + skel pair named `model` in an LVL.
+pub fn find_soldier(inner: &[u8], model: &str) -> Result<(Model, Skeleton)> {
+    let chunks = mungefs::content_chunks(inner).map_err(|e| anyhow!("{e}"))?;
+    let modl = chunks
+        .iter()
+        .filter(|c| &c.tag == b"modl")
+        .filter_map(|c| Model::parse(c).ok())
+        .find(|m| m.name.eq_ignore_ascii_case(model))
+        .ok_or_else(|| anyhow!("modl {model} not found"))?;
+    let skel = chunks
+        .iter()
+        .filter(|c| &c.tag == b"skel")
+        .filter_map(|c| mungefs::skel::parse_skel(c).ok())
+        .find(|s| s.name.eq_ignore_ascii_case(model))
+        .ok_or_else(|| anyhow!("skel {model} not found"))?;
+    Ok((modl, skel))
+}
+
+/// Skeleton bones for the GLB: local bind rotation/translation. XFRM rows
+/// are the row-vector rotation R (`v' = v·R + t`); the column-vector form is
+/// Rᵀ, whose columns are the rows r0, r1, r2.
+pub fn bones_of(skel: &Skeleton) -> Vec<Bone> {
+    skel.bones
+        .iter()
+        .map(|b| {
+            let m = Mat3::from_cols(
+                Vec3::from_array(b.rows[0]),
+                Vec3::from_array(b.rows[1]),
+                Vec3::from_array(b.rows[2]),
+            );
+            Bone {
+                name: b.name.clone(),
+                parent: b.parent,
+                translation: b.t,
+                rotation: Quat::from_mat3(&m).normalize().to_array(),
+            }
+        })
+        .collect()
+}
+
+pub fn to_skinned_model(m: &Model, skel: &Skeleton) -> Result<SkinnedModel> {
+    if !m.bone_space {
+        bail!("{} is not a bone-space (skinned) model", m.name);
+    }
+    let mut segments = Vec::new();
+    for (k, seg) in m.segments.iter().enumerate() {
+        if seg.triangles.is_empty() {
+            continue;
+        }
+        let (positions, normals, bones) =
+            mungefs::model::to_model_space(m, seg, skel).map_err(|e| anyhow!("{e}"))?;
+        if bones.iter().any(|&b| b > 255) {
+            bail!("{}: more than 256 bones", m.name);
+        }
+        let texture = crate::alpha::segment_texture(seg)
+            .unwrap_or_default()
+            .to_string();
+        let blend = segment_blends(seg.material_flags)
+            .with_context(|| format!("{} segment {k}", m.name))?;
+        segments.push(SkinnedSegment {
+            positions,
+            normals,
+            uvs: seg.uvs.clone(),
+            joints: bones.iter().map(|&b| [b as u8, 0, 0, 0]).collect(),
+            weights: vec![[1.0, 0.0, 0.0, 0.0]; bones.len()],
+            triangles: seg.triangles.clone(),
+            texture,
+            blend,
+            spec: crate::spec::spec_pass(seg),
+            cloth: false,
+        });
+    }
+    Ok(SkinnedModel {
+        name: m.name.clone(),
+        bones: bones_of(skel),
+        segments,
+    })
+}
+
+/// `MTRL` bits that change how a 0x04 segment composites on one disc or the
+/// other (`analysis/re-material-flags.md` §2): 0x08 = BF2 `ALPHA 0x64`, a
+/// fixed alpha; 0x40 = BF2 `ALPHA 0x48`, additive; 0x80 = BF1 `ALPHA 0x48`,
+/// and in BF2 a second, additive specular pass.
+const BLEND_MODIFIERS: u32 = 0x08 | 0x40 | 0x80;
+
+/// Does a side model's segment COMPOSITE (`true`) or draw OPAQUE with its
+/// sheet's alpha ignored (`false`)? The disc's own per-segment rule, read from
+/// the segment's `MTRL` word alone — both ELFs pick a model draw's GS state
+/// from that word and nothing else, a skinned draw and a rigid one alike
+/// (`analysis/re-side-alpha.md` §3–§4 [V][O]):
+///   * 0x04 → `ALPHA 0x44` = `Cs·As + Cd·(1−As)`, `As` = the sheet's alpha,
+///     and `TEST 0x51001` — Z-tested, no Z write;
+///   * neither 0x04 nor 0x02 → `TEST 0x50000`, no blend.
+///
+/// Those are the only two states the skinned path draws, so a word asking for
+/// another is REFUSED rather than drawn wrong: 0x02 is the alpha TEST
+/// (`0x5000b` BF2, `0x5100b` BF1) and a 0x04 word with a [`BLEND_MODIFIERS`]
+/// bit composites some other way. None of the 52 soldiers the port bakes
+/// carries either — zero 0x02 on both discs, and one 0x04 segment per game,
+/// `all_inf_wookie`'s fur, words `0x5` / `0x10005` (§1's census) — but P7's
+/// vehicles and the hero units do (§1), and they will need that pass first.
+pub fn segment_blends(flags: u32) -> Result<bool> {
+    use crate::detail::{CUTOUT, TRANSPARENT};
+    if flags & CUTOUT != 0 {
+        bail!("MTRL {flags:#x} has the cutout bit 0x02: the disc alpha-tests this segment, and the skinned path has no alpha test");
+    }
+    if flags & TRANSPARENT != 0 && flags & BLEND_MODIFIERS != 0 {
+        bail!("MTRL {flags:#x} composites with a blend other than ALPHA 0x44 (bits {BLEND_MODIFIERS:#x}), which the skinned BLEND pass does not draw");
+    }
+    Ok(flags & TRANSPARENT != 0)
+}
+
+/// The clips `game::animator` plays today, baked into every soldier GLB under
+/// the disc's own name (BF1 `human_rifle_*`; BF2 ships the same names with a
+/// `_full` suffix on full-body clips, which `game::animator::find_clip`
+/// tries). Every clip of the soldier's animation sets is baked beside them
+/// (`crate::anim_sets`, card ANIMS), which `game::animator` plays.
+pub const SOLDIER_CLIPS: &[&str] = &[
+    "human_rifle_stand_idle_emote",
+    "human_rifle_stand_walkforward",
+    "human_rifle_stand_runforward",
+    "human_rifle_stand_walkbackward",
+    "human_rifle_stand_runbackward",
+    "human_rifle_stand_turnleft",
+    "human_rifle_stand_turnright",
+    "human_rifle_stand_shoot",
+    "human_rifle_stand_reload",
+    "human_rifle_crouch_idle_emote",
+    "human_rifle_crouch_walkforward",
+    "human_rifle_crouch_walkbackward",
+    "human_rifle_crouch_shoot",
+    "human_rifle_crouch_reload",
+    "human_rifle_prone_idle_emote",
+    "human_rifle_prone_walkforward",
+    "human_rifle_prone_shoot",
+    "human_rifle_prone_reload",
+    "human_rifle_diveforward",
+    "human_rifle_jump",
+    "human_rifle_fall",
+    "human_rifle_landsoft",
+    "human_rifle_landhard",
+    "human_rifle_stand_getdown_prone",
+    "human_rifle_crouch_getdown_prone",
+    "human_rifle_prone_getup_stand",
+    "human_rifle_prone_getup_crouch",
+    "human_rifle_stand_getupfront",
+    "human_rifle_stand_getupback",
+    "human_rifle_die",
+    "human_rifle_stand_death_forward",
+    "human_rifle_stand_death_backward",
+    "human_rifle_stand_death_left",
+    "human_rifle_stand_death_right",
+];
+
+/// The seat clips a building turret's gunner is posed with (card VTURG,
+/// `analysis/re-turret-draw.md` 3.3 [O]): `human_<value>` of the
+/// `Pilot9Pose` / `PilotAnimation` keys the armed buildings author - nine
+/// frames, nine frames, one. BF1 keeps them in `human_animation_1`
+/// (COMMON.LVL), BF2 in `human_4` (INGAME.LVL). Then the drawn vehicle
+/// riders' (card VRIDE, `analysis/re-vehicle-riders.md` 1, 6): the speeder
+/// bike's and the BARC's nine-poses, the STAP's, the tauntaun's / kaadu's
+/// `ride`, the skiff pilot's, the gunship passenger's and BF2's one-man
+/// AT-ST's. A game whose banks lack one lists it in `missing`.
+pub const SEAT_CLIPS: &[&str] = &[
+    "human_minigun_9pose",
+    "human_dishcannon_9pose",
+    "human_drive",
+    "human_speederbike_9pose",
+    "human_stap_ride",
+    "human_ride",
+    "human_man_minigun",
+    "human_standing",
+    "human_barc_9pose",
+    "human_drive_1manatst",
+];
+
+/// Per-clip facts the runtime needs beside the GLB animation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ClipMeta {
+    pub name: String,
+    pub frames: u32,
+    /// Bank the clip came from.
+    pub bank: String,
+    /// DummyRoot displacement over the clip (x, y, z; metres) — stripped from
+    /// the baked keys so playback is in place; z is the forward run/walk.
+    pub root_motion: [f32; 3],
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SoldierAnims {
+    pub clips: Vec<ClipMeta>,
+    pub missing: Vec<String>,
+}
+
+/// Find `name` (or `name_full`) across the banks: the disc's name of the
+/// clip, its bank and its index there.
+fn find_clip<'a, 'b>(
+    banks: &[&'a AnimBank<'b>],
+    name: &str,
+) -> Option<(String, &'a AnimBank<'b>, usize)> {
+    for suffix in ["", "_full"] {
+        let full = format!("{name}{suffix}");
+        for b in banks {
+            if let Some(k) = b.clip_index(&full) {
+                return Some((full, b, k));
+            }
+        }
+    }
+    None
+}
+
+/// Turn a decoded clip into GLB tracks on the model skeleton: tracks join
+/// bones by CRC; DummyRoot translation is stripped (returned as root motion).
+pub fn clip_to_tracks(clip: &DecodedClip, skel: &Skeleton) -> (Vec<ClipTrack>, [f32; 3]) {
+    let dummy = crc32_lower("DummyRoot");
+    let mut root_motion = [0.0f32; 3];
+    let mut tracks = Vec::new();
+    for t in &clip.tracks {
+        let Some(bone) = skel.bones.iter().position(|b| b.crc == t.bone_crc) else {
+            continue; // rig helper joints the model does not have
+        };
+        let mut translations = t.translations.clone();
+        if t.bone_crc == dummy {
+            if let (Some(a), Some(z)) = (translations.first(), translations.last()) {
+                root_motion = [z[0] - a[0], z[1] - a[1], z[2] - a[2]];
+            }
+            let rest = skel.bones[bone].t;
+            translations = vec![rest; translations.len()];
+        }
+        tracks.push(ClipTrack {
+            bone,
+            rotations: t.rotations.clone(),
+            translations,
+        });
+    }
+    (tracks, root_motion)
+}
+
+/// Bake one soldier model (+ textures) from a SIDE LVL.
+pub fn bake_soldier(lvl_path: &str, model: &str, outdir: &str) -> Result<BakedSoldier> {
+    bake_soldier_anims(lvl_path, model, None, outdir, None)
+}
+
+/// As `bake_soldier`, plus the soldier's clips from `anim_lvl` (BF1
+/// COMMON.LVL / BF2 INGAME.LVL, and for BF2 the side LVLs beside `lvl_path`)
+/// as GLB animations, `<model>.anims.ron` (what was baked) and
+/// `<model>.sets.ron` (the PS2's animation sets over them,
+/// `anim_sets::SoldierSets`).
+pub fn bake_soldier_anims(
+    lvl_path: &str,
+    model: &str,
+    anim_lvl: Option<&str>,
+    outdir: &str,
+    pc_lvl: Option<&str>,
+) -> Result<BakedSoldier> {
+    let pc = pc_lvl.map(crate::tier::PcTextures::load).transpose()?;
+    let buf = std::fs::read(lvl_path).with_context(|| lvl_path.to_string())?;
+    let inner = mungefs::open(&buf).map_err(|e| anyhow!("{e}"))?;
+    let (m, skel) = find_soldier(inner, model)?;
+    let mut sm = to_skinned_model(&m, &skel)?;
+    // BF2's cloth, rest shape pinned to its bones (card CLOTH; the step is
+    // CLOTH2). A sheet only a cloth draws is opaque unless the class says
+    // Transparent.
+    let mut flags = bake_flags(&m);
+    let cloths = crate::cloth::worn_cloths(inner, &m.name, &skel)?;
+    for c in &cloths {
+        let alpha = if c.segment.blend {
+            crate::detail::TRANSPARENT
+        } else {
+            0
+        };
+        *flags
+            .entry(c.segment.texture.to_ascii_lowercase())
+            .or_default() |= alpha;
+    }
+    let cloth_names: Vec<String> = cloths.iter().map(|c| c.name.clone()).collect();
+    sm.segments.extend(cloths.into_iter().map(|c| c.segment));
+    let out = Path::new(outdir);
+    std::fs::create_dir_all(out.join("soldiers"))?;
+    std::fs::create_dir_all(out.join("textures"))?;
+
+    let mut clips = Vec::new();
+    let mut meta = SoldierAnims::default();
+    if let Some(anim_path) = anim_lvl {
+        let abuf = std::fs::read(anim_path).with_context(|| anim_path.to_string())?;
+        let ainner = mungefs::open(&abuf).map_err(|e| anyhow!("{e}"))?;
+        let sanm = mungefs::sanm::find_sanm(ainner).map_err(|e| anyhow!("{e}"))?;
+        // BF2's sets take every soldier side's classes and banks (a level
+        // loads two sides; `anim_sets::bf2::Registry::register`).
+        let sides: Vec<Vec<u8>> = match sanm {
+            Some(_) => ["ALL", "IMP", "REP", "CIS"]
+                .iter()
+                .filter_map(|s| {
+                    std::fs::read(Path::new(lvl_path).with_file_name(format!("{s}.LVL"))).ok()
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut banks = mungefs::anim::find_banks(ainner).map_err(|e| anyhow!("{e}"))?;
+        let anim_banks = banks.len();
+        for side in &sides {
+            let inner = mungefs::open(side).map_err(|e| anyhow!("{e}"))?;
+            banks.extend(mungefs::anim::find_banks(inner).map_err(|e| anyhow!("{e}"))?);
+        }
+        let bones: Vec<String> = skel.bones.iter().map(|b| b.name.clone()).collect();
+        let plan = match &sanm {
+            None => anim_sets::plan_bf1(&anim_sets::bf1::inventory(&banks), &bones),
+            Some(sanm) => {
+                let mut classes = anim_sets::bf2::side_classes(&abuf)?;
+                for side in &sides {
+                    classes.extend(anim_sets::bf2::side_classes(side)?);
+                }
+                let mut reg = anim_sets::bf2::Registry::shipped();
+                let soldiers = reg.register(&classes);
+                // The families of the classes on this model; a model no
+                // class names is posed as `human`.
+                let mut families: Vec<usize> = soldiers
+                    .iter()
+                    .filter(|c| c.geometry.eq_ignore_ascii_case(&m.name))
+                    .map(|c| c.family)
+                    .collect();
+                families.sort_unstable();
+                families.dedup();
+                if families.is_empty() {
+                    families.push(0);
+                }
+                let inv = anim_sets::Inventory::new(&banks);
+                anim_sets::plan_bf2(&inv, &reg, &families, sanm, &bones)
+            }
+        };
+        // The clips `game::animator` plays today (card ANIML replaces the
+        // list by the sets), then every clip a set names.
+        let human: Vec<&AnimBank> = banks[..anim_banks]
+            .iter()
+            .filter(|b| b.name.starts_with("human"))
+            .collect();
+        let mut wanted: Vec<(String, &AnimBank, usize)> = Vec::new();
+        for name in SOLDIER_CLIPS.iter().chain(SEAT_CLIPS) {
+            match find_clip(&human, name) {
+                Some((full, bank, k)) => wanted.push((full, bank, k)),
+                None => meta.missing.push((*name).to_string()),
+            }
+        }
+        for (c, bank) in plan.sets.clips.iter().zip(&plan.banks) {
+            if wanted.iter().any(|w| w.0 == c.name) {
+                continue;
+            }
+            let found = banks
+                .iter()
+                .find(|b| b.name == *bank)
+                .and_then(|b| Some((b, b.clip_index(&c.name)?)));
+            let (b, k) = found.ok_or_else(|| anyhow!("{}: not in bank {bank}", c.name))?;
+            wanted.push((c.name.clone(), b, k));
+        }
+        let mut sets = plan.sets;
+        for (name, bank, k) in wanted {
+            let decoded = bank.decode_clip(k).map_err(|e| anyhow!("{name}: {e}"))?;
+            if plan.measured.contains(&name) {
+                if let Some(v) = anim_sets::root_speed(&name, &decoded, sanm.is_some()) {
+                    sets.root_speed.insert(name.clone(), v);
+                }
+            }
+            let (tracks, root_motion) = clip_to_tracks(&decoded, &skel);
+            clips.push(Clip {
+                name: name.clone(),
+                fps: 30.0,
+                frames: u32::from(decoded.frames),
+                tracks,
+            });
+            meta.clips.push(ClipMeta {
+                name,
+                frames: u32::from(decoded.frames),
+                bank: bank.name.clone(),
+                root_motion,
+            });
+        }
+        crate::write_ron(
+            &out.join("soldiers").join(format!("{}.anims.ron", m.name)),
+            &meta,
+        )?;
+        crate::write_ron(&manifest::anim_sets::path(out, &m.name), &sets)?;
+    }
+    let glb = skinned_to_glb(&sm, &clips)?;
+    std::fs::write(out.join("soldiers").join(format!("{}.glb", m.name)), glb)?;
+
+    let wanted: Vec<String> = sm
+        .segments
+        .iter()
+        .map(|s| s.texture.to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let textures = bake_textures_flagged(inner, &wanted, &flags, out, pc.as_ref())?;
+
+    let mut min = [f32::MAX; 3];
+    let mut max = [f32::MIN; 3];
+    for p in sm.segments.iter().flat_map(|s| s.positions.iter()) {
+        for i in 0..3 {
+            min[i] = min[i].min(p[i]);
+            max[i] = max[i].max(p[i]);
+        }
+    }
+    Ok(BakedSoldier {
+        name: m.name.clone(),
+        clips: clips.len(),
+        missing_clips: meta.missing.clone(),
+        bones: skel.bones.len(),
+        vertices: sm.segments.iter().map(|s| s.positions.len()).sum(),
+        triangles: sm.segments.iter().map(|s| s.triangles.len()).sum(),
+        textures,
+        cloths: cloth_names,
+        aabb: (min, max),
+    })
+}
+
+/// Per-texture OR of the material flags of the segments that use it.
+pub fn texture_flags(m: &mungefs::model::Model) -> std::collections::HashMap<String, u32> {
+    let mut out: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for seg in &m.segments {
+        for (_, t) in &seg.textures {
+            *out.entry(t.to_ascii_lowercase()).or_default() |= seg.material_flags;
+        }
+    }
+    out
+}
+
+/// The flags [`bake_textures_flagged`] decides a sheet's alpha by: the
+/// per-texture OR ([`texture_flags`]), plus `ALPHA_IS_MEANINGFUL` on every
+/// sheet a specular-pass segment draws, whose alpha is the pass's gloss weight
+/// (`crate::spec::pass_textures`, queue DSHN). Only the texture bake sees the
+/// extra bit: the GLB materials' modes still come from `texture_flags` alone
+/// (`crate::alpha::legacy_per_texture_or`).
+fn bake_flags(m: &mungefs::model::Model) -> std::collections::HashMap<String, u32> {
+    let mut flags = texture_flags(m);
+    for t in crate::spec::pass_textures([m]) {
+        *flags.entry(t).or_default() |= crate::detail::ALPHA_IS_MEANINGFUL;
+    }
+    flags
+}
+
+/// Bake the `tex_` chunks named in `wanted` (lowercase) from an LVL to
+/// `<out>/textures/<name>.ktx2`; side LVLs repeat textures, so each is
+/// written once. Returns the names written.
+///
+/// `tex_flags` carries the per-texture material flags gathered from the models
+/// being baked: a texture no material marks cutout or transparent is written
+/// opaque (crate::detail::ALPHA_IS_MEANINGFUL). Passing an empty map would
+/// therefore bake EVERY texture opaque, which is why there is no convenience
+/// wrapper that does it.
+///
+/// `pc` is the classic-plus second tier — the PC install's own SIDE LVL,
+/// whose texture is written BESIDE the PS2 one as `<name>.tier2.ktx2`
+/// wherever `crate::tier::tier2` accepts it. This is the SECOND write site in
+/// the bake (the first is `crate::map`) and it is where the proportional gain
+/// is largest, because a first-person weapon sheet is 128x64 on the PS2 and
+/// 512x256 on the PC. The resolver is used unchanged, same-art test and all
+/// three exclusions included.
+pub fn bake_textures_flagged(
+    inner: &[u8],
+    wanted: &[String],
+    tex_flags: &std::collections::HashMap<String, u32>,
+    out: &Path,
+    pc: Option<&crate::tier::PcTextures>,
+) -> Result<Vec<String>> {
+    let dir = out.join("textures");
+    std::fs::create_dir_all(&dir)?;
+    // Decode everything first: a wanted texture's `_dtl` companion can sit
+    // anywhere in the LVL, including before the base (crate::detail).
+    let all: Vec<mungefs::texture::Texture> = mungefs::content_chunks(inner)
+        .map_err(|e| anyhow!("{e}"))?
+        .iter()
+        .filter(|c| &c.tag == b"tex_")
+        .filter_map(|c| mungefs::texture::Texture::parse(c).ok())
+        .collect();
+
+    let mut textures: Vec<String> = Vec::new();
+    let mut tier2_written = 0usize;
+    for t in &all {
+        let name = t.name.to_ascii_lowercase();
+        if !wanted.contains(&name) || textures.contains(&name) {
+            continue;
+        }
+        let flags = tex_flags
+            .get(&name)
+            .copied()
+            .unwrap_or(crate::detail::ALPHA_IS_MEANINGFUL);
+        // Both tiers, side by side, exactly as `crate::map:1004-1033` writes
+        // them (PLAN §Classic-plus assets, the maintainer 2026-09-03): the base file is
+        // ALWAYS the PS2 disc's pixels — the sim reads only that — and the
+        // classic-plus override, where the chain has one, is written beside it
+        // as `<name>.tier2.ktx2` for the runtime to pick between.
+        //
+        // The alpha state is the PS2 texture's on BOTH files. The side bake
+        // decides it here from the per-texture OR of the material flags (the
+        // map bake decides it per draw), so the flags land on whichever
+        // pixels are written; and where a draw does want alpha, the override
+        // takes the PS2 mask instead of its own channel, which is gloss/spec
+        // on several shipped sheets — a MASK draw would otherwise cut out
+        // along a mask nobody authored and the tier flip would change the
+        // silhouette.
+        let mut r = crate::tier::Resolved::from_ps2(t);
+        let mut tier2 = crate::tier::tier2(t, pc);
+        if flags & crate::detail::ALPHA_IS_MEANINGFUL == 0 {
+            r.make_opaque();
+            if let Some(o) = tier2.as_mut() {
+                o.make_opaque();
+            }
+        } else if let Some(o) = tier2.as_mut() {
+            o.take_alpha_from(&r);
+        }
+        r.write_ktx2(&dir, &format!("{name}.ktx2"))?;
+        if let Some(o) = &tier2 {
+            o.write_ktx2(&dir, &format!("{name}.tier2.ktx2"))?;
+            tier2_written += 1;
+        }
+        // The detail companion stays PS2: `tier::tier2` refuses a
+        // detail-compressed base outright (exclusion 1), so a base and its
+        // companion cannot come from two different tiers.
+        crate::detail::write_detail_for(&dir, t, &all)?;
+        textures.push(name);
+    }
+    if pc.is_some() {
+        eprintln!(
+            "  tier 2 written beside the PS2 base: {tier2_written} of {}",
+            textures.len()
+        );
+    }
+    Ok(textures)
+}
+
+pub struct BakedWeapon {
+    pub name: String,
+    /// `skel` nodes written to `weapons/<model>.nodes.ron` (card FXMF).
+    pub nodes: usize,
+    pub vertices: usize,
+    pub triangles: usize,
+    pub textures: Vec<String>,
+}
+
+/// Bake a hand-held weapon model (a static, model-space `modl` whose single
+/// BNAM bone sits at identity — re-softskin.md §6) to
+/// `<outdir>/weapons/<model>.glb` + its textures.
+pub fn bake_weapon(
+    lvl_path: &str,
+    model: &str,
+    outdir: &str,
+    pc_lvl: Option<&str>,
+) -> Result<BakedWeapon> {
+    let pc = pc_lvl.map(crate::tier::PcTextures::load).transpose()?;
+    let buf = std::fs::read(lvl_path).with_context(|| lvl_path.to_string())?;
+    let inner = mungefs::open(&buf).map_err(|e| anyhow!("{e}"))?;
+    let chunks = mungefs::content_chunks(inner).map_err(|e| anyhow!("{e}"))?;
+    let m = chunks
+        .iter()
+        .filter(|c| &c.tag == b"modl")
+        .filter_map(|c| Model::parse(c).ok())
+        .find(|m| m.name.eq_ignore_ascii_case(model))
+        .ok_or_else(|| anyhow!("modl {model} not found"))?;
+    if m.bone_space {
+        bail!("{model} is a bone-space (skinned) model, not a weapon");
+    }
+    let out = Path::new(outdir);
+    std::fs::create_dir_all(out.join("weapons"))?;
+    std::fs::write(
+        out.join("weapons").join(format!("{}.glb", m.name)),
+        crate::glb::model_to_glb(&m, &crate::alpha::legacy_per_texture_or(&m), false)?,
+    )?;
+    let wanted: Vec<String> = m
+        .segments
+        .iter()
+        .filter_map(crate::alpha::segment_texture)
+        .map(|n| n.to_ascii_lowercase())
+        .collect();
+    let textures = bake_textures_flagged(inner, &wanted, &bake_flags(&m), out, pc.as_ref())?;
+    let nodes = weapon_nodes(&chunks, &m.name);
+    std::fs::write(
+        manifest::weapon_nodes_path(out, &m.name),
+        ron::ser::to_string_pretty(&nodes, ron::ser::PrettyConfig::default())?,
+    )?;
+    Ok(BakedWeapon {
+        name: m.name.clone(),
+        nodes: nodes.len(),
+        vertices: m.segments.iter().map(|s| s.positions.len()).sum(),
+        triangles: m.segments.iter().map(|s| s.triangles.len()).sum(),
+        textures,
+    })
+}
+
+/// A weapon model's `skel` nodes, each at its origin in its parent's frame
+/// (the node's own translation): where `FirePointName` puts the muzzle flash
+/// (card FXMF, `analysis/re-muzzle-flash.md` §4.1 — B1 `FUN_00496b70`).
+/// Empty when the LVL holds no skeleton for the model.
+pub fn weapon_nodes(chunks: &[mungefs::Chunk<'_>], model: &str) -> manifest::WeaponNodes {
+    crate::hardpoints::Skeletons::of(chunks)
+        .find(model)
+        .map(|s| {
+            s.bones
+                .iter()
+                .map(|b| manifest::ManifestHardpoint {
+                    name: b.name.clone(),
+                    pos: b.t,
+                    axes: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two states a skinned segment can take, read off its `MTRL` word
+    /// alone, and the words the skinned path refuses. The first two rows are
+    /// every word a baked soldier segment carries on either disc
+    /// (`analysis/re-side-alpha.md` §0 item 3).
+    #[test]
+    fn segment_blends_draws_two_states_and_refuses_the_rest() {
+        for word in [0x1, 0x31, 0x1_0001, 0x1_0089, 0x1_0101, 0x1_0010] {
+            assert!(!segment_blends(word).unwrap(), "{word:#x} is opaque");
+        }
+        for word in [0x5, 0x1_0005] {
+            assert!(segment_blends(word).unwrap(), "{word:#x} composites");
+        }
+        // The cutout bit in any company: the disc alpha-TESTS it.
+        for word in [0x2, 0x3, 0x6, 0x1_0003] {
+            assert!(segment_blends(word).is_err(), "{word:#x} is refused");
+        }
+        // A transparent word with a bit that changes its blend.
+        for word in [0xc, 0x44, 0x85, 0x1_008d] {
+            assert!(segment_blends(word).is_err(), "{word:#x} is refused");
+        }
+        // Those bits are harmless on an opaque segment (0x1_0089 above).
+        assert!(!segment_blends(0xc8).unwrap());
+    }
+
+    /// Data-gated, queue SKA: `all_inf_wookie` bakes with its FUR segment
+    /// blended and its other two opaque, on both discs — BF1 segment 2 (word
+    /// `0x5`, 261 vertices), BF2 segment 1 (`0x10005`, 288)
+    /// (`analysis/re-side-alpha.md` §0 item 2, [O]) — and only that material
+    /// states an `alphaMode` in the GLB. The verdict is per SEGMENT: the fur
+    /// shares its sheet with an opaque segment in both games (BF1's third
+    /// segment is the face, `wookieface02`; BF2's three all name one sheet).
+    #[test]
+    fn the_wookies_fur_is_its_only_blended_segment_on_both_discs() {
+        let side = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../extracted");
+        let cases = [
+            ("bf1", ["wookieface02", "wookie", "wookie"], 2, 261),
+            ("bf2", ["all_inf_wookie"; 3], 1, 288),
+        ];
+        for (game, sheets, fur, fur_verts) in cases {
+            let all = format!("{side}/{game}/lvl/DATA/_LVL_PS2/SIDE/ALL.LVL");
+            if !std::path::Path::new(&all).exists() {
+                eprintln!("SKIP: {all} not present");
+                continue;
+            }
+            let buf = std::fs::read(&all).unwrap();
+            let (m, skel) = find_soldier(mungefs::open(&buf).unwrap(), "all_inf_wookie").unwrap();
+            let sm = to_skinned_model(&m, &skel).unwrap();
+            let blends: Vec<bool> = sm.segments.iter().map(|s| s.blend).collect();
+            let expected: Vec<bool> = (0..3).map(|k| k == fur).collect();
+            assert_eq!(blends, expected, "{game}: only the fur composites");
+            assert_eq!(
+                sm.segments[fur].positions.len(),
+                fur_verts,
+                "{game}: the fur segment"
+            );
+            let named: Vec<&str> = sm.segments.iter().map(|s| s.texture.as_str()).collect();
+            assert_eq!(named, sheets, "{game}: the sheets the segments name");
+
+            let glb = skinned_to_glb(&sm, &[]).unwrap();
+            let len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+            let doc: serde_json::Value = serde_json::from_slice(&glb[20..20 + len]).unwrap();
+            let modes: Vec<Option<&str>> = doc["materials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|mat| mat.get("alphaMode").and_then(|v| v.as_str()))
+                .collect();
+            let expected: Vec<Option<&str>> =
+                (0..3).map(|k| (k == fur).then_some("BLEND")).collect();
+            assert_eq!(modes, expected, "{game}: the GLB's materials");
+        }
+    }
+
+    /// re-softskin.md §8 acceptance: the `human` rig's rest pose (zaf_ JONT
+    /// quats/positions) equals the model skel's bind pose bone for bone.
+    #[test]
+    fn human_rig_rest_matches_stormtrooper_bind() {
+        let imp = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../extracted/bf1/lvl/DATA/_LVL_PS2/SIDE/IMP.LVL"
+        );
+        let common = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../extracted/bf1/lvl/DATA/_LVL_PS2/COMMON/ENG/COMMON.LVL"
+        );
+        if !std::path::Path::new(imp).exists() || !std::path::Path::new(common).exists() {
+            eprintln!("SKIP: IMP.LVL / COMMON.LVL not present");
+            return;
+        }
+        let ibuf = std::fs::read(imp).unwrap();
+        let (_, skel) =
+            find_soldier(mungefs::open(&ibuf).unwrap(), "imp_inf_stormtrooper").unwrap();
+        let cbuf = std::fs::read(common).unwrap();
+        let rigs = mungefs::anim::find_rigs(mungefs::open(&cbuf).unwrap()).unwrap();
+        let rig = rigs.iter().find(|r| r.name == "human_animation_0").unwrap();
+        let bones = bones_of(&skel);
+        let mut matched = 0;
+        for (b, sb) in bones.iter().zip(&skel.bones) {
+            let Some(j) = rig.joint(sb.crc) else { continue };
+            matched += 1;
+            let q = Quat::from_array(b.rotation);
+            let r = Quat::from_array(j.rest_rot);
+            assert!(
+                q.dot(r).abs() > 0.999,
+                "{}: model {q:?} vs rig {r:?}",
+                sb.name
+            );
+            let dp = Vec3::from_array(b.translation) - Vec3::from_array(j.rest_pos);
+            assert!(dp.length() < 1e-3, "{}: {dp:?}", sb.name);
+        }
+        assert_eq!(matched, 25, "every model bone has a rig joint");
+    }
+
+    /// Data-gated: the side bake writes BOTH tiers side by side, and the
+    /// classic-plus install cannot reach the base file — the PS2 pixels are
+    /// what `<name>.ktx2` holds whether or not a PC SIDE LVL was supplied,
+    /// and the override sits beside it as `<name>.tier2.ktx2`.
+    ///
+    /// The super battle droid is the case with a PC counterpart AND a sheet a
+    /// specular pass draws, so both files must carry the PS2's gloss mask.
+    #[test]
+    fn side_textures_write_both_tiers_and_the_base_is_always_ps2() {
+        let cis = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../extracted/bf2/lvl/DATA/_LVL_PS2/SIDE/CIS.LVL"
+        );
+        let pc_cis = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../PC_swbf2_exe/Star Wars Battlefront II Classic/GameData/data/_lvl_pc/side/cis.lvl"
+        );
+        if !std::path::Path::new(cis).exists() || !std::path::Path::new(pc_cis).exists() {
+            eprintln!("SKIP: BF2 CIS.LVL or the PC side/cis.lvl is not present");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("openbf_tier2_{}", std::process::id()));
+        let (with_pc, ps2_only) = (root.join("with_pc"), root.join("ps2_only"));
+        let _ = std::fs::remove_dir_all(&root);
+        bake_soldier_anims(
+            cis,
+            "cis_inf_sbdroid",
+            None,
+            with_pc.to_str().unwrap(),
+            Some(pc_cis),
+        )
+        .unwrap();
+        bake_soldier(cis, "cis_inf_sbdroid", ps2_only.to_str().unwrap()).unwrap();
+
+        let base = with_pc.join("textures/cis_inf_sbdroid.ktx2");
+        let tier2 = with_pc.join("textures/cis_inf_sbdroid.tier2.ktx2");
+        let dims = |p: &std::path::Path| {
+            let bytes = std::fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            let r = ktx2::Reader::new(&bytes).unwrap();
+            (r.header().pixel_width, r.header().pixel_height)
+        };
+        assert_eq!(
+            dims(&base),
+            (256, 256),
+            "the base is the disc's own texture"
+        );
+        assert_eq!(dims(&tier2), (512, 512), "the PC override sits beside it");
+        assert_eq!(
+            std::fs::read(&base).unwrap(),
+            std::fs::read(ps2_only.join("textures/cis_inf_sbdroid.ktx2")).unwrap(),
+            "the PC install must not change one byte of the base file"
+        );
+        // The droid's sheet is drawn by a specular pass, so BOTH tiers carry
+        // the PS2's gloss mask (queue DSHN: disc mean 34/255) — the override's
+        // own alpha is a different channel (see `tier`), so it takes the PS2's.
+        for p in [&base, &tier2] {
+            let bytes = std::fs::read(p).unwrap();
+            let r = ktx2::Reader::new(&bytes).unwrap();
+            let level0 = r.levels().next().unwrap();
+            let n = level0.data.len() / 4;
+            let mean = level0
+                .data
+                .chunks_exact(4)
+                .map(|px| f64::from(px[3]))
+                .sum::<f64>()
+                / n as f64;
+            assert!(
+                (20.0..50.0).contains(&mean),
+                "{}: the PS2 gloss mask, got alpha mean {mean:.1}",
+                p.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Data-gated regression, both halves of the droid's sheet. Its alpha is
+    /// NOT a cutout: every texel is below the 0.5 alpha test the renderer
+    /// once ran on every draw (the whole model went invisible), so the GLB
+    /// material stays OPAQUE — no segment's word has 0x02 or 0x04. But it IS
+    /// the specular pass's gloss weight (queue DSHN, `analysis/re-spec-gloss.md`
+    /// §3: disc mean 34/255), so the baked sheet keeps it; at 255 the pass adds
+    /// at full weight and the droid reads as chrome.
+    #[test]
+    fn a_pass_sheet_keeps_its_gloss_alpha_and_draws_opaque() {
+        let cis = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../extracted/bf2/lvl/DATA/_LVL_PS2/SIDE/CIS.LVL"
+        );
+        if !std::path::Path::new(cis).exists() {
+            eprintln!("SKIP: CIS.LVL not present");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("openbf_alpha_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        bake_soldier(cis, "cis_inf_sbdroid", dir.to_str().unwrap()).unwrap();
+        let bytes = std::fs::read(dir.join("textures/cis_inf_sbdroid.ktx2")).unwrap();
+        let r = ktx2::Reader::new(&bytes).unwrap();
+        let level0 = r.levels().next().unwrap();
+        let alpha: Vec<u8> = level0.data.chunks_exact(4).map(|p| p[3]).collect();
+        let mean = alpha.iter().map(|&a| f64::from(a)).sum::<f64>() / alpha.len() as f64;
+        assert!(
+            (20.0..50.0).contains(&mean),
+            "the sheet keeps the disc's gloss mask (mean 34), got mean {mean:.1}"
+        );
+        let glb = std::fs::read(dir.join("soldiers/cis_inf_sbdroid.glb")).unwrap();
+        assert!(
+            !glb.windows(9).any(|w| w == b"alphaMode"),
+            "the droid's materials stay OPAQUE"
+        );
+        // And the flag words really are what decide it: no cutout or
+        // transparent material, and a specular pass on the sheet.
+        let buf = std::fs::read(cis).unwrap();
+        let inner = mungefs::open(&buf).unwrap();
+        let m = mungefs::content_chunks(inner)
+            .unwrap()
+            .iter()
+            .filter(|c| &c.tag == b"modl")
+            .map(|c| mungefs::model::Model::parse(c).unwrap())
+            .find(|m| m.name == "cis_inf_sbdroid")
+            .expect("droid model");
+        assert!(
+            m.segments
+                .iter()
+                .all(|s| s.material_flags & crate::detail::ALPHA_IS_MEANINGFUL == 0),
+            "droid segments claim no cutout/transparent material"
+        );
+        assert!(crate::spec::pass_textures([&m]).contains("cis_inf_sbdroid"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Data-gated: a BF1 base texture with detailCompressed gets its `_dtl`
+    /// companion baked as `<base>.dtl.ktx2` at 4x the base size, and the
+    /// companion does not also appear under its own source name.
+    #[test]
+    fn bf1_soldier_textures_get_detail_companions() {
+        let all = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../extracted/bf1/lvl/DATA/_LVL_PS2/SIDE/ALL.LVL"
+        );
+        if !std::path::Path::new(all).exists() {
+            eprintln!("SKIP: ALL.LVL not present");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("openbf_detail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let b = bake_soldier(all, "all_inf_soldier", dir.to_str().unwrap()).unwrap();
+        assert!(b.textures.contains(&"all_inf_trooper".to_string()));
+        let tex = dir.join("textures");
+        let dims = |file: &str| {
+            let bytes = std::fs::read(tex.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+            let r = ktx2::Reader::new(&bytes).unwrap();
+            (r.header().pixel_width, r.header().pixel_height)
+        };
+        assert_eq!(dims("all_inf_trooper.ktx2"), (64, 64));
+        assert_eq!(dims("all_inf_trooper.dtl.ktx2"), (256, 256));
+        assert_eq!(dims("rebel_face01.ktx2"), (32, 32));
+        assert_eq!(dims("rebel_face01.dtl.ktx2"), (128, 128));
+        assert!(
+            !tex.join("all_inf_trooper_dtl.ktx2").exists(),
+            "the companion is baked as <base>.dtl.ktx2, not as its own texture"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clips bake onto the stormtrooper: in place (DummyRoot stripped), root
+    /// motion recorded, idle 71 fr / run 19 fr.
+    #[test]
+    fn stormtrooper_bakes_with_clips() {
+        let imp = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../extracted/bf1/lvl/DATA/_LVL_PS2/SIDE/IMP.LVL"
+        );
+        let common = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../extracted/bf1/lvl/DATA/_LVL_PS2/COMMON/ENG/COMMON.LVL"
+        );
+        if !std::path::Path::new(imp).exists() || !std::path::Path::new(common).exists() {
+            eprintln!("SKIP: IMP.LVL / COMMON.LVL not present");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("openbf_soldier_anims_{}", std::process::id()));
+        let b = bake_soldier_anims(
+            imp,
+            "imp_inf_stormtrooper",
+            Some(common),
+            dir.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        // BF1's banks hold every seat clip but BF2's two (card VRIDE).
+        assert_eq!(
+            b.missing_clips,
+            ["human_barc_9pose", "human_drive_1manatst"],
+            "missing clips"
+        );
+        // The list and the eight seat clips first, in their order, then the
+        // other clips of BF1's sets: 151 in the tables, 33 of them in the
+        // list (`human_rifle_die` is in no table), none a seat clip.
+        assert_eq!(b.clips, 160);
+        let meta: SoldierAnims = ron::from_str(
+            &std::fs::read_to_string(dir.join("soldiers/imp_inf_stormtrooper.anims.ron")).unwrap(),
+        )
+        .unwrap();
+        for (c, name) in meta.clips.iter().zip(
+            SOLDIER_CLIPS
+                .iter()
+                .chain(SEAT_CLIPS)
+                .filter(|n| !b.missing_clips.iter().any(|m| m == *n)),
+        ) {
+            assert_eq!(c.name, *name);
+        }
+        let get = |n: &str| meta.clips.iter().find(|c| c.name == n).unwrap().clone();
+        // The seat clips (cards VTURG, VRIDE): the turrets' 9, 9 and 1
+        // frames, the riders' (re-vehicle-riders 4.2: `human_ride` 61), from
+        // BF1's bank.
+        for (n, f) in [
+            ("human_minigun_9pose", 9),
+            ("human_dishcannon_9pose", 9),
+            ("human_drive", 1),
+            ("human_speederbike_9pose", 9),
+            ("human_ride", 61),
+        ] {
+            let c = get(n);
+            println!("{n}: {} frames, bank {}", c.frames, c.bank);
+            assert_eq!((c.frames, c.bank.as_str()), (f, "human_animation_1"), "{n}");
+        }
+        for n in ["human_stap_ride", "human_man_minigun", "human_standing"] {
+            let c = get(n);
+            println!("{n}: {} frames, bank {}", c.frames, c.bank);
+        }
+        assert_eq!(get("human_rifle_stand_idle_emote").frames, 71);
+        let run = get("human_rifle_stand_runforward");
+        assert_eq!(run.frames, 19);
+        assert!(
+            (run.root_motion[2] - 4.014).abs() < 0.01,
+            "{:?}",
+            run.root_motion
+        );
+        assert!((get("human_rifle_diveforward").root_motion[2] - 5.404).abs() < 0.01);
+        let (doc, _, _) = gltf::import(dir.join("soldiers/imp_inf_stormtrooper.glb")).unwrap();
+        assert_eq!(doc.animations().count(), 160);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Data-gated Tier-1: the BF1 stormtrooper bakes to a 25-joint skinned
+    /// GLB whose model-space extents equal the modl vis box, and its texture.
+    #[test]
+    fn stormtrooper_bakes() {
+        let p = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../extracted/bf1/lvl/DATA/_LVL_PS2/SIDE/IMP.LVL"
+        );
+        if !std::path::Path::new(p).exists() {
+            eprintln!("SKIP: IMP.LVL not present");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("openbf_soldier_{}", std::process::id()));
+        let b = bake_soldier(p, "imp_inf_stormtrooper", dir.to_str().unwrap()).unwrap();
+        assert_eq!((b.bones, b.vertices, b.triangles), (25, 1387, 1630));
+        assert!((b.aabb.1[1] - 2.08769).abs() < 1e-3, "{:?}", b.aabb);
+        assert!((b.aabb.0[0] + 0.929476).abs() < 1e-3);
+        assert_eq!(b.textures, vec!["imp_inf_trooper".to_string()]);
+        let glb = dir.join("soldiers/imp_inf_stormtrooper.glb");
+        let (doc, buffers, _) = gltf::import(&glb).unwrap();
+        let skin = doc.skins().next().unwrap();
+        assert_eq!(skin.joints().count(), 25);
+        let prim = doc.meshes().next().unwrap().primitives().next().unwrap();
+        let reader = prim.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
+        assert_eq!(reader.read_positions().unwrap().count(), 1387);
+        let joints: Vec<[u16; 4]> = reader.read_joints(0).unwrap().into_u16().collect();
+        assert_eq!(joints[0], [15, 0, 0, 0]);
+        assert!(dir.join("textures/imp_inf_trooper.ktx2").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The BF1 stormtrooper rifle bakes as a static model with its texture.
+    #[test]
+    fn imp_rifle_bakes() {
+        let imp = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../extracted/bf1/lvl/DATA/_LVL_PS2/SIDE/IMP.LVL"
+        );
+        if !std::path::Path::new(imp).exists() {
+            eprintln!("SKIP: IMP.LVL not present");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("openbf_weapon_{}", std::process::id()));
+        let w = bake_weapon(imp, "imp_weap_inf_rifle", dir.to_str().unwrap(), None).unwrap();
+        assert!(
+            w.vertices > 50 && w.triangles > 30,
+            "{} / {}",
+            w.vertices,
+            w.triangles
+        );
+        assert!(!w.textures.is_empty(), "rifle texture");
+        assert!(dir.join("weapons/imp_weap_inf_rifle.glb").exists());
+        assert!(dir.join("weapons/imp_weap_inf_rifle.nodes.ron").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Card FXMF: the fire points equal the PS2 RAM's class+0x30
+    /// (`analysis/re-muzzle-flash.md` §4.1, `ramflash.py`).
+    #[test]
+    fn weapon_fire_points_are_the_ram_values() {
+        let side = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../extracted/bf1/lvl/DATA/_LVL_PS2/SIDE/"
+        );
+        for (lvl, model, want) in [
+            ("REP.LVL", "rep_weap_inf_rifle", [0.0, 0.0533, 1.097]),
+            ("CIS.LVL", "cis_weap_inf_pistol", [0.0103, 0.0394, 0.2601]),
+            ("ALL.LVL", "all_weap_inf_rifle", [0.0, 0.0597, 0.6926]),
+            ("IMP.LVL", "imp_weap_inf_rifle", [0.0, 0.0422, 0.4082]),
+        ] {
+            let Ok(buf) = std::fs::read(format!("{side}{lvl}")) else {
+                eprintln!("SKIP: {lvl} not present");
+                continue;
+            };
+            let inner = mungefs::open(&buf).unwrap();
+            let chunks = mungefs::content_chunks(inner).unwrap();
+            let nodes = weapon_nodes(&chunks, model);
+            let fp = nodes
+                .iter()
+                .find(|n| n.name.eq_ignore_ascii_case("hp_fire"))
+                .unwrap_or_else(|| panic!("{model}: no hp_fire in {nodes:?}"));
+            for (got, want) in fp.pos.iter().zip(want) {
+                assert!((got - want).abs() < 5e-4, "{model}: {:?}", fp.pos);
+            }
+        }
+    }
+}

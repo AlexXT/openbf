@@ -1,0 +1,422 @@
+//! The HUD pass (card BHUD2): window-pixel triangles over the finished frame —
+//! textured, vertex-coloured, alpha or additive, in the order they are given.
+//! A batch flagged `depth` (a HUD mesh) is depth-tested against itself in a
+//! depth buffer of the pass's own; everything else ignores depth, so order
+//! alone decides what covers what. The layout that produces the triangles is
+//! `ui::hud_draw`; this file only puts them on the target.
+//!
+//! [`HudPass`] is its own object rather than a `Renderer` field because it
+//! paints from the overlay hook (`OverlayFn`), like the egui overlay does.
+//!
+//! Colours are DISPLAY values and blend as display values, which is what the
+//! PS2's frame buffer does: black at alpha 0.6 leaves 40 % of the pixel's
+//! byte, not 40 % of its light. The pass gets there by drawing through a
+//! non-sRGB view of the frame (`Renderer::display_view_format`); where the
+//! window surface has none it falls back to the frame's own sRGB view and
+//! linearises each fragment, so colours are right and only the blend is the
+//! renderer's linear one.
+
+use bytemuck::{Pod, Zeroable};
+
+/// Window pixels (x right, y down), depth 0 near … 1 far; display (sRGB
+/// encoded) RGB with straight alpha.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HudVertex {
+    pub pos: [f32; 3],
+    pub uv: [f32; 2],
+    pub color: [f32; 4],
+}
+
+/// A texture uploaded with [`HudPass::add_texture`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HudTexture(u32);
+
+/// A run of indexed triangles sharing one texture and state.
+#[derive(Debug, Clone, Copy)]
+pub struct HudBatch {
+    /// `None` draws the vertex colour alone.
+    pub texture: Option<HudTexture>,
+    pub additive: bool,
+    pub depth: bool,
+    pub first: u32,
+    pub count: u32,
+}
+
+const SHADER: &str = r#"
+// `linearise` is 1 on the fallback path (module doc).
+struct Screen { size: vec2<f32>, linearise: f32, pad: f32 };
+@group(0) @binding(0) var<uniform> screen: Screen;
+@group(1) @binding(0) var sheet: texture_2d<f32>;
+@group(1) @binding(1) var sheet_sampler: sampler;
+
+struct VsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_hud(@location(0) pos: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) color: vec4<f32>) -> VsOut {
+    var out: VsOut;
+    out.clip = vec4<f32>(
+        pos.x / screen.size.x * 2.0 - 1.0,
+        1.0 - pos.y / screen.size.y * 2.0,
+        pos.z,
+        1.0,
+    );
+    out.uv = uv;
+    out.color = color;
+    return out;
+}
+
+@fragment
+fn fs_hud(in: VsOut) -> @location(0) vec4<f32> {
+    let c = textureSample(sheet, sheet_sampler, in.uv) * in.color;
+    if (screen.linearise < 0.5) {
+        return c;
+    }
+    let lo = c.rgb / 12.92;
+    let hi = pow((c.rgb + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return vec4<f32>(select(hi, lo, c.rgb <= vec3<f32>(0.04045)), c.a);
+}
+"#;
+
+pub struct HudPass {
+    /// Indexed `[depth][additive]`.
+    pipelines: [[wgpu::RenderPipeline; 2]; 2],
+    screen_buf: wgpu::Buffer,
+    screen_bg: wgpu::BindGroup,
+    texture_bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    textures: Vec<wgpu::BindGroup>,
+    white: wgpu::BindGroup,
+    vertices: Option<(wgpu::Buffer, u64)>,
+    indices: Option<(wgpu::Buffer, u64)>,
+    depth: Option<(wgpu::TextureView, [u32; 2])>,
+    /// The non-sRGB view format to draw through, or `None` on the fallback.
+    display: Option<wgpu::TextureFormat>,
+}
+
+fn texture_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> Option<wgpu::BindGroup> {
+    let view = crate::texture::upload_levels(
+        device,
+        queue,
+        width,
+        height,
+        &[rgba],
+        // The sheet's bytes as they are: display values (module doc).
+        false,
+        Some("hud sheet"),
+    )
+    .ok()?;
+    Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hud sheet bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    }))
+}
+
+impl HudPass {
+    /// A pass that draws into frames of `format`; `display` is
+    /// `Renderer::display_view_format` for those frames.
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        display: Option<wgpu::TextureFormat>,
+    ) -> Self {
+        let format = display.unwrap_or(format);
+        let screen_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("hud screen bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("hud sheet bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hud layout"),
+            bind_group_layouts: &[&screen_bgl, &texture_bgl],
+            push_constant_ranges: &[],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("hud shader"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
+        let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4];
+        let pipeline = |depth: bool, additive: bool| {
+            let blend = wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: if additive {
+                        wgpu::BlendFactor::One
+                    } else {
+                        wgpu::BlendFactor::OneMinusSrcAlpha
+                    },
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            };
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("hud pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_hud"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<HudVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &attributes,
+                    }],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_hud"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: crate::pipelines::FRAME_WRITES,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                // HUD meshes are mirrored and turned freely: no culling.
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: depth,
+                    depth_compare: if depth {
+                        wgpu::CompareFunction::LessEqual
+                    } else {
+                        wgpu::CompareFunction::Always
+                    },
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let pipelines = [
+            [pipeline(false, false), pipeline(false, true)],
+            [pipeline(true, false), pipeline(true, true)],
+        ];
+        let screen_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hud screen"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let screen_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("hud screen bg"),
+            layout: &screen_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: screen_buf.as_entire_binding(),
+            }],
+        });
+        // The HUD's sheets are drawn near their own size: bilinear, clamped,
+        // no mips.
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("hud sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let white = texture_bind_group(device, queue, &texture_bgl, &sampler, &[255; 4], 1, 1)
+            .expect("a 1x1 texture uploads");
+        Self {
+            pipelines,
+            screen_buf,
+            screen_bg,
+            texture_bgl,
+            sampler,
+            textures: Vec::new(),
+            white,
+            vertices: None,
+            indices: None,
+            depth: None,
+            display,
+        }
+    }
+
+    /// Upload an RGBA8 sheet; `None` when the bytes do not fit the size.
+    pub fn add_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Option<HudTexture> {
+        let bg = texture_bind_group(
+            device,
+            queue,
+            &self.texture_bgl,
+            &self.sampler,
+            rgba,
+            width,
+            height,
+        )?;
+        self.textures.push(bg);
+        Some(HudTexture(self.textures.len() as u32 - 1))
+    }
+
+    /// Draw `batches` over `view` (call from the renderer's overlay hook).
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint(
+        &mut self,
+        vertices: &[HudVertex],
+        indices: &[u32],
+        batches: &[HudBatch],
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        size: [u32; 2],
+    ) {
+        if batches.is_empty() || vertices.is_empty() || size[0] == 0 || size[1] == 0 {
+            return;
+        }
+        queue.write_buffer(
+            &self.screen_buf,
+            0,
+            bytemuck::cast_slice(&[
+                size[0] as f32,
+                size[1] as f32,
+                if self.display.is_some() { 0.0 } else { 1.0 },
+                0.0,
+            ]),
+        );
+        let grow = |slot: &mut Option<(wgpu::Buffer, u64)>, bytes: &[u8], usage| {
+            let need = bytes.len() as u64;
+            if !matches!(slot, Some((_, cap)) if *cap >= need) {
+                let cap = need.next_power_of_two().max(4096);
+                *slot = Some((
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("hud geometry"),
+                        size: cap,
+                        usage: usage | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    cap,
+                ));
+            }
+            if let Some((buf, _)) = slot {
+                queue.write_buffer(buf, 0, bytes);
+            }
+        };
+        grow(
+            &mut self.vertices,
+            bytemuck::cast_slice(vertices),
+            wgpu::BufferUsages::VERTEX,
+        );
+        grow(
+            &mut self.indices,
+            bytemuck::cast_slice(indices),
+            wgpu::BufferUsages::INDEX,
+        );
+        if !matches!(&self.depth, Some((_, s)) if *s == size) {
+            self.depth = Some((
+                crate::device::create_depth_texture(device, size[0], size[1]),
+                size,
+            ));
+        }
+        let (Some((vbuf, _)), Some((ibuf, _)), Some((depth, _))) =
+            (&self.vertices, &self.indices, &self.depth)
+        else {
+            return;
+        };
+        let display_view = self.display.map(|format| {
+            view.texture().create_view(&wgpu::TextureViewDescriptor {
+                format: Some(format),
+                ..Default::default()
+            })
+        });
+        let view = display_view.as_ref().unwrap_or(view);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("hud pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_bind_group(0, &self.screen_bg, &[]);
+        pass.set_vertex_buffer(0, vbuf.slice(..));
+        pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+        let total = indices.len() as u32;
+        for b in batches {
+            let end = b.first.saturating_add(b.count);
+            if b.count == 0 || end > total {
+                continue;
+            }
+            let bg = b
+                .texture
+                .and_then(|t| self.textures.get(t.0 as usize))
+                .unwrap_or(&self.white);
+            pass.set_pipeline(&self.pipelines[usize::from(b.depth)][usize::from(b.additive)]);
+            pass.set_bind_group(1, bg, &[]);
+            pass.draw_indexed(b.first..end, 0, 0..1);
+        }
+    }
+}

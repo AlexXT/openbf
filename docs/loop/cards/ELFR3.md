@@ -1,0 +1,38 @@
+---
+id: ELFR3
+title: BF1 Normal-class 0x04 words blend on the PS2 (re-material-flags §0.4 [V]) but the census bakes them OPAQUE or MASK: YAV1's free-standing temple holo panels (yav_bldg_controlroom_maps 0x4) and BES1/HOT1's command-centre holo maps (HOTH_bldg_command_center_maps 0x5) draw solid green where the PS2 sees through them
+milestone: M1
+value: 3
+phase: build
+status: done
+deps: ELFR
+files: bake/src/alpha.rs
+declares: rebake=maps; goldens=(census first)
+needs:
+effort:
+branch:
+resume: MERGED into ELFR2 (planner 2026-09-30 21:45): same file bake/src/alpha.rs, same census; ELFR2 carries this card's text and acceptance
+created: 2026-09-29
+defer: post-alpha
+value_pre_alpha: 4
+---
+## Why
+ELFR (landed the Normal-without-bits OPAQUE and Scroll|0x04 BLEND overrides) found that the PXWA "temple holo panels" are NOT
+the Scroll `scanlines` material: the free-standing panels in `pcsx2/ref/bf1_yav1/walk/cp1_temple_b180` are
+`yav_bldg_controlroom_maps` (flags 0x4, Normal class, a0 0.336 mid 0.325 → census rule 3 OPAQUE); `PXC_DROP_LAYERS=Opaque`
+removes them (ELFR report). The ELF blends every Normal 0x04 word without 0x02 (ALPHA 0x44, Z-tested, no Z write).
+BES1's control-room panels (`bes1_bldg_console_b`, `HOTH_bldg_command_center_maps` 0x5) are the same case.
+## Scope — the census (ELFR scratch bake, `lead_tmp/elfr/census/`): 44 BF1 materials, Normal class, 0x04 without 0x02, not BLEND:
+most are bimodal MASK cutouts (bamboo LOWD, fences, gates, moss, sky mountains/planets) that would draw the same shape
+blended; the risky ones: `kam_crate` 0x05 (§0.6(a), grime alpha mid 0.55 — the shredded-crate case ALPHA RULE v2 was made for),
+`kam_bldg_chamber_floor`/`kam_bldg_interior_floors` 0x10045 (alpha 224–229 everywhere → a 0.9-opaque floor), `Rhn1_prop_floor_01`
+0x45 (mid 0.99), `nab2_bldg_rot_floor` 0x10005 (mid 1.0), the RHN2/BES1 sky clouds (sky path: D7).
+## Acceptance
+- Grab PCSX2 frames of the KAM1 crate and a KAM1 interior floor (and RHN1's tunnel floor) first: do they show see-through?
+  If yes, take the full Normal 0x04 → BLEND rule in `bf1_elf_verdict`; if not, find what the PS2 does to their alpha
+  (vertex alpha? the CLUT scale makes 229 → 115/128) before splitting the rule.
+- Re-render `bf1_yav1/walk cp1_temple` and `bf1_bes1/walk cp0_cp9, cp1_cp12` (ELFR's `lead_tmp/elfr/render.sh` pattern:
+  before/after from the same pxc_pose): the panels see-through. Declare the goldens the census names.
+
+## Planner note (2026-09-30, M-ALPHA)
+`defer: post-alpha` — not needed for the alpha's six showcase maps or its checklist. Value 4 → 3 until the alpha (restore from `value_pre_alpha`).

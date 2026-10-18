@@ -1,0 +1,305 @@
+<!-- Moved verbatim from PLAN.md (original lines shown in the pointer table) on 2026-10-08. PLAN.md lines 30-332: LOCKED FEATURE SET (the maintainer's decisions). -->
+
+## LOCKED FEATURE SET (the maintainer, 2026-08-30)
+
+### Movement & feel
+- **(the maintainer, 2026-09-03) Aim assist is NEVER off by default, at any difficulty.**
+  It is a separate user toggle, default ON, saved per profile with the
+  user's other customisations. No difficulty tier may flip it.
+- **(the maintainer, 2026-09-03) Universalised unit behaviour.** Where a class behaves
+  differently between the two games, ONE behaviour is chosen for the whole
+  blended game and applied to that class on every map, whichever disc the map
+  comes from; the choice is recorded here per class as it comes up. First
+  decision: **the droideka in ball form can jump on every map, as in BF2**
+  (BF1's ball cannot). **CORRECTED 2026-09-08** (the maintainer's decision (a), from
+  `analysis/re-droideka.md`, RE_LOG 2026-09-07): the original line named the
+  wrong game — BF2's ball has the button jump and BF1's has none (its only
+  upward impulse is the PostCollision mirror bounce). The universal behaviour
+  is therefore BF2's, with BF2's numbers: `BallJumpHeight` 1.27 m
+  (v0 = √(2·9.8·1.27) = 4.99 m/s), `EnergyCostJump` 30 of `EnergyBar` 100
+  (restore 10/s, 15 idle), grounded for < 0.1 s only, no double jump, a
+  +25 % forward boost; a BF1-sourced droideka has no `BallJumpHeight`, so it
+  takes 1.27 m as a PROVISIONAL default. The BUILD stays HELD (P7-class, the
+  vehicle/entity work). The RE for each such difference cites both ELFs.
+- Stances: one contextual button — **moving = roll** (both games had roll; BF1's was
+  harder), **stationary = stance cycle** stand → crouch → prone/army-crawl (BF1 prone
+  returns; BF2 dropped it). `RE:` BF1 stance machine + both roll implementations.
+  **RE DONE 2026-08-30** (analysis/re-stance-roll.md): BF2 already implements the
+  contextual button (crouch btn: moving=roll / stationary=cycle); its prone action is
+  a stub but engine support survives. DECISION: adopt BF2's roll predicate (stick≥0.9,
+  not straight-back) + BF2 impulse roll (all-direction, RollSpeedFactor 1.7×MaxSpeed,
+  10 energy, exit to stand) + BF1's prone restored in the cycle; BF1's sideways
+  strafe-ramp roll documented for reference, not shipped.
+- Sprint: BF2 system, **limited stamina**. Infinite stamina exists only as a cheat.
+- Jet/jump-pack: **BF2 feel**; infinite fuel via cheat.
+- Aim assist **on foot**: **BF1 passive magnetism only** — no BF2 square-button X lock-on.
+  Intensity slider. `RE:` BF1 magnetism math + constants (top priority). Vehicles, flyers
+  and space aim differently (§Vehicles & space).
+
+### Combat
+- Weapon balance: **fresh rebalance pass**. Baked ODF stats are the starting point, then a
+  tuning pass (documented per weapon, PS2 values kept in data for reference/revert).
+- Awards & medals: **KEEP (BF2 system)** — grind-to-permanent-unlock stays. Settings
+  toggle on/off; "all awards this session" cheat.
+- Classes: **hybrid unlock**. In-battle: BF2-style score unlock for special classes, every
+  battle. Meta: cumulative usage/feats (elite-rifle-style graduated criteria) lower the
+  in-battle threshold over time → eventually permanently unlocked.
+
+### Heroes
+- **Playable heroes (BF2) AND AI-controlled heroes (BF1 presence), both on all content.**
+- Heroes are **killable, always** — no BF1 invincibility ("you see a hero and you just run
+  away — no fun").
+- Health (the maintainer, 2026-09-23 — **reverses the earlier "flat pool, drop the drain/kill-to-heal"
+  call**): use **BF2's standard hero health pool, the disc's own values** (`RE:` them, do not
+  guess), with one change — it shrinks **only from damage taken, never with the passage of
+  time**, and it still **regenerates for killing enemies**. This is the default for now; the maintainer
+  will add options and tinker with it later, so keep the pool, the kill-heal amount and the
+  no-time-drain rule as data. `RE:` hero spawn/possession flow (BF2), NPC hero behavior (BF1),
+  the disc's hero health and kill-heal values.
+
+### AI
+- Infantry AI base: **RESOLVED 2026-09-01 (the maintainer, Fable session 8): openbf's OWN
+  AI** — modern architecture (authored-graph navigation + local steering, a
+  per-team utility commander, behaviour tree, perception, a skill vector, squad
+  commands) fed by the discs' `plan` graphs, `Hint` nodes, `BARR` barriers, post
+  values and tuning knobs; neither original's decision code is ported. Four
+  difficulties (Easy/Normal/Hard/Elite) on a three-layer model: symmetric
+  competence, per-HUMAN pressure, team handicap only against bot-only teams.
+  Squad commands: follow / hold / disperse / clear, ≤ 6 bots within 20 m of the
+  player. Design, evidence and phases: Log "AI decision". Space AI (P8) will be
+  the same architecture.
+- **(the maintainer, 2026-10-01) AI class weights.** An AI spawn (and respawn) draws its class by weight: the team's alive-AI cap
+  is shared out over its classes — the default class (the mission's first: the rifleman) 4 parts, a standard class 2, a
+  special class 1 (the table's entries from the fifth on: BF2's officer and special slots, BF1's fifth class — the
+  officers, wookiees, droidekas, dark and jet troopers) — each living bot of a class lowers that class's weight, and every
+  class keeps the same small floor, so all-riflemen or all-droidekas is possible and rare. On a BF2 team of 16 that is
+  about 5 riflemen, 3 of each standard class and 1 of each special one. The human always picks their own class. Built
+  023e3fd (the spread) and AICLW (the shares; `Sim::ai_class_weights`, `core/src/sim/spawn.rs`). The 4 : 2 : 1 is ours
+  and PROVISIONAL; the PS2's own rule is untraced (card AICLS) and is not the target.
+- **(the maintainer, 2026-10-01) Bots hold ground and fight, and not as statues.** A bot that reaches a hub with an enemy in
+  sight takes a position there (an authored Cover or Snipe hint if one is near, else a point in the hub; never in water),
+  holds it for a dwell and fights from it, then advances past a hub before it may hold again; a defender also takes an
+  authored position when the enemy is merely near. On its position it shuffles to another spot now and then, strafes on
+  some bursts, rolls instead of side-stepping on some hits, and runs clear of a grenade — each by a percent chance per
+  opportunity that rises with the difficulty (Easy 15 / 10 / 20 / 30 %, Normal 35 / 30 / 35 / 60 %, Hard 55 / 50 / 50 /
+  85 %, Elite 70 / 65 / 60 / 95 %; `core::skill::Tier`), so an Easy bot mostly stands there to be shot. In the endgame
+  nobody waits in a position. Built: HOLD (`core/src/ai/brain.rs`). The rule and every number are ours and
+  PROVISIONAL; **the tier chances are the maintainer's to tune.** Measured on BF1 KAS2 against the PS2: standing still 20.5 % → 24.3 %
+  (PS2 55 %), in the lagoon 42.7 % → 41.1 % (PS2 22 %) — the targets are NOT met; holding more stalls BF2 Kamino, where the port kills 3–5 a minute
+  against the PS2's 17.6 — the kill rate is the next lever. Grenades are not thrown yet (card GREN): the reaction is
+  built and tested against a grenade put on the ground by hand.
+- **(the maintainer, 2026-10-01) AI bounds and the way back.** Bots do not cross the edges of the playable level on their own:
+  a disc `BARR` barrier with a hull, a drop or nothing behind it is a wall for the steering (BF2 Kamino's rim rails and
+  bridge sides are ringed with them; the PS2's walk step never crosses one). A bot that ends up off the level anyway
+  walks back — to the nearest hub it can stand level with, jumping a low wall with a run-up — and after 45 s with no
+  way back it is given up and respawns. Under the map (a hard landing beneath the floor it fell from) and below the
+  kill floor every soldier dies, the invincibility cheat included. Built: KFLR 5b12384, BNDS (`core/src/sim/bounds.rs`,
+  `core/src/ai`). "On the level" is ours and PROVISIONAL: the hubs' floors walked from the posts, the barriers, the
+  collision.
+- Unit counts: **default = PS2-authentic (16/team)**, settings slider to raise on modern
+  hardware. `RE:` verify BF2's existing unit-count option + what actually bounds it.
+  **RE DONE 2026-08-30** (re-tickets-spawn.md): the "16" is BF2's default alive-AI cap
+  (NumBots, DAT_006004fc=16) over SetUnitCount=20 member pools; BF1 PS2 actually runs
+  25–32/team. openbf defaults: per-source-game authentic caps (BF2 16 bots / BF1
+  25–32), slider raises both.
+
+### Vehicles & space
+- Ground vehicle handling: **BF2** (verify BF1/BF2 similarity during RE; revisit if they
+  diverge more than expected).
+- Flyers: **faithful per source map** — BF1 maps keep their flyable craft, BF2 maps stay
+  as shipped.
+- Aiming in vehicles, flyers and space (the maintainer, 2026-09-23 — **likely, not yet locked**: "will
+  probably need"): keep **BF2's lock-on-target mechanic** there, while soldiers on foot keep
+  BF1 magnetism. Settle it when P7/P8's RE reaches it. `RE:` what BF2's vehicle/space
+  lock-on actually is on the disc (weapon `LockOn*` properties, reticle/targeting code) and
+  whether it shares anything with the on-foot X-lock; BF1 aim assist against vehicles
+  (`re-aim-assist.md` covers soldiers only) is the comparison.
+- Space Assault: **KEEP but needs rework** — least-loved mode; enhancement design DEFERRED.
+
+### Modes & rules
+- Conquest: **BF2 rules + BF1 no-overspawn invariant**: live units on a team may never
+  exceed remaining reinforcements — when a player respawns into the last slots, excess AI
+  despawn (e.g., 3 tickets left, 2 players + 1 AI alive; player dies & respawns → the AI
+  teammate despawns). Preserves comeback tension. `RE:` BF2 ticket/bleed + BF1 spawn
+  reserve logic.
+- CTF: **KEEP both variants, REWORK later** — the maintainer barely played it (childhood reason: the
+  clone commander says "damn" when the flag drops — optional VO filter noted); needs a
+  fun pass before it matters.
+- Hunt & Hero Assault: **KEEP** + rule-mixing per Architecture #6.
+- BF1 Historical Campaigns: **DROP** (it is essentially curated conquest battles in movie
+  order with narration stills/VO between; per the maintainer's rule that's not worth keeping —
+  narration assets still get baked, revivable).
+- **Special teams as options, played the conquest way (the maintainer, 2026-09-28).** The player
+  eventually picks who fights on a map: the four factions and the special teams (Wampas,
+  Ewoks, Gungans, Geonosians, Naboo guards, Wookiees, Jawas/Tuskens, BF2's hunt rosters,
+  BF1's historical rosters), each with its own weapons, items, sounds and movement, under
+  **conquest rules with no hunt score** (the maintainer dislikes hunt scoring). The historical
+  campaign's scripting stays dropped; its rosters and `_h` worlds are content sources.
+  Cards TEAMS (survey) → TEAMD (design); not built ahead of M1/M2.
+- **BF1 Naboo Plains always has the Gungan fambaa and its shield (the maintainer, 2026-09-28)**, in
+  every mode, as the map's unique feature (the classes load only from `NAB1_H.LVL` on the
+  disc; card FAMB).
+- BF2 story campaign: **KEEP**. Stretch idea (LATER): extend/mod the story or a small new
+  storyline of our own.
+- Galactic Conquest: **KEEP, BF2 galaxy-map + credits version**; credits/reward economy
+  needs a tuning pass. Research task R1: survey community GC mods on the PC ports for
+  improvement ideas.
+- **Era mix-and-match (NEW)**: traditional matchups by default, option for cross-era
+  battles (e.g., droids vs stormtroopers). Cheap because factions are baked rosters;
+  watch AI class assumptions + VO fallbacks.
+- **New modes (LATER, candidates)**: firefight/horde (defend a CP against escalating
+  waves), gun game (weapon ladder per kill), king of the hill (single contested CP),
+  elimination (no-respawn rounds — pairs well with no-overspawn taste), hero hunt
+  (rotating hero vs squad). Pick 1–2 post-1.0.
+
+### Presentation & audio
+- **Widescreen-native (the maintainer, 2026-08-30): 16:9/16:10/ultrawide, hor+** — vertical FOV
+  keeps the traced PS2 values (render::Camera is fov_y-based, so hor+ falls out of the
+  projection; PS2-traced FOV constants drop into fov_y when camera RE lands). HUD and
+  shell are authored ASPECT-AWARE (anchored to edges/corners/safe areas, never
+  stretched). 4:3-authored content (BF1 load screens, movies) presents PILLARBOXED,
+  never stretched. RE flag: check BF1 aim-assist/reticle code for 4:3 screen-space
+  assumptions (logged in RE_LOG §aim-assist open items).
+- Shell/menus: **BF2** theme & flow. Loading screens: **BF1** incl. the beep sequence.
+- **(the maintainer, 2026-09-03) One UI for the whole blended game: BF2's shell, menus and
+  HUD on every map of both games.** Look and feel stay BF2's; the CONTENT of
+  the menus (settings, details, information) may change to fit our features,
+  modernisation and simplification. A BF1 map or unit whose weapon, grenade or
+  item has no BF2 art shows its BF1 icon inside the BF2 HUD (bake the BF1 HUD
+  icon sheets alongside BF2's; the HUD looks the icon up by weapon class, BF2
+  first, BF1 as the fallback). Nothing in a BF1 map uses BF1's HUD or menus.
+- **(the maintainer, 2026-09-03) One voice set, one command set, everywhere.** Squad
+  commands work on every map of both games; the spoken chatter for them is
+  ONE universal set (BF1's tactical chatter baked as the universal lines,
+  replaced by BF2's if the port ever finds them in BF2's global bank) — the
+  same fallback pattern as the HUD icons.
+- HUD: **BF2**.
+- End-of-round (scoreboard, medal ceremony): **BF2**.
+- Announcer/VO: **per source map**. SFX where games differ: **BF2**.
+- Music: union, per-map source game.
+
+### Cheats (session-scoped, BF2-style pause-menu codes)
+- From the originals: invincibility, infinite ammo.
+- New: infinite stamina, infinite jet fuel, all-awards-for-session.
+- All reset on app restart; registry designed for easy additions.
+- In MP/splitscreen: host-only control (see Saves, sessions & host authority).
+
+### Saves, sessions & host authority (added 2026-08-30)
+- **Autosave everywhere.** Each user profile autosaves continuously: career stats and
+  award/unlock progression in every mode, single-player or multiplayer. Story campaign
+  autosaves at mission/checkpoint boundaries. Galactic Conquest autosaves after every
+  battle/turn.
+- **Host (P1) sessions.** LAN and splitscreen sessions have a designated host. Host
+  chooses the session type: Instant Action (BF2-style multi-map/mode queue) or Galactic
+  Conquest.
+- **Host-only session authority.** In MP/splitscreen, only the host toggles cheats and
+  session rules (e.g., awards on/off). Per-profile progression still saves for everyone.
+- **MP Galactic Conquest autosave ownership: OPEN** — host-only save vs replicated to all
+  players (so anyone can continue solo) vs hybrid. Deferred design item #8.
+
+### Classic-plus assets (added 2026-08-30 — Harrisonfog remaster integration)
+- **(the maintainer, 2026-09-03) Render quality is a RUNTIME toggle, never a gameplay
+  change.** Like Halo MCC's original/anniversary switch: the in-game menu picks
+  the visual tier (strict-faithful PS2 ↔ classic-plus with the remaster), so the
+  bake emits BOTH tiers side by side (the PS2 texture and its override, the PS2
+  render mesh and any remastered one) and the renderer selects at runtime. The
+  sim reads ONLY the PS2 bake — heightfield, `coll`/`prim` collision, instance
+  placements, missions, nav data — and no override may enter it: a remaster
+  pack's meshes, if ever used, replace render geometry only, never collision or
+  placement. GATE for every classic-plus change: `--sim-hash` and the replays
+  byte-identical with the tier switched either way. Creative liberties on
+  textures (units included) are allowed later — personal project, never shared
+  — but only on the visual tier, decided case by case.
+  **(the maintainer, 2026-09-03, refinements):** the switch lives in the PAUSE menu's
+  graphics settings, flipped mid-level without reloading — so both tiers are
+  resident (or hot-swappable) at runtime and a mid-round flip is a pure
+  renderer event (the sim hash must not move across it). A remastered render
+  mesh may only stand in for the PS2 mesh of the SAME name at the SAME
+  instance transform; overrides never add, remove or move instances, and the
+  bake REJECTS an override mesh whose bounds leave the PS2 mesh's bounds by
+  more than a small tolerance, so no visual building or object ever stands
+  where its collision is not.
+Sources: the maintainer's local `community_mods/harrisonfog/` (gitignored, LOCAL-ONLY; see its
+INVENTORY.md for pack-by-pack verdicts/credits). PS2 bake stays gameplay truth
+(geometry/layout/missions); the remaster contributes VISUALS only.
+- **HD textures**: bake learns to read PC-format LVL textures (D3D formats, audit A2
+  §5; LibSWBF2/swbf-unmunge = format reference) and emits them as name-matched
+  OVERRIDES over the PS2 bake. Canonical source = `00-canonical-remaster-jan2026/`
+  (Part 1 ground maps + shell, Part 2 sides/FPM, Part 3 space); never bake the
+  superseded standalones alongside (no duplicate maps). Coverage: all BF2 content +
+  BF1 Bespin Platforms (BS1). Remaining BF1 maps/units: our own local upscale pass in
+  bake (one consistent upscaler) so nothing looks left behind.
+  **Override chain (locked design, the maintainer 2026-08-30): Harrisonfog HD (name-matched) >
+  our upscale output > PS2 original**. **REFINEMENT CONFIRMED by the maintainer and IMPLEMENTED
+  2026-08-31 (`bake::tier`): PC STOCK sits between Harrisonfog and our upscale,
+  taken only where the PC texture is LARGER
+  **and is the SAME ART.** Measured over every BF2 map (analysis/
+  community-projects.md): 370 of 1,040 name-matched textures (34.8 %) are
+  strictly larger on the PC, the modal case a clean 2x in each dimension. Real
+  2x source art beats a 2x upscale; but only where it is bigger, because PC is
+  lossy DXT1 and at equal size a PS2 palettized texture may be cleaner — and
+  only where it is the same painting, because `sky_hoth` is a blizzard on the
+  PS2 and a blue sky on the PC (24 such rejects, plus 11 detail-compressed
+  bases; 312 taken). BF1 is unaffected — no PC BF1 exists here. Cost is memory
+  only: BF2 per-map texture bytes roughly double with no measurable frame-time
+  change. The upscale pass takes per-category settings in the bake config.
+  **DLSS is NOT the tool for this (asked + answered 2026-08-30).** DLSS is a
+  TEMPORAL FRAME upscaler — it reconstructs a rendered frame from motion
+  vectors, depth and sub-pixel jitter accumulated across frames. It has no
+  offline image mode and cannot bake a static texture; "run DLSS on a texture"
+  is not an operation that exists. The right tool for offline texture upscaling
+  is the ESRGAN family, which is already the plan below. (DLSS as a RUNTIME
+  frame upscaler is a separate, legitimate idea — but it is NVIDIA-only, which
+  conflicts with the Intel-iGPU floor, wgpu does not expose it so it would need
+  raw Vulkan interop, and the measured frame times leave no performance problem
+  for it to solve. FSR1/NIS as a plain spatial shader is the vendor-neutral
+  option if upscaling is ever wanted. Revisit only if classic-plus lighting
+  makes the frame expensive.)
+  Evidence base (both gitignored, read-only):
+  `community_mods/harrisonfog/upscale-feasibility/RESULTS.md` — Real-ESRGAN pass is
+  VIABLE (seconds/texture on the RTX) but must be category-aware: props/buildings/
+  rock 4× clean; dither-shaded terrain layers + palettized gradient skies need a
+  de-dither/deband pre-pass, 2×, or substitution by Harrison's layers on shared
+  planets; alpha preserved. Genuinely upscale-only BF1 content is small (Rhen Var,
+  Cloud City bes1, BF1-unique props/skies).
+  `community_mods/harrisonfog/LOOK-REFERENCE.md` — Harrison's exact 2025 preset
+  numbers (saturation 1.13, contrast 1.03, bloom blend 0.225/intensity 0.1,
+  vignette 0.25→1.0, ASSAO r=0.5/mult=0.8, tonemapper None, grain+DoF OFF), the
+  full MIT Shader Patch HLSL tree extracted locally (86 files), and the derived
+  wgpu feature checklist. **Render-crate roadmap requirement: the remaster ships
+  A8L8 _bump normal maps + 1024–2048px terrain layers → classic-plus NEEDS normal
+  mapping with tangent generation — plan the vertex format for tangents NOW so the
+  mesh format doesn't need a redo** (noted in render/src/mesh.rs).
+- **Addon maps** (`10-addon-maps-keep/`): map VARIANTS in the data model — one
+  canonical entry per map, variants selectable (e.g. Realistic Geonosis/Hoth vs
+  installer versions; CW/GCW space skins as era variants). Not map-list spam.
+- **The look**: reimplemented NATIVELY in wgpu. References in order: Shader Patch
+  source (SleepKiller, MIT — reading github.com/SleepKiller/shaderpatch allowed and
+  encouraged) with Harrisonfog's 2025 preset as the target numbers; then the 2019
+  MasterEffect configs (bloom/AO/tonemap/SMAA values). NEVER port or ship the
+  d3d9.dll/ReShade binaries.
+- **Not wanted**: Anakin's menu/shell framework (native BF2-style shell per PLAN),
+  Remaster script manager, .exe patches. Improved-Sides beyond-vanilla extras
+  (TFU/phase-3 troopers, Falcon, legion skins) = opt-in variants later, default
+  rosters vanilla-faithful (no-bloat rule).
+- **Replacement models** (Part 2): later experiment (skeleton/anim risk) — textures
+  first.
+- **Legal**: everything stays local-only and uncommitted; personal build only. Any
+  public release needs Harrisonfog/Javitolo98/Anakin permission; Shader Patch alone
+  is MIT.
+
+### Platform & meta
+- Input: **controller only** (KB/M dropped entirely); PS2 default mapping, full remap;
+  on-screen keyboard for text entry.
+- Splitscreen co-op: **KEEP** (roadmap: M5, before PACK; local — one sim, N cameras, N input devices, no netcode; NOT
+  part of the multiplayer hold, the loop builds it without asking — the maintainer, 2026-09-30 evening; card SSCR).
+- LAN: client-server UDP, **cap 16**, bots server-side. Internet matchmaking: DROP. Held until the maintainer says (M7).
+- Saves/profiles: modern format; awards/unlock progression persists per profile.
+
+### Dropped outright (never RE these binary regions)
+GameSpy + DNAS, EENet/PPP stack, NTGUI app, memory-card UI, USB headset/GSM voice, PS2
+GS/VIF/VU renderer internals, IOP sound drivers, PSS movie codec, PAL/NTSC logic, SDK
+plumbing. KB/M input paths (PC-ism, dropped by decision #28). BF1 Historical Campaign
+scripting. BF2's on-foot X-lock aim mechanic (the vehicle/space lock-on is NOT dropped —
+§Vehicles & space).
+

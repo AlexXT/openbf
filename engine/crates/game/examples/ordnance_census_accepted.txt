@@ -1,0 +1,50 @@
+# ordnance_census's accepted through runs (card GRFL). One line each: `<map|*> <S-|SO|--> <label>  # <reason>`; the
+# label is exact or a prefix ending in `*`. A through run (a grenade that passed an up-facing SOLDIER-layer face) is
+# keyed by the body it crossed and is ACCEPTED when a line covers that key; every other is NEW and fails the gate.
+# The footer's counts are pinned in engine/artifacts/loop/gates.toml (`[ordnance] footer`), so an accepted body still
+# fails the gate when its count moves.
+#
+# 2026-10-09, the first census after the sweep fix (127,017 through runs before it, 7,260 after).
+
+# S-: the crossed body is on the soldier layer only. The disc gives it no ordnance layer, so a grenade passes it by
+# authoring; what the PS2 does at each is not measured (no PCSX2 throw was made).
+bf2_pol1 S- com_inv_col*  # 6140 runs: invisible walls (OrdnanceCollision none); their tops are not floors, the census takes them on a map whose hub heights are not its floors
+bf2_kam1 S- kam_bldg_mushplatform1*  # 935 runs: the platform's soldier-only skirt prim at y 61.4, crossed by throws off the deck's edge
+bf2_fel1 S- fel1_bldg_bladder*  # 36 runs: the bladder plants
+bf1_nab1 S- com_weap_gunturret*  # 33 runs: a turret's top
+tat1 S- com_weap_gunturret*  # 15 runs: a turret's top
+bf1_nab2 S- com_weap_gunturret*  # 11 runs: a turret's top
+bf1_kas2 S- com_weap_gunturret*  # 7 runs: a turret's top
+bf1_rhn1 S- com_weap_gunturret*  # 7 runs: a turret's top
+bf1_yav1 S- com_weap_gunturret*  # 6 runs: a turret's top
+bf1_end1 S- end_bldg_ewok_fence*  # 5 runs: the Ewok fences
+bf2_end1 S- end_bldg_ewok_fence*  # 5 runs: the Ewok fences
+bf1_end1 S- com_weap_gunturret*  # 4 runs: a turret's top
+bf1_yav2 S- com_weap_gunturret*  # 4 runs: a turret's top
+bf1_end1 S- end_bldg_ewok_ramp*  # 4 runs: the Ewok ramps
+bf2_kam1 S- tur_weap_built_gunturret*  # 2 runs: a turret's top
+bf1_kas1 S- kas1_prop_bamboo2*  # 1 run: a bamboo prop
+
+# SO: the crossed body HAS an ordnance layer and the grenade still passed a soldier face of it: 45 runs of 1,556,912
+# in 20 classes. RESIDUE, NOT TRACED (trees, rocks, bunkers and ruins: a bounce among steep or thin faces). Each line
+# is one class on one map; a fix removes its line.
+bf1_geo1 SO geo_prop_rock_bunker*  # 1 run: residue
+bf1_nab1 SO nab1_prop_gunganhead_bunker*  # 1 run: residue
+bf1_yav1 SO yav_bldg_ruins_bldgpiece1*  # 1 run: residue
+bf2_cor1 SO cor1_bldg_grand_hall_outside*  # 1 run: residue
+bf2_dag1 SO dag1_prop_barrier_1*  # 4 runs: residue
+bf2_dag1 SO dag1_prop_grandtree*  # 4 runs: residue
+bf2_dag1 SO dag1_prop_grandtree_2*  # 11 runs: residue
+bf2_dea1 SO dea1_bldg_central_shaft04*  # 2 runs: residue
+bf2_dea1 SO dea1_bldg_garbage_room*  # 2 runs: residue
+bf2_fel1 SO fel1_bldg_destroyed_gunship*  # 1 run: residue
+bf2_geo1 SO geo_bldg_bunker_1_outside*  # 1 run: residue
+bf2_geo1 SO geo_prop_boulder_1*  # 1 run: residue
+bf2_hot1 SO hoth_bldg_bunker*  # 1 run: residue
+bf2_mus1 SO mus1_bldg_conference*  # 2 runs: residue
+bf2_pol1 SO pol_bldg_health*  # 1 run: residue
+bf2_uta1 SO uta1_bldg_building02*  # 1 run: residue
+bf2_uta1 SO uta1_bldg_lizardpen*  # 6 runs: residue
+bf2_uta1 SO uta1_bldg_sphere_hanger_wings*  # 2 runs: residue
+tat2 SO tat2_bldg_medium1*  # 1 run: residue
+bf2_yav1 SO yav_bldg_ruins_bldgpiece1*  # 1 run: residue

@@ -1,0 +1,1848 @@
+//! The scene upload: [`upload_scene`] turns a loaded `Scene` into the static
+//! draw list the renderer consumes every frame ([`SceneGpu`]) — the terrain in
+//! draw chunks, the `LOWR` sheet, the water, the instanced models, the sky
+//! shells and `SkyObject` flights — through one by-name texture cache, and
+//! counts every draw it could not texture ([`Untextured`]); a specular
+//! segment's second pass rides beside its base draw, with the map's lookup
+//! table installed on the renderer (queue SPEC); the water's speckle
+//! flipbook rides beside the water ([`SpeckleAnim`], queue W3).
+
+use super::camera::instance_matrix;
+use super::look::{
+    apply_lighting, clear_color, far_cull, far_cull_from, lowres_enabled, lowres_range,
+    speckle_enabled, speckle_frames, speckle_look, water_look,
+};
+use super::upload::{
+    compact_submesh, upload_cpu_texture_inner, upload_cpu_texture_scrolling, upload_submeshes,
+    SubmeshPart,
+};
+use crate::assets::{CpuMesh, CpuTexture, Scene, SpecPass};
+use anyhow::{anyhow, Result};
+use glam::{Mat4, Vec3};
+use render::{DrawCmd, DrawLayer, MeshData, MeshHandle, Renderer, TextureHandle};
+use std::collections::HashMap;
+use std::path::Path;
+
+/// Fallback tint for a water surface whose texture the map did not name and
+/// whose `_water` fallback was ambiguous. Unused on all twelve shipped water
+/// maps — every one of them resolves a texture — but a bake without the
+/// texture must still put a surface there rather than nothing.
+const WATER_TINT: [f32; 4] = [0.16, 0.28, 0.34, 1.0];
+
+/// GPU-uploaded scene: a static draw list the renderer consumes every frame.
+pub struct SceneGpu {
+    pub draws: Vec<DrawCmd>,
+    /// (class, count) skipped for having no drawable model — for one-time logging.
+    pub skipped: Vec<(String, usize)>,
+    /// Draws that resolved NO texture and fell back to a flat colour, as
+    /// (what it is, material name or `<none>`, draw count). Collected here
+    /// rather than derived by a separate walk so a census cannot drift from
+    /// what actually renders — see `--scene-report`.
+    pub untextured: Vec<(String, String, usize)>,
+    /// Segments the DISC itself left untextured, SKIPPED rather than drawn —
+    /// see [`Untextured::DiscUntextured`]. `--scene-report` prints this as
+    /// "untextured on the disc".
+    pub disc_untextured: usize,
+    /// Draws skipped because the material names a texture that is on NEITHER
+    /// disc — see [`Untextured::Dangling`] and [`DANGLING_ON_DISC`].
+    pub dangling: usize,
+    /// Terrain draw chunks dropped because the map's `LTEX` names a texture
+    /// that ships in ANOTHER map's LVL. 64 on BF1 BES1 (`kam1_water`, only in
+    /// KAM1.LVL) and 0 on the other 31 maps. The count is in OUR chunks (see
+    /// [`TERRAIN_CHUNK_CELLS`]), not the disc's — it is one sheet of terrain.
+    pub terrain_dropped: usize,
+    /// What the frame clears to for THIS map (linear RGBA) — see
+    /// [`clear_color`]. The viewer, the goldens and BOTH of the gallery's map
+    /// panels pass this: since 2026-09-03 the sheet's first panel is a fogged
+    /// vantage camera rather than an unfogged orbital one (`gallery.rs`).
+    pub clear: [f64; 4],
+    /// Sky shell segments whose texture was uploaded with V clamped rather
+    /// than repeated — see [`sky_wrap_v`]. One line per segment,
+    /// `"<geometry> prim<N> v=[lo,hi] tex=<material>"`, in upload order.
+    /// This is the census behind the sheets' "what moved it" column and
+    /// `--scene-report`'s clamp line; it changes no draw.
+    pub sky_clamped: Vec<String>,
+    /// Textures this map uploaded TWICE because of the clamp: once REPEAT for
+    /// the world and once CLAMPED for a sky shell (`sky_naboo2` is both a
+    /// shell and a world texture, which is why the clamped upload gets its own
+    /// cache key). A clamped texture no world draw uses costs nothing extra
+    /// and is not counted here.
+    pub sky_clamp_extra_uploads: usize,
+    /// The map's water, able to move — `None` on a dry map. Nothing moves
+    /// until [`SceneGpu::animate_water`] is called (`crate::water_anim`).
+    pub water_motion: Option<crate::water_anim::WaterMotion>,
+    /// The water's speckle flipbook — `None` where the map draws no speckle
+    /// ([`speckle_look`]). Stepped with the water by
+    /// [`SceneGpu::animate_water`]; until then it shows frame 0.
+    pub speckle: Option<SpeckleAnim>,
+    /// Every BF2 door's moving submeshes (queue DRV), drawn shut until
+    /// [`SceneGpu::pose_doors`] is called — the goldens never call it.
+    pub doors: Vec<DoorDraw>,
+    /// Every armed building's parts that ride a node (card VTURD), drawn at
+    /// the bind pose until [`SceneGpu::pose_turrets`] is called — the
+    /// goldens never call it.
+    pub turrets: Vec<super::turret_pose::TurretDraw>,
+    /// BF2's local lights the scene itself holds (card BPNT,
+    /// `crate::point_light`): the authored ones and the EntityLights. The
+    /// upload hands the renderer these plus the posts' at their starting
+    /// owners; a battle re-submits them each frame
+    /// (`crate::point_light::submit`).
+    pub lights: Vec<render::PointLight>,
+    /// The non-Static omnis among them, as the terrain pass takes them.
+    pub ground_lights: Vec<crate::bolt_light::OmniLight>,
+    /// A BF2 map: its command posts carry a light.
+    pub post_lights: bool,
+    /// What the posts' holograms draw with (card CPHOL, `crate::holo`).
+    pub holo: crate::holo::HoloArt,
+}
+
+/// One placed door's draws that ride its `open` clip: the manifest instance,
+/// its matrix, and per moving submesh the draws it pushed (the base draw and
+/// its specular pass) with the bone's model-space track (`ManifestDoor::parts`).
+pub struct DoorDraw {
+    pub instance: usize,
+    model: Mat4,
+    parts: Vec<DoorPart>,
+}
+
+/// One moving submesh's draws and its bone's per-frame (rotation,
+/// translation) track.
+type DoorPart = (std::ops::Range<usize>, Vec<(glam::Quat, Vec3)>);
+
+/// The water's speckle layer as pushed: per water submesh, TWO
+/// [`DrawCmd::speckle`] draws at `first[k]` and `first[k] + 1` — the frame
+/// `⌊t·fps⌋` and the next, weighted `1 − w` and `w` ([`speckle_frames`]).
+/// Two adds of one surface sum to the PS2's one cross-faded add. The
+/// instance alpha is that weight alone; the layer's colour and add weight
+/// are `fs_speckle`'s ([`super::look::water_shading`]).
+pub struct SpeckleAnim {
+    first: Vec<usize>,
+    frames: Vec<TextureHandle>,
+    fps: f32,
+}
+
+impl SpeckleAnim {
+    fn step(&self, draws: &mut [DrawCmd], t: f32) {
+        let (i, j, w) = speckle_frames(t, self.fps, self.frames.len());
+        for &k in &self.first {
+            draws[k].texture = Some(self.frames[i]);
+            draws[k].color[3] = 1.0 - w;
+            draws[k + 1].texture = Some(self.frames[j]);
+            draws[k + 1].color[3] = w;
+        }
+    }
+}
+
+impl SceneGpu {
+    /// Pose every drawn door at its sim door's `open` (`core::door`): each
+    /// moving submesh at `instance · D(open)`, the collision bodies' own
+    /// rule. A door with no sim twin (`OPENBF_DOORS_SOLID=1`) stays shut.
+    pub fn pose_doors(&mut self, doors: &[core::door::Door]) {
+        for d in doors {
+            let Some(dd) = self.doors.iter().find(|x| x.instance == d.instance) else {
+                continue;
+            };
+            for (range, frames) in &dd.parts {
+                let m = dd.model * core::door::sample(frames, d.open);
+                for k in range.clone() {
+                    self.draws[k].model = m;
+                }
+            }
+        }
+    }
+
+    /// Move the map's water to `t` seconds, seen from `eye` (the camera's
+    /// position) — pass [`crate::water_anim::clock`] of the renderer's clock.
+    /// The flat-water bob rides the water draws' model matrices. On an ocean
+    /// map every call re-uploads the FFT patches and instances them over the
+    /// wet cells that reach inside the water's far range; the first call also
+    /// takes the still plane out. The speckle flipbook turns to `t`'s frames.
+    /// A no-op on a dry map. The gallery's sheets and the walkabout (the
+    /// goldens) call it once per eye at the clock's 0 s
+    /// (`crate::gallery`'s `step_water`).
+    pub fn animate_water(&mut self, r: &mut Renderer, t: f32, eye: Vec3) -> Result<()> {
+        if let Some(s) = &self.speckle {
+            s.step(&mut self.draws, t);
+        }
+        let Some(w) = &mut self.water_motion else {
+            return Ok(());
+        };
+        let before = w.draw_range();
+        w.step(r, &mut self.draws, t, eye)?;
+        let after = w.draw_range();
+        if after.len() != before.len() {
+            reindex_after_splice(
+                &mut self.doors,
+                &mut self.turrets,
+                &mut self.speckle,
+                &before,
+                after.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// An ocean step splices the water's draws (`old`) with `new_len` patch
+/// draws, which moves every draw after them (`WaterMotion::step`). The door
+/// parts and the speckle frames hold draw indices from upload, so without
+/// this `pose_doors` wrote door poses onto whatever draws had slid under
+/// its indices (a turret's parts hold them the same way, card VTURD) — ramps, decks and towers drawn at the doors' places, and
+/// the doors themselves never moved (the maintainer's BF2 Kamino, 2026-09-30). Indices
+/// past the range shift by the length change; a speckle index inside it
+/// pointed at the still plane, which the patches replaced, so it goes.
+fn reindex_after_splice(
+    doors: &mut [DoorDraw],
+    turrets: &mut [super::turret_pose::TurretDraw],
+    speckle: &mut Option<SpeckleAnim>,
+    old: &std::ops::Range<usize>,
+    new_len: usize,
+) {
+    let delta = new_len as isize - old.len() as isize;
+    let shift = |k: usize| -> usize {
+        if k >= old.end {
+            (k as isize + delta) as usize
+        } else {
+            k
+        }
+    };
+    for d in doors.iter_mut() {
+        for (range, _) in &mut d.parts {
+            *range = shift(range.start)..shift(range.end);
+        }
+    }
+    for t in turrets.iter_mut() {
+        for (range, _) in &mut t.parts {
+            *range = shift(range.start)..shift(range.end);
+        }
+        t.whole = shift(t.whole.start)..shift(t.whole.end);
+    }
+    if let Some(s) = speckle {
+        s.first.retain(|k| !old.contains(k));
+        for k in &mut s.first {
+            *k = shift(*k);
+        }
+        if s.first.is_empty() {
+            *speckle = None;
+        }
+    }
+}
+
+/// One uploaded submesh of a model: its mesh, the texture it resolved (if
+/// any), the material name it asked for (kept for the untextured census),
+/// the pass its material's `alphaMode` puts it in, its specular second
+/// pass, if its segment draws one, and the PS2 lighting path its segment
+/// takes (`render::LightPath`, queue LITEB).
+/// One model to draw where [`upload_scene`] instances models: a world
+/// instance or path prop (no tint, no fade; `door` = its manifest index and
+/// rig when it has one) or a foliage model (`super::foliage`).
+struct PlacedModel<'a> {
+    model: &'a str,
+    matrix: Mat4,
+    door: Option<(usize, &'a manifest::ManifestDoor)>,
+    /// Card VTURD: its manifest index, class, translation and node rig.
+    turret: Option<(
+        usize,
+        &'a manifest::ManifestInstance,
+        &'a manifest::ManifestTurretRig,
+    )>,
+    color: Option<[f32; 4]>,
+    fade: Option<render::Fade>,
+    /// Metres nearer than which the draw is discarded — the far scene's
+    /// reach, for a geometry's LOWD extension alone ([`upload_scene`]).
+    near: Option<f32>,
+}
+
+type ModelPart = (
+    MeshHandle,
+    Option<BoundTexture>,
+    Option<String>,
+    DrawLayer,
+    Option<SpecPass>,
+    render::LightPath,
+);
+
+/// Build one textured draw in the pass its material asked for. `Water` (and
+/// its `Speckle`), `FarSheet` and `TerrainLayer` cannot reach here — no glTF
+/// `alphaMode` maps to them (the water plane, the `LOWR` sheet and the
+/// terrain layers are built by their own blocks in [`upload_scene`], never
+/// from a material) — and they fall back
+/// to the opaque pass rather than silently disabling depth.
+pub(super) fn draw_in(
+    layer: DrawLayer,
+    mesh: MeshHandle,
+    texture: TextureHandle,
+    model: Mat4,
+) -> DrawCmd {
+    match layer {
+        DrawLayer::Mask => DrawCmd::textured_masked(mesh, texture, model),
+        DrawLayer::Blend => DrawCmd::textured_blended(mesh, texture, model),
+        DrawLayer::Opaque
+        | DrawLayer::Water
+        | DrawLayer::Spec
+        | DrawLayer::Speckle
+        | DrawLayer::FarSheet
+        | DrawLayer::TerrainLayer => DrawCmd::textured(mesh, texture, model),
+    }
+}
+
+/// Is the specular second pass drawn? On unless `OPENBF_SPEC=0` — the A/B
+/// switch for a look check, not a fidelity choice (queue SPEC).
+fn spec_enabled() -> bool {
+    std::env::var("OPENBF_SPEC").as_deref() != Ok("0")
+}
+
+/// The disc's mirrored specular light (`render::Renderer::spec_mirror`), on
+/// unless `OPENBF_SPEC_MIRROR=0`, which takes the consistent `d = L·R`.
+/// DECIDED by the SPEC RE (PLAN Log 2026-09-24): the disc's frame mix is the
+/// default; PROVISIONAL, `[O]` (`analysis/re-specular-pass.md` §4).
+fn spec_mirror_enabled() -> bool {
+    std::env::var("OPENBF_SPEC_MIRROR").as_deref() != Ok("0")
+}
+
+/// Install `game`'s specular lookup table: `common_<game>/specular.ktx2`
+/// under the baked tree `assets_dir` (`bake specular`), level 0 only — it is
+/// a lookup, never mipmapped. No table (a tree baked before queue SPEC, or
+/// `OPENBF_SPEC=0`) leaves the pass off, which the renderer does by skipping
+/// every [`DrawLayer::Spec`] draw. A map installs its own game's
+/// ([`upload_scene`]); the gallery's unit sheet, which has no map, the side's.
+pub fn install_spec_table(r: &mut Renderer, assets_dir: &Path, game: &str) -> Result<()> {
+    r.spec_mirror = spec_mirror_enabled();
+    let path = assets_dir
+        .join(format!("common_{game}"))
+        .join("specular.ktx2");
+    let table = match Some(path).filter(|p| spec_enabled() && pak::is_file(p)) {
+        Some(p) => Some(crate::assets::load_ktx2(&pak::read(&p)?)?),
+        None => None,
+    };
+    r.set_specular_table(table.as_ref().map(|t| (t.width, t.height, &t.rgba[..])))
+        .map_err(|e| anyhow!("specular table: {e}"))
+}
+
+/// Install BF2's terrain light texture, `common_bf2/com_sfx_omniproj.ktx2`
+/// (`bake omniproj`, card FXBL), level 0 only. BF1 (whose terrain draws no
+/// light, `analysis/re-bolt.md` §5.1), a tree baked before FXBL, or
+/// `OPENBF_TERRAIN_LIGHTS=0` installs none, and no light pass is drawn.
+pub fn install_omniproj(r: &mut Renderer, assets_dir: &Path, game: &str) -> Result<()> {
+    let path = assets_dir.join("common_bf2").join("com_sfx_omniproj.ktx2");
+    let on = game == "bf2" && std::env::var("OPENBF_TERRAIN_LIGHTS").as_deref() != Ok("0");
+    let tex = match Some(path).filter(|p| on && pak::is_file(p)) {
+        Some(p) => Some(crate::assets::load_ktx2(&pak::read(&p)?)?),
+        None => None,
+    };
+    r.set_omniproj(tex.as_ref().map(|t| (t.width, t.height, &t.rgba[..])))
+        .map_err(|e| anyhow!("com_sfx_omniproj: {e}"))
+}
+
+/// Where a map's specular draws stop, metres from the eye. BF2 draws the pass
+/// only on NEAR-scene models (`analysis/re-specular-pass.md` §7, `[O]`), and
+/// the port's split is `NearSceneRange`'s c, the heightfield's own end
+/// (`far_cull_from`) — PROVISIONAL, the entry's decision; BF1 draws it in
+/// both scenes and takes the base draw's own cull.
+pub(super) fn spec_cull(scene: &Scene, base: Option<f32>) -> Option<f32> {
+    if scene.manifest.source_game == "bf2" {
+        far_cull_from(&scene.manifest.lighting).map(|c| c.terrain)
+    } else {
+        base
+    }
+}
+
+/// Does this texture carry ANY transparency? Used by the ocean's foam layer,
+/// which is only worth a second draw of the whole surface if it can let the
+/// base show through — see [`upload_scene`].
+fn texture_has_alpha(t: &CpuTexture) -> bool {
+    t.rgba.iter().skip(3).step_by(4).any(|&a| a < 255)
+}
+
+/// A texture bound to a draw. It carries NO alpha mode: under ALPHA RULE v2
+/// the pass is a property of the DRAW (the GLB material's `alphaMode`), so
+/// one cached texture serves Opaque, Mask and Blend draws alike — which is
+/// what makes the by-name cache below still correct.
+#[derive(Clone, Copy)]
+struct BoundTexture {
+    handle: TextureHandle,
+}
+
+/// Texture names a segment on the discs asks for that exist in NO `tex_`
+/// chunk on EITHER PS2 disc — dangling on the disc, so the PS2 could not have
+/// textured them from that LVL either.
+///
+/// PROVISIONAL AND OURS as a list. The census
+/// (`engine/artifacts/briefs/untextured_list.csv`, read off the raw disc
+/// bytes) found exactly three names across all 32 maps, accounting for 8
+/// draws: `yav_prop_ivy` (6 draws, both YAV1s), `Cor1_bldg_flowers` (1, BF2
+/// COR1) and `noIcon` (1, the `geo_sky_explosions` sky shell). What the PS2
+/// actually put on screen for a dangling material is UNTRACED, so the draw is
+/// skipped rather than painted an invented colour.
+///
+/// `yav_prop_ivy` DOES ship in the PC install — reinstating it is a
+/// classic-plus question, not a fidelity one, and is not this list's job.
+///
+/// Lowercase; matched case-insensitively, like [`get_texture`]'s own lookup.
+const DANGLING_ON_DISC: &[&str] = &["yav_prop_ivy", "cor1_bldg_flowers", "noicon"];
+
+/// Why a draw resolved no texture — which decides whether it is drawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Untextured {
+    /// The DISC named no texture for this segment: all four `TNAM` slots
+    /// empty (BF2) or no `TNAM` chunk at all (BF1), so the baked GLB material
+    /// name is empty and [`upload_submeshes`] hands us `None`. 76 draws over
+    /// 27 model/segment pairs on 8 maps, every one a 1-18-triangle stub —
+    /// effect anchors and collision placeholders (`kas2_prop_dirt` x31,
+    /// `geo_prop_splash`, `dea1_bldg_*_collision_*`, `uta1_bldg_cliffs*`,
+    /// `mus1_fx_largeexplosion`, `dag1_prop_effectvine_1`,
+    /// `tat1_prop_tuskcampfire1`) — not art.
+    ///
+    /// NOT DRAWN. Flat grey put solid stubs in the world that the disc never
+    /// asked to be visible; skipping is what the terrain arm already does for
+    /// the same reason. PROVISIONAL: what the PS2 does with an untextured
+    /// segment is untraced.
+    ///
+    /// One of the 76 differs and is recorded here rather than special-cased:
+    /// BF2 TAN1 `tan4_bldg_engine_b` seg1 has an empty slot but DOES carry
+    /// `COL0` (8 colours, MTRL `0x00010201`), so it may be real
+    /// vertex-coloured geometry. The renderer does not draw `COL0` today, so
+    /// the only choice on offer is grey or nothing — revisit when it does.
+    DiscUntextured,
+    /// The material names a texture that is on neither disc — see
+    /// [`DANGLING_ON_DISC`]. Also not drawn.
+    Dangling,
+    /// The material names a texture we simply failed to find: a lookup bug on
+    /// OUR side, not the disc's. Still painted flat grey and counted, so it
+    /// stays visible. Reads 0 on all 32 maps as of session 10.
+    LookupFailed,
+}
+
+/// Route one draw whose texture did not resolve. Pure, and the unit test
+/// drives it directly — the three arms are the whole policy.
+pub fn route_untextured(material: Option<&str>) -> Untextured {
+    match material {
+        Some(name) if !name.is_empty() => {
+            if DANGLING_ON_DISC
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(name))
+            {
+                Untextured::Dangling
+            } else {
+                Untextured::LookupFailed
+            }
+        }
+        // `None`, or an empty name: the disc named nothing.
+        _ => Untextured::DiscUntextured,
+    }
+}
+
+/// Whether the map's heightfield is drawn. BF1 reads `DomeInfo
+/// TerrainEnable` into `DAT_005229a8` (default 1), and at 0 its terrain draw
+/// `FUN_00487ad8` draws nothing — no patches, no detail pass, no far sheet
+/// (`analysis/re-terrain-enable.md` §2 `[O]`). The discs author it only on
+/// BF1 KAM1 (whose sea is then the ocean draw alone) and BES1; BF2's ELF
+/// never reads the key. Only the DRAW goes: `Scene::heightfield` still gives
+/// the sim a ground (card TENS).
+fn terrain_drawn(source_game: &str, sky: Option<&manifest::ManifestSky>) -> bool {
+    !(source_game == "bf1" && sky.and_then(|s| s.terrain_enable) == Some(0.0))
+}
+
+/// The untextured census `upload_scene` accumulates as it uploads, so it
+/// cannot drift from what actually renders.
+#[derive(Default)]
+struct Census {
+    /// Real lookup failures — (what it is, material name) -> draw count.
+    failed: HashMap<(String, String), usize>,
+    disc_untextured: usize,
+    dangling: usize,
+    terrain_dropped: usize,
+    /// See [`SceneGpu::sky_clamped`].
+    sky_clamped: Vec<String>,
+}
+
+impl Census {
+    /// Record one draw that resolved no texture, and say what to do with it.
+    fn route(&mut self, what: &str, material: Option<&str>) -> Untextured {
+        let r = route_untextured(material);
+        match r {
+            Untextured::DiscUntextured => self.disc_untextured += 1,
+            Untextured::Dangling => self.dangling += 1,
+            Untextured::LookupFailed => self.failed(what, material),
+        }
+        r
+    }
+
+    /// Record a lookup failure directly — for a draw that keeps a fallback
+    /// colour of its own (the water plane's tint) rather than being routed.
+    fn failed(&mut self, what: &str, material: Option<&str>) {
+        let m = match material {
+            Some(m) if !m.is_empty() => m.to_ascii_lowercase(),
+            _ => "<none>".to_string(),
+        };
+        *self.failed.entry((what.to_string(), m)).or_default() += 1;
+    }
+}
+
+pub fn upload_scene(r: &mut Renderer, scene: &Scene) -> Result<SceneGpu> {
+    let mut textures: HashMap<String, BoundTexture> = HashMap::new();
+    let mut draws = Vec::new();
+    let mut census = Census::default();
+    // The far-scene cull, off unless `OPENBF_FAR_CULL=1`. It is decided ONCE
+    // here and carried per draw (`render::DrawCmd::cull`), because the two
+    // distances belong to different draws: the terrain stops at the near
+    // scene's far plane, the models and the water at `FarSceneRange`. The
+    // sky's own upload path takes none.
+    let cull = far_cull(&scene.manifest.lighting);
+
+    // Terrain at identity: bake emits world-space positions. Its material is
+    // LTEX layer 0, tiled by SCAL[0] in the baked UVs (bake::terrain_glb).
+    // SPLIT into draw chunks here rather than in the bake — see
+    // `upload_terrain_chunks`.
+    //
+    // A chunk whose layer texture does not resolve is NOT DRAWN. There used
+    // to be a `TERRAIN_TINT` fallback (a tan we picked), and exactly one map
+    // ever hit it: BF1 Bespin Platforms, whose `tern` names `LTEX("kam1_water")`
+    // and `DTEX("yav_decal")` — both textures from OTHER maps' LVLs, in no
+    // chunk BES1 ships, so the PS2 cannot have textured that sheet from
+    // BES1.LVL either. Painting it tan laid a flat invented floor over the
+    // cloud art Bespin DOES ship below its horizon
+    // (`bes1_sky_dome_clouds_2`, 60 vertices, every one below the horizon).
+    // `Scene::heightfield` still reads `scene.terrain`, so the sim's ground
+    // is untouched — this only decides what is DRAWN.
+    //
+    // A BF1 map authoring `DomeInfo TerrainEnable(0)` (KAM1, BES1) draws no
+    // terrain at all — neither the base nor the layers: see `terrain_drawn`.
+    let terrain = scene
+        .terrain
+        .as_ref()
+        .filter(|_| terrain_drawn(&scene.manifest.source_game, scene.manifest.sky.as_ref()));
+    if let Some(t) = terrain {
+        for (mesh, mat, layer, _) in upload_terrain_chunks(r, t)? {
+            let tex = match mat {
+                Some(m) => get_texture(
+                    r,
+                    scene,
+                    &mut textures,
+                    &m.to_ascii_lowercase(),
+                    render::WrapV::Repeat,
+                )?,
+                None => None,
+            };
+            draws.push(match tex {
+                // UNLIT with the GS vertex byte, per game: no ambient, sun
+                // or Light2 reaches the PS2's terrain (re-terrain-lighting.md
+                // §0, [O]).
+                Some(b) => draw_in(layer, mesh, b.handle, Mat4::IDENTITY)
+                    .with_cull(cull.map(|c| c.terrain))
+                    .with_light(render::LightPath::Terrain),
+                None => {
+                    // Its own report line: this is a whole SHEET of terrain
+                    // whose layer texture lives in another map's LVL, not a
+                    // per-segment authoring gap. See `terrain_dropped`.
+                    census.terrain_dropped += 1;
+                    continue;
+                }
+            });
+        }
+    }
+
+    // The terrain's texture LAYERS above LTEX[0] (card TALPH,
+    // `analysis/re-terrain-layers.md`): each layer's triangles composited
+    // over the base terrain by their `ALPH` alpha, in ascending LTEX order —
+    // the order `upload_terrain_layer_chunks` uploads them in, which the
+    // renderer's `TerrainLayer` pass keeps. Chunked like the base for the
+    // frustum cull; a layer whose texture does not resolve is dropped like a
+    // base chunk (none on the disc: every LTEX name ships in its own LVL).
+    if let (Some(t), Some(layers)) = (terrain, &scene.terrain_layers) {
+        for (mesh, mat) in upload_terrain_layer_chunks(r, t, layers)? {
+            match get_texture(
+                r,
+                scene,
+                &mut textures,
+                &mat.to_ascii_lowercase(),
+                render::WrapV::Repeat,
+            )? {
+                Some(b) => draws.push(
+                    DrawCmd::terrain_layer(mesh, b.handle, Mat4::IDENTITY)
+                        .with_cull(cull.map(|c| c.terrain)),
+                ),
+                None => census.terrain_dropped += 1,
+            }
+        }
+    }
+
+    // The `LOWR` far-LOD sheet at identity, like the terrain, and behind
+    // `OPENBF_LOWRES=1`: the only terrain either PS2 draws past its near
+    // scene (`analysis/re-lowr.md` §0.2 [V]). Its range is
+    // [`lowres_range`] — MaxDistance out, and the heightfield's own end in,
+    // which is the port's one deviation and is written up there.
+    //
+    // Drawn on its own pass, `DrawLayer::FarSheet` (queue CLN5): UNLIT, as
+    // the disc's base colour 0x80808080 is GS unity; alpha-tested at the
+    // disc's AREF 0x10, which cuts real holes in BF1 KAS1's and KAS2's
+    // sheets (`bake::lowres_glb`); and fogged like any far-scene draw — the
+    // sheet is drawn with the `fogspread` program, never as sky
+    // (re-lowr.md §2.2 [V]).
+    // `TerrainEnable(0)` switches it off with the rest (`terrain_drawn`).
+    if lowres_enabled() && terrain_drawn(&scene.manifest.source_game, scene.manifest.sky.as_ref()) {
+        if let (Some(mesh), Some((near, far))) = (
+            &scene.lowres,
+            lowres_range(cull, &scene.manifest.lighting, scene.manifest.sky.as_ref()),
+        ) {
+            let name = scene
+                .manifest
+                .sky
+                .as_ref()
+                .and_then(|s| s.low_res_terrain.as_deref())
+                .unwrap_or_default();
+            // WrapV::Repeat because the two maps that author a big
+            // `TextureScale` (BES2 20, END1 19) tile their sheet.
+            match get_texture(r, scene, &mut textures, name, render::WrapV::Repeat)? {
+                Some(b) => {
+                    let handle = r
+                        .add_mesh(&MeshData {
+                            positions: &mesh.positions,
+                            normals: &mesh.normals,
+                            uvs: &mesh.uvs,
+                            colors: Some(&mesh.colors),
+                            indices: &mesh.indices,
+                        })
+                        .map_err(|e| anyhow!("lowres mesh upload: {e}"))?;
+                    draws.push(
+                        DrawCmd::far_sheet(handle, b.handle, Mat4::IDENTITY)
+                            .with_cull(Some(far))
+                            .with_cull_near(Some(near)),
+                    );
+                }
+                // Same reasoning as the terrain's dropped sheet: a whole
+                // surface with no texture is not worth an invented colour.
+                None => census.failed("lowres", Some(name)),
+            }
+        }
+    }
+
+    // Water at identity, like the terrain: `bake::water_glb` emits world-space
+    // positions at the plane's own height. Its texture gets a DEDICATED
+    // handle so the authored UV scroll cannot leak into a model that happens
+    // to share the name.
+    //
+    // Its LOOK is [`water_look`] — the disc's tint and blend weight, its own
+    // fog rule (carried in `render::Lighting`, not per draw) and its own far
+    // distance. On FLAT water that distance rides the same `with_cull` switch
+    // as everything else and so is OFF unless `OPENBF_FAR_CULL=1`: culling
+    // the water while the terrain under it runs on to the horizon would open
+    // a hole in the sea and show the seabed, which is a worse picture than
+    // the one the flag keeps off by default (`far_cull_enabled`; queue L's
+    // landing). An OCEAN always ends there (card KSEA,
+    // `analysis/re-kamino.md` §2): the PS2 draws no water past the ocean's
+    // far pass and the frame behind it is black, and neither Kamino draws a
+    // seabed. A stepped ocean ends on whole cells (`water_anim`); this still
+    // plane, which has no eye to pick cells by, is cut per fragment.
+    let mut water_motion = None;
+    let mut speckle = None;
+    if let (Some(info), Some(mesh)) = (&scene.manifest.water, &scene.water) {
+        let first = draws.len();
+        let look = water_look(&scene.manifest.source_game, &scene.manifest.lighting, info);
+        let ocean = info.config.as_ref().is_some_and(|c| c.ocean);
+        let far = if ocean { look.far } else { cull.and(look.far) };
+        let mut handle = |name: Option<&str>| -> Result<Option<TextureHandle>> {
+            let Some(t) = name.and_then(|n| scene.textures.get(&n.to_ascii_lowercase())) else {
+                return Ok(None);
+            };
+            Ok(Some(upload_cpu_texture_scrolling(
+                r,
+                t,
+                name.unwrap_or("water"),
+                info.uv_velocity,
+                [1.0, 1.0],
+            )?))
+        };
+        let tex = handle(info.texture.as_deref())?;
+        // The ocean's foam layer: a SECOND draw of the same surface with the
+        // map's `FoamTexture`, blended over the opaque base by its sheet's
+        // alpha × its vertex alpha (`analysis/re-water.md` §3 cit. 5 [V],
+        // `re-water-alpha.md` §0 [O]). Both KAM1s and nothing else. That
+        // vertex alpha is the disc's per-point foam byte, which a STEPPED
+        // ocean carries (`water_anim::Foam`, queue OCF). The still plane is
+        // flat, and on a flat field the disc's rule decays every foam byte to
+        // 0, so this still draw carries no foam (alpha 0, set below once
+        // `WaterMotion::new` has taken its templates at the look's foam
+        // alpha: 1, or the lit ocean's 0.5) — what an
+        // unstepped scene shows; `WaterMotion::step` replaces it. Its colour is
+        // unity (WCOLB): the baked mesh's placeholder white alpha under a
+        // unity foam would paint the whole sea with the sheet.
+        //
+        // It is drawn only if the sheet carries transparency: blending an
+        // opaque layer is a PAINT that would hide `kam1_water_2` and put back
+        // the flat grey plane W1 removed. Both KAM1s' do since WA (`19975d0`,
+        // 2026-09-23) — `kam1_water` keeps its disc alpha, 0..218
+        // (`re-water-alpha.md` §4), where the bake before it forced 255.
+        let foam = match look.foam_tint {
+            Some(_) => {
+                let name = info.config.as_ref().and_then(|c| c.foam_texture.as_deref());
+                match name
+                    .and_then(|n| scene.textures.get(&n.to_ascii_lowercase()))
+                    .is_some_and(texture_has_alpha)
+                {
+                    true => handle(name)?,
+                    false => None,
+                }
+            }
+            None => None,
+        };
+        // The speckle layer ([`speckle_look`], queue W3): its frames get
+        // their own handles, carrying the layer's tiling and scroll. The
+        // WATR cell side is read off the mesh's first lattice quad (the bake
+        // emits the lattice cells before any `CPAT` patch). A frame the bake
+        // did not ship drops the whole layer — 0 on the shipped maps.
+        let look_s = match speckle_enabled() {
+            true => mesh
+                .indices
+                .get(..6)
+                .and_then(|q| crate::water_anim::lattice_cells(&mesh.positions, q))
+                .and_then(|l| speckle_look(&scene.manifest.source_game, info, l.cell)),
+            false => None,
+        };
+        let mut frames = Vec::new();
+        if let Some(sp) = &look_s {
+            for n in &sp.frames {
+                match scene.textures.get(&n.to_ascii_lowercase()) {
+                    Some(t) => frames.push(upload_cpu_texture_scrolling(
+                        r,
+                        t,
+                        n,
+                        sp.scroll,
+                        sp.uv_scale,
+                    )?),
+                    None => {
+                        frames.clear();
+                        break;
+                    }
+                }
+            }
+        }
+        let mut speckle_first = Vec::new();
+        let mut still_foam = Vec::new();
+        for (m, _, _, _) in upload_submeshes(r, mesh)? {
+            draws.push(match tex {
+                Some(h) => DrawCmd::water(m, h, look.tint, Mat4::IDENTITY).with_cull(far),
+                None => {
+                    // The water plane keeps its own tint rather than being
+                    // routed: the manifest always names a texture, so a miss
+                    // here IS a lookup failure. 0 on all 32 maps.
+                    census.failed("<water>", info.texture.as_deref());
+                    DrawCmd::flat(m, WATER_TINT, Mat4::IDENTITY).with_cull(far)
+                }
+            });
+            if let (Some(h), Some(tint)) = (foam, look.foam_tint) {
+                still_foam.push(draws.len());
+                draws.push(DrawCmd::water(m, h, tint, Mat4::IDENTITY).with_cull(far));
+            }
+            if let (Some(_), false) = (&look_s, frames.is_empty()) {
+                let c = |w: f32| [1.0, 1.0, 1.0, w];
+                let next = frames[1 % frames.len()];
+                speckle_first.push(draws.len());
+                draws.push(DrawCmd::speckle(m, frames[0], c(1.0), Mat4::IDENTITY).with_cull(far));
+                draws.push(DrawCmd::speckle(m, next, c(0.0), Mat4::IDENTITY).with_cull(far));
+            }
+        }
+        if let (Some(sp), false) = (&look_s, speckle_first.is_empty()) {
+            speckle = Some(SpeckleAnim {
+                first: speckle_first,
+                frames,
+                fps: sp.fps,
+            });
+        }
+        // What moves it: the bob, or the ocean's FFT patch. Built here, and
+        // inert until a caller steps it — these draws stay exactly as pushed.
+        let ranges = crate::water_anim::WaterRanges {
+            near: scene
+                .manifest
+                .lighting
+                .near_scene_range
+                .map_or(0.0, |r| r[1]),
+            far: look.far.unwrap_or(f32::INFINITY),
+        };
+        water_motion = Some(crate::water_anim::WaterMotion::new(
+            first..draws.len(),
+            &draws,
+            mesh,
+            info.config.as_ref(),
+            ranges,
+        ));
+        for k in still_foam {
+            draws[k].color[3] = 0.0;
+        }
+    }
+
+    // Models: upload each drawable model's submeshes once, then instance them.
+    // Three sources, in this order: the world's instances (`ii` is the
+    // manifest index a door rig keys on), the foliage's path-block props
+    // (world instances of their class, re-foliage §9) and the foliage's
+    // model instances (`super::foliage`), which carry their tint and fade.
+    let mut uploaded: HashMap<String, Vec<ModelPart>> = HashMap::new();
+    let mut skipped: HashMap<String, usize> = HashMap::new();
+    let mut doors: Vec<DoorDraw> = Vec::new();
+    let mut turrets: Vec<super::turret_pose::TurretDraw> = Vec::new();
+    let path_props = scene
+        .manifest
+        .foliage
+        .as_ref()
+        .map_or(&[][..], |f| &f.path_props[..]);
+    let mut placed: Vec<PlacedModel<'_>> = Vec::new();
+    for (ii, inst) in scene
+        .manifest
+        .instances
+        .iter()
+        .chain(path_props)
+        .enumerate()
+    {
+        let Some(model) = scene.resolve_model(&inst.class) else {
+            *skipped.entry(inst.class.clone()).or_default() += 1;
+            continue;
+        };
+        let world = ii < scene.manifest.instances.len();
+        placed.push(PlacedModel {
+            model,
+            matrix: instance_matrix(inst.rotation, inst.translation),
+            // DRV: the submeshes this instance's door clip moves.
+            door: world
+                .then(|| {
+                    scene
+                        .resolve_class(&inst.class)
+                        .and_then(|c| c.door.as_ref())
+                })
+                .flatten()
+                .map(|d| (ii, d)),
+            // VTURD: the parts this instance's turret turns.
+            turret: world
+                .then(|| {
+                    scene
+                        .resolve_class(&inst.class)
+                        .and_then(|c| c.turret_rig.as_ref())
+                })
+                .flatten()
+                .map(|t| (ii, inst, t)),
+            color: None,
+            fade: None,
+            near: None,
+        });
+        // The far scene's LOWD extension (card UTAS, `analysis/re-far-lowd.md`
+        // §0/§6 [O]): the PS2 draws a geometry's LOWD in its far scene, which
+        // takes an object whose sphere reaches past `NearSceneRange[1]`
+        // (times the camera zoom, 1 here). The port draws LOD0 everywhere
+        // and adds only what LOD0 lacks — BF2 UTA1's far sinkhole wall —
+        // with the fragments nearer than `NearSceneRange[1]` discarded.
+        // A map with no `NearSceneRange` has no far scene to draw it in.
+        let reach = scene.manifest.lighting.near_scene_range.map(|r| r[1]);
+        if let (true, Some(far), Some(near)) = (world, scene.resolve_far(&inst.class), reach) {
+            placed.push(PlacedModel {
+                model: far,
+                matrix: instance_matrix(inst.rotation, inst.translation),
+                door: None,
+                turret: None,
+                color: None,
+                fade: None,
+                near: Some(near),
+            });
+        }
+    }
+    let foliage_records = super::foliage::records(scene);
+    placed.extend(
+        super::foliage::models(scene, &foliage_records)
+            .into_iter()
+            .map(|f| PlacedModel {
+                model: f.model,
+                matrix: f.matrix,
+                door: None,
+                turret: None,
+                color: Some(f.color),
+                fade: f.fade,
+                near: None,
+            }),
+    );
+    // Card BPNT: each world model's sphere, in model space, for the local
+    // lights' gather (`crate::point_light::model_sphere`).
+    let mut spheres: HashMap<String, Option<render::LitSphere>> = HashMap::new();
+    for p in &placed {
+        let model = p.model;
+        // The terrain foliage's models (tinted) take none: PROVISIONAL, their
+        // draw path is not the model draw's (re-foliage §6).
+        let lit = match p.color {
+            Some(_) => None,
+            None => spheres
+                .entry(model.to_owned())
+                .or_insert_with(|| {
+                    crate::point_light::model_sphere(&scene.meshes[model], Mat4::IDENTITY)
+                })
+                .map(|s| render::LitSphere {
+                    centre: p.matrix.transform_point3(s.centre),
+                    radius: s.radius * p.matrix.transform_vector3(Vec3::X).length(),
+                }),
+        };
+        if !uploaded.contains_key(model) {
+            let mut parts = Vec::new();
+            let cpu = &scene.meshes[model];
+            for (k, (mesh, mat, layer, _)) in upload_submeshes(r, cpu)?.into_iter().enumerate() {
+                let tex = match mat {
+                    Some(m) => get_texture(r, scene, &mut textures, m, render::WrapV::Repeat)?,
+                    None => None,
+                };
+                parts.push((
+                    mesh,
+                    tex,
+                    mat.map(|m| m.to_string()),
+                    layer,
+                    cpu.spec_pass(k),
+                    cpu.light_path(k),
+                ));
+            }
+            uploaded.insert(model.to_owned(), parts);
+        }
+        let m = p.matrix;
+        let far = cull.map(|c| c.world);
+        let rig = p.door.map(|(_, d)| d);
+        let mut moving = Vec::new();
+        let mut turning = Vec::new();
+        let whole_start = draws.len();
+        for (k, (mesh, tex, mat, layer, spec, light)) in uploaded[model].iter().enumerate() {
+            let first = draws.len();
+            // The specular second pass rides only a textured draw: its add is
+            // weighted by the base texel's alpha. A far-scene draw (`p.near`)
+            // takes none: BF2's pass is the near scene's (`spec_cull`).
+            if let (Some(b), Some(sp), None) = (tex, spec, p.near) {
+                let rgb = sp.rgb_under(scene.manifest.lighting.sun_color);
+                // `light` too: `fs_spec` recomputes its base draw's colour.
+                draws.push(
+                    DrawCmd::specular(*mesh, b.handle, rgb, sp.power, m)
+                        .with_cull(spec_cull(scene, far))
+                        .with_light(*light)
+                        .with_fade(p.fade)
+                        .with_lit(lit),
+                );
+            }
+            let mut base = match tex {
+                Some(b) => draw_in(*layer, *mesh, b.handle, m).with_cull(far),
+                None => match census.route(model, mat.as_deref()) {
+                    // Nothing the disc left untextured, and nothing whose
+                    // texture is on neither disc, is drawn.
+                    Untextured::DiscUntextured | Untextured::Dangling => continue,
+                    Untextured::LookupFailed => {
+                        DrawCmd::flat(*mesh, [0.6, 0.6, 0.6, 1.0], m).with_cull(far)
+                    }
+                },
+            }
+            .with_cull_near(p.near)
+            .with_light(*light)
+            .with_fade(p.fade)
+            .with_lit(lit);
+            if let Some(c) = p.color {
+                base.color = std::array::from_fn(|i| base.color[i] * c[i]);
+            }
+            draws.push(base);
+            if let Some(part) = rig.and_then(|r| r.parts.iter().find(|q| q.submesh as usize == k)) {
+                let frames = part
+                    .motion
+                    .iter()
+                    .map(|(q, t)| (glam::Quat::from_array(*q), Vec3::from(*t)))
+                    .collect();
+                moving.push((first..draws.len(), frames));
+            }
+            if p.turret
+                .is_some_and(|(_, _, t)| matches!(t.parts.get(k), Some(Some(_))))
+            {
+                turning.push((first..draws.len(), k));
+            }
+        }
+        if let (false, Some((ii, inst, rig))) = (turning.is_empty(), p.turret) {
+            turrets.push(super::turret_pose::TurretDraw::new(
+                ii,
+                inst,
+                m,
+                rig,
+                turning,
+                whole_start..draws.len(),
+            ));
+        }
+        if let (false, Some((ii, _))) = (moving.is_empty(), p.door) {
+            doors.push(DoorDraw {
+                instance: ii,
+                model: m,
+                parts: moving,
+            });
+        }
+    }
+
+    let mut skipped: Vec<(String, usize)> = skipped.into_iter().collect();
+    skipped.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    apply_lighting(r, scene);
+    // Set on every upload, so a map without lights clears the last map's.
+    r.set_point_lights(crate::point_light::still_lights(scene));
+    if let Some(assets_dir) = scene.dir.parent() {
+        install_spec_table(r, assets_dir, &scene.manifest.source_game)?;
+        install_omniproj(r, assets_dir, &scene.manifest.source_game)?;
+    }
+    let sky = upload_sky(r, scene, &mut textures, &mut census)?;
+    r.set_sky(sky);
+    // The grass patches (queue FOLGG, `super::grass`): the FOLG records'
+    // patches and the world instances of a grass class, drawn by the
+    // renderer's own pass every frame. Set on every upload, so a map
+    // without grass clears the last map's.
+    let (grass_classes, grass_patches) = super::grass::build(scene, &foliage_records, |name| {
+        Ok(get_texture(r, scene, &mut textures, name, render::WrapV::Repeat)?.map(|t| t.handle))
+    })?;
+    r.set_grass(grass_classes, grass_patches);
+    // The leaf patches (card LEAF, `super::leaf`): the props' attached
+    // clusters, the world and FOLG ones; they ride the grass pass and fade
+    // by NearSceneRange (b, c). Set on every upload, as the grass.
+    let (leaf_classes, leaf_objects) = super::leaf::build(scene, &foliage_records, |name| {
+        Ok(get_texture(r, scene, &mut textures, name, render::WrapV::Repeat)?.map(|t| t.handle))
+    })?;
+    let near = scene
+        .manifest
+        .lighting
+        .near_scene_range
+        .map(|[_, b, c]| (b, c));
+    r.set_leaves(leaf_classes, leaf_objects, near);
+    let mut untextured: Vec<(String, String, usize)> = census
+        .failed
+        .into_iter()
+        .map(|((a, b), n)| (a, b, n))
+        .collect();
+    untextured.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+    Ok(SceneGpu {
+        draws,
+        skipped,
+        untextured,
+        disc_untextured: census.disc_untextured,
+        dangling: census.dangling,
+        terrain_dropped: census.terrain_dropped,
+        clear: clear_color(scene),
+        sky_clamp_extra_uploads: textures
+            .keys()
+            .filter_map(|k| k.strip_prefix(CLAMP_V_KEY_PREFIX))
+            .filter(|bare| textures.contains_key(*bare))
+            .count(),
+        sky_clamped: census.sky_clamped,
+        water_motion,
+        speckle,
+        doors,
+        turrets,
+        lights: crate::point_light::scene_lights(scene),
+        ground_lights: crate::point_light::ground_lights(scene),
+        post_lights: scene.manifest.source_game == "bf2",
+        holo: crate::holo::HoloArt::load(r, scene),
+    })
+}
+
+/// World radius the base sky dome is scaled to, metres. PROVISIONAL and OURS.
+///
+/// The shipped dome meshes are tiny (`tat1_sky_dome` is 13.6 units across) —
+/// they are drawn around the camera, so their own size says nothing about how
+/// big the engine makes them. The disc's own scale is 1.0 — it draws the mesh
+/// at its authored ~20 m (`analysis/re-sky-dome-placement.md` §3, S = 1.0
+/// [D]) — and the port scales it up only so the shell clears the near plane.
+///
+/// Since 2026-09-03 the scale is angle-invariant: the shell's lift scales
+/// with the mesh (`render::Placement::Dome`), so `SKY_SHELL_RADIUS` no longer
+/// changes any elevation angle and reproducing the ELF's picture does not
+/// depend on its value. It used to set what `DomeModel.Offset` meant in
+/// proportion to the shell, which is how Mustafar's volcano band ended up
+/// 5.5 degrees too high (RE §7).
+const SKY_SHELL_RADIUS: f32 = 1000.0;
+
+/// How a sky shell SEGMENT addresses its texture in V, from the V range of
+/// that segment's own vertices: `ClampToEdge` when the range stays inside
+/// [-0.25, 1.25], `Repeat` otherwise. U is always REPEAT (`render::WrapV`).
+///
+/// **What this fixes.** The port samples every texture REPEAT on all three
+/// axes, and the shipped domes' bottom rings sit AT or a hair past v = 1.0:
+/// `hoth_sky_dome` ends at v = 1.0010, `mus1_sky_dome` prim1 at 1.0767,
+/// BF1 NAB1's `sky_water` at 1.1304, `cor1_sky_dome` at 1.0107. Those rows
+/// wrap round to the texture's TOP row — zenith sky painted as a hard stripe
+/// along the horizon, which is the line the maintainer reported across both Hoth skies
+/// and Kamino's. Even a ring that stops exactly at v = 1.0 draws it, because
+/// the bilinear footprint of the last row straddles the wrap.
+///
+/// **The measurement** is `engine/artifacts/sky_wrap/dome_uv.txt` (the lead,
+/// 2026-09-03): the per-segment U/V ranges of every `DomeModel` on the 32
+/// baked map dirs. Two base domes genuinely TILE in V and must keep
+/// repeating — BF2 POL1's `pol1_skydome` (v = -1.708..2.708) and BF2 TAN1's
+/// `tan1_sky_dome` (v = -0.503..1.502) — and many tile in U, which is why U
+/// is untouched.
+///
+/// **OURS — a stated deviation** (`analysis/PLAN_LOG_2026.md`, "Stated deviations from the PS2", deviation 3): the
+/// PS2 does not clamp; it REPEATs every model draw's texture, sky shells
+/// included, and would show that row-0 line wherever nothing covers the ring
+/// (`analysis/re-texture-wrap.md` §0, RE_LOG "Texture wrap mode",
+/// 2026-09-03). The 0.25 tolerance is PROVISIONAL, the lead's own with no RE
+/// behind it: wide enough to swallow the 1.0..1.13 overshoots and narrow
+/// enough to leave the two tiling domes alone. This function is the ONE place
+/// the rule lives.
+pub fn sky_wrap_v(v_min: f32, v_max: f32) -> render::WrapV {
+    if v_min >= -0.25 && v_max <= 1.25 {
+        render::WrapV::ClampToEdge
+    } else {
+        render::WrapV::Repeat
+    }
+}
+
+/// Build the map's sky shells: each `DomeModel` from the manifest, uploaded
+/// once and scaled so the FIRST shell (the dome) has `SKY_SHELL_RADIUS`. All
+/// shells share that scale so their authored proportions survive.
+///
+/// The shipped domes cover a BAND of elevation, not a closed sphere. Censused
+/// at the scale the engine draws them (`mungefs --example sky_dome_census`,
+/// session 5): 29 of 32 base domes reach BELOW the horizon and every one
+/// reaches the zenith; only BF1 KAS1, BF1 KAS2 and BF2 UTA1 stop at 0 degrees.
+/// Below UTA1's the frame keeps its clear colour, black as on the PS2
+/// ([`MAP_CLEAR`](super::MAP_CLEAR)); both Kashyyyks author their shells
+/// `Reflect`, so there the mirrored copies fill it.
+///
+/// A `Reflect` shell is drawn twice in the PS2's order: its mirrored copy
+/// (every segment), then the shell itself (BF1 `FUN_002f2308` 280242–280284,
+/// `analysis/re-sky-reflect.md` §2). The copy is tinted by
+/// `ReflectionColor` alone — the PS2 passes sky+0x1c, not the dome ambient —
+/// and keeps the shell's own [`render::SkyMode`] (§3). The port has no far
+/// target, so this one copy stands for both of the PS2's (§5).
+fn upload_sky(
+    r: &mut Renderer,
+    scene: &Scene,
+    textures: &mut HashMap<String, BoundTexture>,
+    census: &mut Census,
+) -> Result<Vec<render::SkyShell>> {
+    let Some(sky) = &scene.manifest.sky else {
+        return Ok(Vec::new());
+    };
+    let ambient = [sky.ambient[0], sky.ambient[1], sky.ambient[2], 1.0];
+    let reflection = sky.reflection_color.unwrap_or([1.0; 3]);
+    let reflection = [reflection[0], reflection[1], reflection[2], 1.0];
+    let mut scale = None;
+    let mut shells = Vec::new();
+    for (i, m) in sky.models.iter().enumerate() {
+        let ambient = sky_shell_tint(scene.manifest.lightning.as_ref(), i, ambient);
+        let Some(cpu) = scene.meshes.get(&m.geometry) else {
+            // The discs reference four dome models that exist in no LVL
+            // (`hoth_mountain_2`, `kas_moon`, `geo_sky_dome_arena`); the bake
+            // already drops those, so this is belt and braces.
+            continue;
+        };
+        let scale = *scale.get_or_insert_with(|| {
+            let radius = cpu
+                .positions
+                .iter()
+                .map(|p| p[0].abs().max(p[2].abs()))
+                .fold(0.0f32, f32::max);
+            if radius > 1e-3 {
+                SKY_SHELL_RADIUS / radius
+            } else {
+                1.0
+            }
+        });
+        // Sky shells keep their own pass (`upload_sky`), so the glTF alpha
+        // mode — ALPHA RULE v2's census verdict, which is the WORLD path's
+        // rule — is not consulted here. The RAW MTRL word is, because the ELF
+        // draws a shell with the GS state its own material asks for
+        // (`render::SkyMode`, `analysis/re-sky-dome-placement.md` §5).
+        let mut own = Vec::new();
+        for (k, (mesh, mat, _, flags)) in upload_submeshes(r, cpu)?.into_iter().enumerate() {
+            // The V address mode is decided PER SEGMENT, off that segment's
+            // own UVs — see [`sky_wrap_v`]. A segment whose range cannot be
+            // read (an empty index run) keeps the old REPEAT behaviour.
+            let v_range = cpu.submesh_v_range(k);
+            let wrap = v_range.map_or(render::WrapV::Repeat, |(lo, hi)| sky_wrap_v(lo, hi));
+            let tex = match &mat {
+                Some(name) => get_texture(r, scene, textures, &name.to_ascii_lowercase(), wrap)?,
+                None => None,
+            };
+            if wrap == render::WrapV::ClampToEdge && tex.is_some() {
+                let (lo, hi) = v_range.unwrap_or((0.0, 0.0));
+                census.sky_clamped.push(format!(
+                    "{} prim{k} v=[{lo:.4},{hi:.4}] tex={}",
+                    m.geometry,
+                    mat.unwrap_or("<none>")
+                ));
+            }
+            if tex.is_none() {
+                let what = format!("<sky> {}", m.geometry);
+                // A shell the disc never textured, or one whose texture is on
+                // neither disc, is NOT DRAWN — otherwise it paints a flat
+                // ambient-coloured shell right across the sky. The only shell
+                // on any of the 32 maps that hits this is BF2 GEO1's
+                // `geo_sky_explosions`, whose material is the dangling
+                // `noIcon`.
+                if census.route(&what, mat) != Untextured::LookupFailed {
+                    continue;
+                }
+            }
+            own.push(render::SkyShell {
+                mesh,
+                texture: tex.map(|b| b.handle),
+                color: ambient,
+                scale,
+                // The ELF's dome rule, with the port's own uniform scale (an
+                // angle-invariant scale about the eye) — see
+                // `render::Placement::Dome` and
+                // `analysis/re-sky-dome-placement.md` §3/§4/§8.1.
+                placement: render::Placement::Dome {
+                    offset_y: m.offset,
+                    movement_scale: m.movement_scale,
+                },
+                yaw: 0.0,
+                // No fog flag: the sky draw flag 0x20 excludes every shell
+                // from the fog pass in both ELFs (`analysis/re-fog.md` §2.4).
+                mode: render::SkyMode::from_flags(flags),
+            });
+        }
+        if m.reflect {
+            shells.extend(own.iter().map(|s| render::SkyShell {
+                color: reflection,
+                placement: render::Placement::Mirror {
+                    offset_y: m.offset,
+                    movement_scale: m.movement_scale,
+                },
+                ..*s
+            }));
+        }
+        shells.extend(own);
+    }
+    shells.extend(upload_sky_objects(r, scene, textures, ambient, census)?);
+    Ok(shells)
+}
+
+/// The tint dome shell `index` is drawn with: `base` (the map's flat
+/// `sky.ambient`), and on a map whose `Effect("Lightning")` is enabled shell 0
+/// is darkened to the PS2's resting dome colour — 153/255 for the discs'
+/// `SkyDomeDarkenFactor(0.4)` — while every other shell keeps `base`
+/// (`analysis/re-kamino.md` §1 [O]: B2 `FUN_003cb918` draws shell 0 with the
+/// stored dome colour and the rest with constant white). Mirrored shells and
+/// `SkyObject`s are not shell 0's draw and keep their own tint.
+///
+/// The hook for the weather card (WTHR): a flash lifts the dome back toward
+/// white, `ManifestLightning::dome_tint(brightness)`; this is the look
+/// between flashes, `brightness` 0.
+fn sky_shell_tint(
+    lightning: Option<&manifest::ManifestLightning>,
+    index: usize,
+    base: [f32; 4],
+) -> [f32; 4] {
+    match lightning {
+        Some(l) if index == 0 => {
+            let k = l.dome_tint(0.0);
+            [base[0] * k, base[1] * k, base[2] * k, base[3]]
+        }
+        _ => base,
+    }
+}
+
+/// The map's `SkyObject` flights — distant capital ships, which the discs
+/// author per map and whose geometry lives in a SIDE LVL rather than the
+/// map's own (see `bake::map::pull_side_models`). BF1 Tatooine 1 asks for
+/// two each of a Republic assault ship, a Federation lander, a Mon Calamari
+/// cruiser and an Imperial destroyer, at 350-500 m altitude and 2500 m out.
+///
+/// They are drawn as sky shells: camera-locked in XZ, so they hold their
+/// authored distance and cannot be flown to, and depth-free, so they sit
+/// behind everything. Unlike a dome they keep scale 1.0 — a capital ship
+/// 2.5 km away needs real perspective, not a dome's normalisation.
+///
+/// **The BEARING is ours and PROVISIONAL.** The discs author a count, an
+/// altitude band and a distance, but no azimuth, so something has to choose
+/// one. This spreads every ship on the map evenly around the compass (and
+/// spreads a flight of more than one across its altitude band), which is
+/// deterministic, keeps ships from overlapping, and gives every direction
+/// something to look at. Two authored fields are NOT consumed because their
+/// meaning is not decoded: `InDirectionFactor` (2.5 on BF1 TAT1) and an
+/// unnamed two-argument range, `0xb4c88558` (30, 50 on TAT1) — either could
+/// be the real bearing rule. See `analysis/RE_LOG.md`.
+fn upload_sky_objects(
+    r: &mut Renderer,
+    scene: &Scene,
+    textures: &mut HashMap<String, BoundTexture>,
+    ambient: [f32; 4],
+    census: &mut Census,
+) -> Result<Vec<render::SkyShell>> {
+    let Some(sky) = &scene.manifest.sky else {
+        return Ok(Vec::new());
+    };
+    let total: u32 = sky.objects.iter().map(|o| o.count).sum();
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut placed = 0u32;
+    for o in &sky.objects {
+        let Some(cpu) = scene.meshes.get(&o.geometry) else {
+            continue;
+        };
+        let parts = upload_submeshes(r, cpu)?;
+        for k in 0..o.count {
+            let bearing = std::f32::consts::TAU * placed as f32 / total as f32;
+            placed += 1;
+            // One ship sits mid-band; a flight spreads across it.
+            let t = if o.count > 1 {
+                k as f32 / (o.count - 1) as f32
+            } else {
+                0.5
+            };
+            let y = o.height[0] + (o.height[1] - o.height[0]) * t;
+            let offset = Vec3::new(bearing.sin() * o.distance, y, bearing.cos() * o.distance);
+            for &(mesh, ref mat, _, flags) in &parts {
+                // NOT V-clamped, unlike a dome segment: a capital ship is an
+                // ordinary model that may legitimately tile its hull texture,
+                // and it shares the world's texture cache. See [`sky_wrap_v`].
+                let tex = match mat {
+                    Some(name) => get_texture(
+                        r,
+                        scene,
+                        textures,
+                        &name.to_ascii_lowercase(),
+                        render::WrapV::Repeat,
+                    )?,
+                    None => None,
+                };
+                if tex.is_none() {
+                    // Routed exactly like a dome shell above. 0 on all 32
+                    // maps today.
+                    let what = format!("<sky-object> {}", o.geometry);
+                    if census.route(&what, mat.as_deref()) != Untextured::LookupFailed {
+                        continue;
+                    }
+                }
+                out.push(render::SkyShell {
+                    mesh,
+                    texture: tex.map(|b| b.handle),
+                    color: ambient,
+                    scale: 1.0,
+                    // Unchanged by the sky-placement build: a `SkyObject`'s
+                    // offset is the port's own (bearing + altitude below), so
+                    // it stays a fixed vector from the eye.
+                    placement: render::Placement::Object { offset },
+                    yaw: bearing,
+                    // Routed off the raw MTRL word exactly like a dome
+                    // shell: a `SkyObject` is a model like any other and the
+                    // ELF's material rule is not specific to domes (RE §5).
+                    mode: render::SkyMode::from_flags(flags),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Look up (uploading on first use) one texture; None when the manifest
+/// references one we didn't bake. The draw's pass is NOT decided here — it
+/// comes from the GLB material (`assets::CpuMesh::submeshes`).
+fn get_texture(
+    r: &mut Renderer,
+    scene: &Scene,
+    cache: &mut HashMap<String, BoundTexture>,
+    name: &str,
+    wrap_v: render::WrapV,
+) -> Result<Option<BoundTexture>> {
+    // `Scene::textures` is keyed lowercase: a `modl` segment spells its
+    // texture with whatever case the artist typed, and the `tex_` chunk that
+    // holds it spells it another way.
+    let name = &name.to_ascii_lowercase();
+    // A CLAMPED upload is a different GPU sampler, so it is a different
+    // entry: `sky_naboo2` is both BF1/BF2 NAB2's dome and a world texture,
+    // and the world's copy must stay REPEAT. The clamped entry hides behind a
+    // prefix no `tex_` name can spell (U+0001 is not a filename character),
+    // so the two never collide.
+    let key = match wrap_v {
+        render::WrapV::Repeat => name.clone(),
+        render::WrapV::ClampToEdge => format!("{CLAMP_V_KEY_PREFIX}{name}"),
+    };
+    if let Some(&h) = cache.get(&key) {
+        return Ok(Some(h));
+    }
+    let Some(t) = scene.textures.get(name) else {
+        return Ok(None);
+    };
+    if test_dropped_texture(name) {
+        return Ok(None);
+    }
+    let bt = BoundTexture {
+        handle: upload_cpu_texture_inner(r, t, name, [0.0, 0.0], [1.0, 1.0], wrap_v)?,
+    };
+    cache.insert(key, bt);
+    Ok(Some(bt))
+}
+
+/// Does `OPENBF_TEST_DROP_TEXTURE` name this (lowercased) texture? TEST-ONLY:
+/// the hook `tests/walkabout_stats.rs` proves itself with — the draw takes the
+/// untextured fallback, as it would if the texture had stopped binding.
+/// Unset, nothing is dropped.
+fn test_dropped_texture(name: &str) -> bool {
+    std::env::var("OPENBF_TEST_DROP_TEXTURE").is_ok_and(|v| v.eq_ignore_ascii_case(name))
+}
+
+/// Cache-key prefix for the CLAMPED upload of a texture — see [`get_texture`].
+/// U+0001 cannot appear in a `tex_` chunk name, so a clamped entry can never
+/// shadow a real one.
+const CLAMP_V_KEY_PREFIX: &str = "\u{1}clampv:";
+
+/// Cells along one edge of a terrain draw chunk. See
+/// [`upload_terrain_chunks`]; 32 is exactly 4x4 of the disc's own 8-cell
+/// `PCHS` patches, and gives an 8x8 grid of 64 chunks on a 256-cell map.
+/// PROVISIONAL as a tuning choice — it is the granularity/draw-count
+/// trade-off, nothing decoded.
+const TERRAIN_CHUNK_CELLS: usize = 32;
+
+/// Split the terrain heightfield into square draw chunks.
+///
+/// As one mesh it was 130k triangles with a map-wide AABB, so frustum culling
+/// could never touch it and it was the measured residual on every big map
+/// (PLAN B4). Chunking gives each piece its own bounds.
+///
+/// **This happens at UPLOAD, not in the bake, and that is deliberate.**
+/// `Scene::heightfield` rebuilds the sim's ground-height query out of
+/// `terrain.positions`, assuming they are a row-major `n x n` grid in the
+/// order the bake emits them. Chunking the GLB silently breaks that: the
+/// vertex count stops being `n²` (chunk seams duplicate a row), and on BF1
+/// Hoth 69,169 happens to be a perfect square, so the guard in `heightfield`
+/// passes and the sim gets a garbage ground plane — soldiers and the camera
+/// end up floored against nonsense, and `--sim-hash` moves. Splitting here
+/// leaves the baked data, the manifest and every sim path untouched by
+/// construction.
+///
+/// Falls back to the unsplit mesh whenever the terrain is not the grid this
+/// assumes (which is the same contract `Scene::heightfield` checks).
+fn upload_terrain_chunks<'a>(r: &mut Renderer, cpu: &'a CpuMesh) -> Result<Vec<SubmeshPart<'a>>> {
+    let Some(chunks) = terrain_chunk_indices(cpu) else {
+        return upload_submeshes(r, cpu);
+    };
+    let mat = cpu.submeshes[0].2.as_str();
+    let mat = (!mat.is_empty()).then_some(mat);
+    // Every chunk is one sheet split for culling, so they all share the one
+    // submesh's alpha mode.
+    let layer = cpu.submeshes[0].3;
+    // ...and its raw MTRL word, which no terrain draw reads (the sky pass is
+    // the only consumer) but which travels with the tuple.
+    let flags = cpu.submeshes[0].4;
+    let mut out = Vec::new();
+    for indices in chunks.iter().filter(|c| !c.is_empty()) {
+        // Compacting is what gives the chunk its own vertex range and
+        // therefore its own AABB — the whole point of the split.
+        let sub = compact_submesh(cpu, indices);
+        let mesh = r
+            .add_mesh(&MeshData {
+                positions: &sub.positions,
+                normals: &sub.normals,
+                uvs: &sub.uvs,
+                colors: Some(&sub.colors),
+                indices: &sub.indices,
+            })
+            .map_err(|e| anyhow!("terrain chunk upload: {e}"))?;
+        out.push((mesh, mat, layer, flags));
+    }
+    if out.is_empty() {
+        return upload_submeshes(r, cpu);
+    }
+    Ok(out)
+}
+
+/// Upload the terrain's LAYER meshes ([`crate::assets::Scene::terrain_layers`])
+/// split into the base terrain's draw chunks: LAYER-major, so every chunk of
+/// layer k gets a lower mesh handle than any chunk of layer k+1 and the
+/// `TerrainLayer` pass composites them in ascending LTEX order. A triangle
+/// goes to the chunk of its minimum cell, as the base's do. Empty when the
+/// base terrain is not the grid this assumes.
+fn upload_terrain_layer_chunks<'a>(
+    r: &mut Renderer,
+    base: &CpuMesh,
+    layers: &'a CpuMesh,
+) -> Result<Vec<(render::MeshHandle, &'a str)>> {
+    let Some(n) = crate::assets::terrain_grid_size(&base.positions) else {
+        return Ok(Vec::new());
+    };
+    let p0 = base.positions[0];
+    let unit = base.positions[1][0] - p0[0];
+    if !(unit.is_finite() && unit > 0.0) {
+        return Ok(Vec::new());
+    }
+    let cell = |w: f32, o: f32| (((w - o) / unit) as isize).clamp(0, n as isize - 1) as usize;
+    let per_row = n.div_ceil(TERRAIN_CHUNK_CELLS).max(1);
+    let mut out = Vec::new();
+    for (start, count, mat, _, _) in &layers.submeshes {
+        let idx = &layers.indices[*start as usize..(*start + *count) as usize];
+        let mut chunks = vec![Vec::new(); per_row * per_row];
+        for tri in idx.chunks_exact(3) {
+            if tri.iter().any(|&i| i as usize >= layers.positions.len()) {
+                continue;
+            }
+            let (x, z) = tri.iter().fold((usize::MAX, usize::MAX), |a, &i| {
+                let p = layers.positions[i as usize];
+                (a.0.min(cell(p[0], p0[0])), a.1.min(cell(p[2], p0[2])))
+            });
+            let (cx, cz) = (
+                (x / TERRAIN_CHUNK_CELLS).min(per_row - 1),
+                (z / TERRAIN_CHUNK_CELLS).min(per_row - 1),
+            );
+            chunks[cz * per_row + cx].extend_from_slice(tri);
+        }
+        for indices in chunks.iter().filter(|c| !c.is_empty()) {
+            let sub = compact_submesh(layers, indices);
+            let mesh = r
+                .add_mesh(&MeshData {
+                    positions: &sub.positions,
+                    normals: &sub.normals,
+                    uvs: &sub.uvs,
+                    colors: Some(&sub.colors),
+                    indices: &sub.indices,
+                })
+                .map_err(|e| anyhow!("terrain layer upload: {e}"))?;
+            out.push((mesh, mat.as_str()));
+        }
+    }
+    Ok(out)
+}
+
+/// Deal the terrain's BAKED triangles into square chunks, in chunk order
+/// (z-major), each keeping the baked index order. `None` when the mesh is not
+/// a single-material heightfield mesh.
+///
+/// It reads the baked index buffer rather than re-deriving the grid's quads,
+/// because the bake no longer emits one quad per cell everywhere: a render
+/// patch a terrain cutter reaches into ships a PRE-CLIPPED replacement mesh
+/// that the bake substitutes for those 64 quads (`bake::terrain_glb`,
+/// analysis/re-terrain-cutters.md §0.3). Walking the grid would silently draw
+/// the snow back inside Hoth's outpost rooms.
+///
+/// A triangle belongs to the chunk of its MINIMUM cell, which puts both
+/// triangles of a grid quad in the chunk that owns the quad's lower-left
+/// corner — the same assignment the grid walk made, so the chunking of a
+/// terrain with no replacement mesh is unchanged down to the index order.
+fn terrain_chunk_indices(cpu: &CpuMesh) -> Option<Vec<Vec<u32>>> {
+    if cpu.submeshes.len() != 1 {
+        return None;
+    }
+    let n = crate::assets::terrain_grid_size(&cpu.positions)?;
+    let p0 = cpu.positions[0];
+    let unit = cpu.positions[1][0] - p0[0];
+    if !(unit.is_finite() && unit > 0.0) {
+        return None;
+    }
+    // A grid vertex IS its cell (row-major, `z * n + x`); a replacement
+    // vertex is placed by its world position, which lies inside the patch it
+    // replaces.
+    let cell = |v: u32| -> (usize, usize) {
+        let v = v as usize;
+        if v < n * n {
+            (v % n, v / n)
+        } else {
+            let p = cpu.positions[v];
+            let f = |w: f32, o: f32| (((w - o) / unit) as isize).clamp(0, n as isize - 1) as usize;
+            (f(p[0], p0[0]), f(p[2], p0[2]))
+        }
+    };
+    let per_row = n.div_ceil(TERRAIN_CHUNK_CELLS).max(1);
+    let mut chunks = vec![Vec::new(); per_row * per_row];
+    for tri in cpu.indices.chunks_exact(3) {
+        if tri.iter().any(|&i| i as usize >= cpu.positions.len()) {
+            return None;
+        }
+        let cells = tri.iter().map(|&i| cell(i));
+        let (x, z) = cells.fold((usize::MAX, usize::MAX), |a, c| {
+            (a.0.min(c.0), a.1.min(c.1))
+        });
+        let (cx, cz) = (
+            (x / TERRAIN_CHUNK_CELLS).min(per_row - 1),
+            (z / TERRAIN_CHUNK_CELLS).min(per_row - 1),
+        );
+        chunks[cz * per_row + cx].extend_from_slice(tri);
+    }
+    Some(chunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An ocean step that turns 2 water draws into 130 moves every later draw
+    /// by 128: the door parts follow, a speckle frame inside the old range
+    /// (the still plane's) is dropped, and an index before the range stays.
+    #[test]
+    fn door_and_speckle_indices_follow_an_ocean_splice() {
+        let mut doors = vec![DoorDraw {
+            instance: 7,
+            model: Mat4::IDENTITY,
+            parts: vec![(40..42, Vec::new()), (50..52, Vec::new())],
+        }];
+        let mut speckle = Some(SpeckleAnim {
+            first: vec![3, 11, 60],
+            frames: Vec::new(),
+            fps: 30.0,
+        });
+        let inst = manifest::ManifestInstance {
+            name: "t".into(),
+            class: "t".into(),
+            rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translation: [0.0; 3],
+            props: Vec::new(),
+        };
+        let rig = manifest::ManifestTurretRig {
+            nodes: Vec::new(),
+            parts: Vec::new(),
+        };
+        let mut turrets = vec![super::super::turret_pose::TurretDraw::new(
+            9,
+            &inst,
+            Mat4::IDENTITY,
+            &rig,
+            vec![(4..6, 0), (60..62, 1)],
+            60..64,
+        )];
+        reindex_after_splice(&mut doors, &mut turrets, &mut speckle, &(10..12), 130);
+        assert_eq!(turrets[0].parts[0].0, 4..6);
+        assert_eq!(turrets[0].parts[1].0, 188..190);
+        assert_eq!(turrets[0].whole, 188..192);
+        assert_eq!(doors[0].parts[0].0, 168..170);
+        assert_eq!(doors[0].parts[1].0, 178..180);
+        assert_eq!(speckle.as_ref().unwrap().first, vec![3, 188]);
+        // A shrink moves them back; every speckle frame gone drops the layer.
+        reindex_after_splice(&mut doors, &mut turrets, &mut speckle, &(10..140), 2);
+        assert_eq!(doors[0].parts[0].0, 40..42);
+        speckle.as_mut().unwrap().first = vec![11];
+        reindex_after_splice(&mut doors, &mut turrets, &mut speckle, &(10..12), 2);
+        assert!(speckle.is_none());
+    }
+
+    /// Only BF1's authored `TerrainEnable(0)` switches the terrain draw off.
+    #[test]
+    fn only_bf1_terrain_enable_zero_hides_the_terrain() {
+        let sky = |e: Option<f32>| manifest::ManifestSky {
+            texture: None,
+            models: Vec::new(),
+            ambient: [1.0; 3],
+            low_res_terrain: None,
+            low_res_max_distance: None,
+            objects: Vec::new(),
+            terrain_enable: e,
+            reflection_color: None,
+        };
+        assert!(!terrain_drawn("bf1", Some(&sky(Some(0.0)))));
+        assert!(terrain_drawn("bf2", Some(&sky(Some(0.0)))));
+        assert!(terrain_drawn("bf1", Some(&sky(Some(1.0)))));
+        assert!(terrain_drawn("bf1", Some(&sky(None))));
+        assert!(terrain_drawn("bf1", None));
+    }
+
+    /// Card KSKY: Kamino's `SkyDomeDarkenFactor(0.4)` rests dome shell 0 at
+    /// 255·(1 − 0.4) = 153 — the byte PS2 RAM holds — while shell 1
+    /// (`kam1_city`) stays white; a map without the effect darkens nothing.
+    #[test]
+    fn lightning_darkens_dome_shell_0_only() {
+        let l = manifest::ManifestLightning {
+            sky_dome_darken_factor: 0.4,
+            sunlight_fade_factor: 0.1,
+            color: [255.0; 3],
+            brightness_min: 1.0,
+            fade_time: 0.2,
+            time_between_flashes: [3.0, 5.0],
+            time_between_sub_flashes: [0.01, 0.5],
+            num_sub_flashes: [2.0, 5.0],
+            horizon_angle: [30.0, 60.0],
+            sound_crack: None,
+            sound_sub_crack: None,
+        };
+        assert_eq!(l.dome_byte(0.0), 153);
+        // A flash at full brightness is white: the hook the weather card animates.
+        assert_eq!(l.dome_byte(1.0), 255);
+        assert_eq!(l.dome_tint(1.0), 1.0);
+        // 153/255 through the sRGB curve.
+        let k = ((0.6f32 + 0.055) / 1.055).powf(2.4);
+        assert!((l.dome_tint(0.0) - k).abs() < 1e-6, "{}", l.dome_tint(0.0));
+        let white = [1.0; 4];
+        assert_eq!(sky_shell_tint(Some(&l), 0, white), [k, k, k, 1.0]);
+        assert_eq!(sky_shell_tint(Some(&l), 1, white), white);
+        assert_eq!(sky_shell_tint(None, 0, white), white);
+    }
+
+    /// A baked terrain mesh: `n x n` world-space grid vertices row-major, two
+    /// triangles per cell, one material — what `bake::terrain_glb` emits.
+    fn grid_mesh(n: usize) -> CpuMesh {
+        let unit = 8.0f32;
+        let half = n as f32 / 2.0 * unit;
+        let mut positions = Vec::new();
+        for z in 0..n {
+            for x in 0..n {
+                positions.push([x as f32 * unit - half, 0.0, z as f32 * unit - (half - unit)]);
+            }
+        }
+        let mut indices = Vec::new();
+        for z in 0..n - 1 {
+            for x in 0..n - 1 {
+                let a = (z * n + x) as u32;
+                let (b, c, d) = (a + 1, a + n as u32, a + n as u32 + 1);
+                indices.extend_from_slice(&[a, c, b, b, c, d]);
+            }
+        }
+        let v = positions.len();
+        CpuMesh {
+            positions,
+            normals: vec![[0.0, 1.0, 0.0]; v],
+            uvs: vec![[0.0, 0.0]; v],
+            colors: vec![[255; 4]; v],
+            indices,
+            submeshes: vec![(0, 0, "hoth_main_1".into(), render::DrawLayer::Opaque, 0)],
+            spec: Vec::new(),
+            light: Vec::new(),
+            sphere: None,
+        }
+    }
+
+    /// The chunking the grid walk did before the bake could ship replacement
+    /// meshes — kept here as the reference the new dealer must reproduce.
+    fn grid_walk(n: usize) -> Vec<Vec<u32>> {
+        let per_row = n.div_ceil(TERRAIN_CHUNK_CELLS).max(1);
+        let mut out = Vec::new();
+        for cz in 0..per_row {
+            for cx in 0..per_row {
+                let (x0, z0) = (cx * TERRAIN_CHUNK_CELLS, cz * TERRAIN_CHUNK_CELLS);
+                let (x1, z1) = (
+                    (x0 + TERRAIN_CHUNK_CELLS).min(n - 1),
+                    (z0 + TERRAIN_CHUNK_CELLS).min(n - 1),
+                );
+                if x0 >= x1 || z0 >= z1 {
+                    continue;
+                }
+                let mut idx = Vec::new();
+                for z in z0..z1 {
+                    for x in x0..x1 {
+                        let a = (z * n + x) as u32;
+                        let (b, c, d) = (a + 1, a + n as u32, a + n as u32 + 1);
+                        idx.extend_from_slice(&[a, c, b, b, c, d]);
+                    }
+                }
+                out.push(idx);
+            }
+        }
+        out
+    }
+
+    /// Terrain chunking is now driven by the BAKED index buffer, and on a
+    /// plain grid that reproduces the old grid walk chunk for chunk, index for
+    /// index — so no golden moves on the 19 terrains that ship no replacement
+    /// mesh.
+    #[test]
+    fn terrain_chunks_reproduce_the_grid_walk() {
+        for n in [64usize, 128] {
+            let cpu = grid_mesh(n);
+            let got: Vec<Vec<u32>> = terrain_chunk_indices(&cpu)
+                .expect("a grid mesh chunks")
+                .into_iter()
+                .filter(|c| !c.is_empty())
+                .collect();
+            assert_eq!(got, grid_walk(n), "n = {n}");
+        }
+    }
+
+    /// A cutter-clipped patch: the bake drops that patch's quads and appends
+    /// the shipped replacement vertices after the grid
+    /// (analysis/re-terrain-cutters.md §0.3). The dropped quads must stay
+    /// dropped — the defect was drawing them anyway — and the replacement
+    /// triangle must be dealt into the chunk its world position is in.
+    #[test]
+    fn a_replaced_patch_loses_its_quads_and_keeps_the_shipped_triangle() {
+        let n = 64usize;
+        let mut cpu = grid_mesh(n);
+        // The patch is cells 40..48 in x and z: chunk (1, 1) of the 2x2. Its
+        // INTERIOR vertices are referenced by its quads and by nothing else,
+        // so they are the ones that must disappear.
+        let dropped: Vec<u32> = (41..48)
+            .flat_map(|z: usize| (41..48).map(move |x| (z * 64 + x) as u32))
+            .collect();
+        let mut idx = Vec::new();
+        for z in 0..n - 1 {
+            for x in 0..n - 1 {
+                if (40..48).contains(&x) && (40..48).contains(&z) {
+                    continue; // the patch the munge replaced
+                }
+                let a = (z * n + x) as u32;
+                let (b, c, d) = (a + 1, a + n as u32, a + n as u32 + 1);
+                idx.extend_from_slice(&[a, c, b, b, c, d]);
+            }
+        }
+        let base = cpu.positions.len() as u32;
+        for p in [
+            [6.0f32, -3.0, 90.0],
+            [20.0, -3.0, 90.0],
+            [13.0, -3.0, 104.0],
+        ] {
+            cpu.positions.push(p);
+            cpu.normals.push([0.0, 1.0, 0.0]);
+            cpu.uvs.push([0.0, 0.0]);
+            cpu.colors.push([255; 4]);
+        }
+        idx.extend_from_slice(&[base, base + 1, base + 2]);
+        cpu.indices = idx;
+
+        let chunks = terrain_chunk_indices(&cpu).expect("chunks");
+        let all: Vec<u32> = chunks.concat();
+        assert_eq!(all.len(), cpu.indices.len(), "every triangle is dealt once");
+        assert!(
+            !dropped.iter().any(|v| all.contains(v)),
+            "a dropped quad came back"
+        );
+        // The three appended vertices sit at world (6..20, 90..104) = cells
+        // (40..46, 42..46), so their triangle belongs to chunk (1, 1).
+        assert!(
+            chunks[3].ends_with(&[base, base + 1, base + 2]),
+            "chunk (1,1)"
+        );
+    }
+
+    /// The whole untextured policy, as three arms. See [`route_untextured`].
+    #[test]
+    fn untextured_routing_skips_the_disc_s_own_gaps_and_greys_only_our_misses() {
+        // The disc named no texture at all: skipped, not painted.
+        assert_eq!(route_untextured(None), Untextured::DiscUntextured);
+        // An empty material name is the same thing — `upload_submeshes` maps
+        // it to `None`, but the bake writes it as "" and either can arrive.
+        assert_eq!(route_untextured(Some("")), Untextured::DiscUntextured);
+
+        // A texture that is on neither disc: skipped, and counted apart.
+        for name in DANGLING_ON_DISC {
+            assert_eq!(route_untextured(Some(name)), Untextured::Dangling, "{name}");
+        }
+        // Matched case-insensitively — the discs spell these `yav_prop_ivy`,
+        // `Cor1_bldg_flowers` and `noIcon`.
+        assert_eq!(
+            route_untextured(Some("Cor1_bldg_flowers")),
+            Untextured::Dangling
+        );
+        assert_eq!(route_untextured(Some("noIcon")), Untextured::Dangling);
+
+        // Anything else that fails to resolve is OUR bug: grey and counted.
+        assert_eq!(
+            route_untextured(Some("tat1_bldg_wall")),
+            Untextured::LookupFailed
+        );
+        // Near-misses on the dangling list must NOT be swallowed by it.
+        assert_eq!(
+            route_untextured(Some("yav_prop_ivy2")),
+            Untextured::LookupFailed
+        );
+        assert_eq!(route_untextured(Some("icon")), Untextured::LookupFailed);
+    }
+
+    /// The V address-mode rule over the shapes `artifacts/sky_wrap/dome_uv.txt`
+    /// actually holds — the four overshooting shells that made the horizon
+    /// stripe, the two base domes that genuinely tile in V, and the ordinary
+    /// [0, 1] shell.
+    #[test]
+    fn the_v_wrap_rule_over_the_shipped_dome_segments() {
+        use render::WrapV::{ClampToEdge, Repeat};
+        // Overshoot past v = 1: clamp, or the last rows wrap to the zenith.
+        assert_eq!(sky_wrap_v(0.0020, 1.0010), ClampToEdge); // hoth_sky_dome
+        assert_eq!(sky_wrap_v(0.0020, 1.0767), ClampToEdge); // mus1_sky_dome prim1
+        assert_eq!(sky_wrap_v(0.0308, 1.1304), ClampToEdge); // BF1 NAB1 sky_water
+                                                             // Genuinely tiling base domes: leave them repeating.
+        assert_eq!(sky_wrap_v(-1.7080, 2.7080), Repeat); // BF2 POL1 pol1_skydome
+        assert_eq!(sky_wrap_v(-0.5029, 1.5015), Repeat); // BF2 TAN1 tan1_sky_dome
+                                                         // The ordinary case — and the one the bilinear footprint still
+                                                         // wraps without the clamp.
+        assert_eq!(sky_wrap_v(0.0, 1.0), ClampToEdge);
+        // The tolerance is symmetric and exclusive at its own edges.
+        assert_eq!(sky_wrap_v(-0.25, 1.25), ClampToEdge);
+        assert_eq!(sky_wrap_v(-0.2501, 1.0), Repeat);
+        assert_eq!(sky_wrap_v(0.0, 1.2501), Repeat);
+    }
+}

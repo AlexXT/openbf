@@ -1,0 +1,70 @@
+---
+id: KNOCK
+title: Explosions throw soldiers as the PS2's do: BF1 pushes every gathered soldier not thrown / tumbling / getting up / mounted by (normalize(d)+(0,0.6,0))·Push·f - thrown at g 13.5, a tumble, a get-up, a 1.93 s lock; a kill by a blast or a direct hit kicks the body 5 m/s, the blast-killed fly and die at the landing, corpses keep a moving body for 4 s; BF2 pushes only the dead unless the class authors PushDeadOnly 0 - today a blast only damages and a dead unit freezes
+milestone: M3
+value: 4
+phase: build
+status: todo
+deps: VDTH
+files: engine/crates/core/src/sim/blast.rs,engine/crates/core/src/sim/combat.rs,engine/crates/core/src/sim/step.rs,engine/crates/core/src/soldier.rs,engine/crates/core/src/soldier/tests.rs,engine/crates/core/src/unit.rs,engine/crates/core/src/weapon.rs,engine/crates/game/src/soldier_vis.rs,engine/crates/game/src/animator.rs
+declares: sim; sweep; arena
+needs:
+branch:
+resume: RE done (analysis/re-knockback.md, 6f52332 + 95f4e25; rows in lead_tmp/knock/out/). Build in three commits, tests first from the PS2 rows of section 6: (1) the dead keep a body - a dead unit stays in the tick for 4.0 s with a velocity (gravity 18, the brake of section 3 / 4), is in Sim::explode's gather, and a kill by a bolt or a blast adds the 5 m/s kick (combat.rs, blast.rs); (2) the push in Sim::explode (blast.rs's marked spot; ExplosionClass reads PushDeadOnly, BF1 classes false) + Soldier stances Thrown / Tumble / GetUp with the lock, the blast-killed thrown and dying at the landing; (3) game: the corpse's draw follows the body, the thrown / tumble / rest clips if the baked sets hold them. Droids: card DCHK.
+created: 2026-09-28
+alpha: yes
+---
+
+## Why (build, rewritten 2026-10-07 after the RE: `analysis/re-knockback.md`)
+On the PS2 a grenade beside a BF1 soldier throws him 14 m through the air; he tumbles, gets up and is back in the
+fight 4.4 s later. A soldier it kills flies the same way and only dies when he lands. Every kill - by a blast or by a
+bolt - kicks the body 5 m/s along the hit, and the body slides and stays in the world for 4 s, where the next blast
+throws it again. In BF2 a blast throws only the dead (the Ewok's rock and the wampa's smash are the two exceptions).
+In the port a blast only damages, and a dead unit freezes where it stood.
+
+## Evidence
+- `analysis/re-knockback.md` (6f52332, 95f4e25): §0 the answers; §1 the push and its apply; §2 thrown / tumble / get-up and
+  the lock with every constant; §3 the kick, the late death, the corpse; §4 BF2; §7 which explosions push; §8 the
+  build notes. 55 claims through a 12-agent verifier workflow (§9).
+- Measured on the PS2 (`engine/artifacts/lead_tmp/knock/out/live_summary.txt`; rows in `out/*.json`): BF1 17 of 17
+  living pushed, 5 of 5 corpses, 8 of 8 in the skipped states unpushed, 6 of 6 controls untouched, 0.00 m/s off the
+  model at rest; BF2 0 of 22 living pushed, 4 of 4 blast-killed and 5 of 5 corpses pushed; with the PushDeadOnly bit
+  cleared in RAM 15 of 15 living thrown.
+- The port today: `core/src/sim/blast.rs` line 103 marks the push's place; `ExplosionClass` already holds `push`,
+  `push_inner`, `push_outer`; `Stance` has no thrown state; `sim/step.rs` skips a dead unit; `game/src/soldier_vis.rs`
+  draws a corpse where the unit died.
+
+## Acceptance (run these, paste the output)
+1. **The impulse** (core test, PS2 row `bf1_hot1_knock.json` trial 2, P): a standing soldier whose feet are 2.01 m from
+   a thermal detonator's blast on level ground (Push 10, PushRadius 4.5 - 4.5) gets dv = (9.13, 10.01, 0.76) ± 0.02
+   for the row's geometry; the same soldier 7.5 m away gets 0; one in the tumble state gets 0.
+2. **The flight** (core test, the same row): the blast's tick sets the velocity; the next tick moves him with no
+   gravity (the ground flag is still set), then 44 ticks at g 13.5 (vy falling 0.45 a tick, the horizontal 9.16 m/s
+   unchanged), on the ground at tick 46, tumbling at tick 47; the tumble at 8.4 m/s² to under 4 m/s, the get-up at
+   16.8 m/s² to rest, the lock 1.9333 s; at rest 18.7 ± 0.3 m from the start 2.4 ± 0.1 s after the blast. No fire and
+   no move while locked.
+3. **The dead** (core tests): a bolt kill gives the body 5.0 m/s along the shot; a soldier a blast kills is thrown and
+   his death (state, item drop) comes after the landing (BF1 2.5 - 3.6 s on the PS2; BF2 from the get-up, 1.5 - 1.8 s);
+   a corpse 0.9 s old 2.35 m from a blast gets push + kick (-14.91, 7.22, 0.00) ± 0.05 (row C1) and is gone at 4.0 s.
+4. **BF2** (core test): a living soldier inside a thermal detonator's radius takes the damage and 0.00 m/s; a class
+   with PushDeadOnly 0 throws him (row `bf2_hot1flag_knock.json`, P: (-4.80, 8.71, -8.34)).
+5. **Mutation check**: break each of the five rules (the 0.6, g 13.5, the 5 m/s, PushDeadOnly, the skipped states) and
+   name the test that fails.
+6. **The sweep** on main and on the branch, 8 seeds x 32 maps: recycles, deaths under the floor (thrown bodies can
+   leave a level: say where, per map) and the finish counts, with the paired difference by seed; FEEL_NOTES lines for
+   the kick and the lock.
+
+## Not in this card
+- Droid soldiers' ChunkFrequency roll and the chunk death: card DCHK. Until it lands a BF1 droid is pushed every
+  time - a named, temporary deviation (the PS2 skips the push 6 times in 10).
+- The mounted x 9 throw (needs a rider's death in a seat: note it on the seat's card when built), BF2's flinch,
+  whatever else knocks a living BF2 soldier down (Force powers, vehicles): `re-knockback.md` §9's [H] list.
+
+## History
+- 2026-09-28 filed by VDTH's RE as "BF1 knockback of living soldiers" (value 3). 2026-09-29 AUDIT VDTH: BF1 pushes
+  corpses too, the death kick is a velocity, the "resist" roll is ChunkFrequency (value 4).
+- 2026-09-30 planner: `alpha: yes` (explosions throwing soldiers). Showcase maps: BF1 NAB1, TAT1, YAV2; BF2 UTA1,
+  MYG1, HOT1.
+- 2026-10-07 RE (manual run, the workflow trial): report `reports/20261007_1731_card_KNOCK.md`. The card's "no BF2
+  class sets PushDeadOnly 0" was wrong (two do); the five skipped states are thrown, tumble, get-up and the two
+  mounted ones.

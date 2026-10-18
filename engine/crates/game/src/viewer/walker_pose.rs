@@ -1,0 +1,287 @@
+//! A walker drawn alive (card WSKN, `analysis/re-walker.md` §5, §6, §10):
+//! its skeleton posed from the integrator's anim state, each tick.
+//!
+//! - **The clip** is the anim-table entry `WalkerState::anim` at
+//!   `clip_time` (the integrator's player position, reversed walks
+//!   included), sampled between keyframes as a DRAWN PS2 walker is (§5).
+//!   DummyRoot's translation is held at rest by the bake: its z is the root
+//!   motion the integrator already moved the walker by (§4.9).
+//! - **The leg layers** (FUN_002a1d00): each leg pair's P+0x120 blend b
+//!   weighs the entry's `_leftup` layer by −b when b < 0, its `_rightup`
+//!   layer by b when b > 0, over the subtrees of the pair's two layer bones
+//!   (the class entry's +0x28 / +0x30 masks, FUN_002668c0). Only the AT-AT
+//!   ships layer clips. PROVISIONAL: the layer is a per-bone lerp from the
+//!   base pose by its weight — the player's own mix (+0x1340) is not read.
+//! - **§10's bones** (FUN_0025f050): bone 0 is yawed by the legs' 2h, the
+//!   quaternion (0, sin h, 0, cos h), so the model turns with the legs while
+//!   the entity matrix stays the body's; `bone_root` (the name hashing to
+//!   0x16e27226 — the anim CRC-32 of "bone_root") takes SkeletonRootScale,
+//!   the pitch (sin a, 0, 0, cos a) and the roll (0, 0, R.s, R.c).
+//!   PROVISIONAL: the order of those products (every shipped clip keeps
+//!   both bones' rotations at identity, where the order does not show).
+//!
+//! The pose is skinned on the CPU (one bone per vertex, the disc's
+//! softskin) into the model's per-submesh dynamic meshes, so a walker keeps
+//! the world path's passes, lighting and specular (`super::vehicles`).
+
+use crate::skin::{Clip, Pose, Skeleton};
+use core::vehicle::walker::WalkerState;
+use glam::{Mat4, Quat, Vec3};
+
+/// The anim CRC-32 of the pitch/roll bone's name (§10).
+pub const BONE_ROOT: &str = "bone_root";
+
+/// The layers of an anim-table entry (FUN_002a0c78), as the bake names them.
+pub const LAYERS: [&str; 3] = ["", "_leftup", "_rightup"];
+
+/// One walker model's skeleton, its clips by anim-table entry and layer,
+/// and each leg pair's layer mask.
+pub struct WalkerRig {
+    pub skeleton: Skeleton,
+    clips: Vec<Clip>,
+    /// Per anim-table entry: its base, `_leftup` and `_rightup` clip.
+    entries: Vec<[Option<usize>; 3]>,
+    /// Per leg pair: the bones its layers move.
+    masks: Vec<Vec<bool>>,
+    bone_root: Option<usize>,
+}
+
+impl WalkerRig {
+    /// The rig from a skin GLB's skeleton and clips and the class's walker
+    /// record (its entries' clip names and its pairs' layer bones).
+    pub fn new(skeleton: Skeleton, clips: Vec<Clip>, walker: &manifest::ManifestWalker) -> Self {
+        let find = |name: &str| clips.iter().position(|c| c.name.eq_ignore_ascii_case(name));
+        let entries = walker
+            .clips
+            .iter()
+            .map(|c| match c {
+                Some(c) => LAYERS.map(|l| find(&format!("{}{l}", c.name))),
+                None => [None; 3],
+            })
+            .collect();
+        let masks = walker
+            .layer_bones
+            .iter()
+            .map(|pair| {
+                let mut m = vec![false; skeleton.len()];
+                for b in pair.iter().filter_map(|n| skeleton.index_of(n)) {
+                    mark_subtree(&skeleton, b, &mut m);
+                }
+                m
+            })
+            .collect();
+        let bone_root = skeleton.index_of(BONE_ROOT);
+        Self {
+            skeleton,
+            clips,
+            entries,
+            masks,
+            bone_root,
+        }
+    }
+
+    /// The local pose of walker state `w` (every bone, parent space), before
+    /// SkeletonRootScale.
+    pub fn pose(&self, w: &WalkerState) -> Pose {
+        let entry = self.entries.get(usize::from(w.anim));
+        let sample = |layer: usize| {
+            let c = entry.and_then(|e| e[layer]).map(|k| &self.clips[k])?;
+            Some(c.sample(&self.skeleton, w.clip_time * c.fps, false))
+        };
+        let mut pose = sample(0).unwrap_or_else(|| Pose::bind(&self.skeleton));
+        for (mask, &b) in self.masks.iter().zip(&w.layer_blend) {
+            let (layer, weight) = if b < 0.0 {
+                (1, -b)
+            } else if b > 0.0 {
+                (2, b)
+            } else {
+                continue;
+            };
+            let Some(lp) = sample(layer) else { continue };
+            for (k, _) in mask.iter().enumerate().filter(|(_, &m)| m) {
+                pose.0[k] = pose.0[k].blend(lp.0[k], weight.min(1.0));
+            }
+        }
+        // FUN_0025f050: bone 0 turns with the legs (2h).
+        let (c, s) = w.h;
+        if let Some(b0) = pose.0.first_mut() {
+            b0.rotation = (Quat::from_xyzw(0.0, s, 0.0, c) * b0.rotation).normalize();
+        }
+        if let Some(r) = self.bone_root.and_then(|r| pose.0.get_mut(r)) {
+            let (sa, ca) = w.pitch.sin_cos();
+            let (rc, rs) = w.roll;
+            r.rotation = (r.rotation
+                * Quat::from_xyzw(sa, 0.0, 0.0, ca)
+                * Quat::from_xyzw(0.0, 0.0, rs, rc))
+            .normalize();
+        }
+        pose
+    }
+
+    /// The joint palette of walker state `w` for a class whose
+    /// SkeletonRootScale is `root_scale`.
+    pub fn palette(&self, w: &WalkerState, root_scale: f32) -> Vec<Mat4> {
+        let mut locals = self.pose(w).locals();
+        if let Some(r) = self.bone_root.filter(|_| root_scale != 1.0) {
+            locals[r] *= Mat4::from_scale(Vec3::splat(root_scale));
+        }
+        self.skeleton.palette(&locals)
+    }
+
+    /// Node `name`'s model-space matrix as walker state `w` poses it: what
+    /// an `AnimatedPilotPosition` rider hangs by (card VRIDE,
+    /// `analysis/re-vehicle-riders.md` 2.1 [O]). `None` when the skeleton
+    /// has no such node.
+    pub fn node_now(&self, w: &WalkerState, root_scale: f32, name: &str) -> Option<Mat4> {
+        let n = self.skeleton.index_of(name)?;
+        Some(self.palette(w, root_scale)[n] * self.skeleton.global_bind[n])
+    }
+}
+
+/// Mark `bone` and every bone below it.
+fn mark_subtree(skel: &Skeleton, bone: usize, mask: &mut [bool]) {
+    mask[bone] = true;
+    for k in 0..skel.len() {
+        if skel.parents[k] == Some(bone) && !mask[k] {
+            mark_subtree(skel, k, mask);
+        }
+    }
+}
+
+/// Skin one vertex list by `palette` (one bone per vertex, `joints[i][0]`):
+/// positions through the joint matrix, normals through it and renormalised.
+/// A vertex whose bone is past the palette stays where it is.
+pub fn skin(
+    palette: &[Mat4],
+    positions: &[[f32; 3]],
+    normals: &[[f32; 3]],
+    joints: &[[u8; 4]],
+) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+    positions
+        .iter()
+        .zip(normals)
+        .zip(joints)
+        .map(|((p, n), j)| match palette.get(usize::from(j[0])) {
+            Some(m) => (
+                m.transform_point3(Vec3::from(*p)).to_array(),
+                m.transform_vector3(Vec3::from(*n))
+                    .normalize_or_zero()
+                    .to_array(),
+            ),
+            None => (*p, *n),
+        })
+        .unzip()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skin::BoneXform;
+
+    /// DummyRoot → bone_root → bone_l_thigh → bone_l_calf, one metre apart.
+    fn rig(with_layers: bool) -> WalkerRig {
+        let names = ["DummyRoot", "bone_root", "bone_l_thigh", "bone_l_calf"];
+        let skel = Skeleton::new(
+            names.iter().map(|s| s.to_string()).collect(),
+            vec![None, Some(0), Some(1), Some(2)],
+            (0..4)
+                .map(|i| {
+                    Mat4::from_translation(Vec3::new(0.0, if i == 0 { 0.0 } else { 1.0 }, 0.0))
+                })
+                .collect(),
+        );
+        let key = |q: Quat| {
+            vec![
+                BoneXform {
+                    rotation: q,
+                    translation: Vec3::Y
+                };
+                2
+            ]
+        };
+        let clip = |name: &str, thigh: Quat| Clip {
+            name: name.into(),
+            fps: 30.0,
+            frames: 2,
+            tracks: vec![None, None, Some(key(thigh)), None],
+        };
+        let mut clips = vec![clip("idle", Quat::IDENTITY)];
+        if with_layers {
+            clips.push(clip("idle_leftup", Quat::from_rotation_x(1.0)));
+            clips.push(clip("idle_rightup", Quat::from_rotation_x(-1.0)));
+        }
+        let walker = manifest::ManifestWalker {
+            bank: "test".into(),
+            clips: vec![Some(manifest::ManifestWalkerClip {
+                name: "idle".into(),
+                frames: 2,
+                duration: 1.0 / 30.0,
+                looping: false,
+                root_z: vec![0.0, 0.0],
+            })],
+            prims: vec![],
+            skin: Some("test".into()),
+            layer_bones: vec![["bone_l_thigh".into(), "bone_r_thigh".into()]],
+        };
+        WalkerRig::new(skel, clips, &walker)
+    }
+
+    fn angle_x(q: Quat) -> f32 {
+        let (axis, a) = q.to_axis_angle();
+        a * axis.x.signum()
+    }
+
+    #[test]
+    fn the_leftup_layer_takes_minus_b_and_the_rightup_layer_b() {
+        let r = rig(true);
+        let mut w = WalkerState::default();
+        w.layer_blend[0] = -0.25;
+        assert!((angle_x(r.pose(&w).0[2].rotation) - 0.25).abs() < 1e-4);
+        w.layer_blend[0] = 0.5;
+        assert!((angle_x(r.pose(&w).0[2].rotation) + 0.5).abs() < 1e-4);
+        // The layer moves only its bones' subtrees: bone_root holds.
+        assert!(r.pose(&w).0[1].rotation.abs_diff_eq(Quat::IDENTITY, 1e-6));
+        // No layer clips: the base pose.
+        let plain = rig(false);
+        assert!(plain.pose(&w).0[2]
+            .rotation
+            .abs_diff_eq(Quat::IDENTITY, 1e-6));
+    }
+
+    #[test]
+    fn bone_zero_turns_by_the_legs_two_h_and_bone_root_pitches_two_a() {
+        let r = rig(false);
+        let mut w = WalkerState::default();
+        let h: f32 = 0.2;
+        w.h = (h.cos(), h.sin());
+        w.pitch = 0.1;
+        let p = r.pose(&w);
+        let (axis, a) = p.0[0].rotation.to_axis_angle();
+        assert!((a - 2.0 * h).abs() < 1e-5 && axis.y > 0.99);
+        assert!((angle_x(p.0[1].rotation) - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_bind_pose_skins_every_vertex_where_it_is() {
+        let r = rig(false);
+        let pal = r.palette(&WalkerState::default(), 1.0);
+        let (p, n) = skin(
+            &pal,
+            &[[0.3, 2.5, 0.1]],
+            &[[0.0, 0.0, 1.0]],
+            &[[2, 0, 0, 0]],
+        );
+        assert!(Vec3::from(p[0]).abs_diff_eq(Vec3::new(0.3, 2.5, 0.1), 1e-5));
+        assert!(Vec3::from(n[0]).abs_diff_eq(Vec3::Z, 1e-5));
+        // SkeletonRootScale scales about bone_root: a thigh vertex 1.5 m
+        // above it sits 3 m above it at scale 2.
+        let pal = r.palette(&WalkerState::default(), 2.0);
+        let (p, _) = skin(
+            &pal,
+            &[[0.0, 2.5, 0.0]],
+            &[[0.0, 1.0, 0.0]],
+            &[[2, 0, 0, 0]],
+        );
+        assert!((p[0][1] - 4.0).abs() < 1e-5, "{p:?}");
+    }
+}

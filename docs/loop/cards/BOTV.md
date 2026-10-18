@@ -1,0 +1,77 @@
+---
+id: BOTV
+title: The redesigned bots are on main: re-take BOTM's table (8 seeds x 32 maps + the PS2 column) on main after every BOTD build card has landed and check each of BOTD's bars - the gate the maintainer set in front of PERF and UCNT (2026-10-02 17:40)
+milestone: M3
+value: 5
+phase: measure
+status: todo
+deps: SAIR,BOTD,JITR,FFLN,OBST,BOTM,FGHT,SPL11,HUBP,MOVR,LLEG,RETW,TPOS,TEAM,TURR,FLNK,GRAI,TIER,TCMP,LOC3,MOVR2,OBSF,OBST2,OBSV,OBSR,FGHTA,REACT,TGAP,GRAIA,MOUTH,DAGS,RLOOP,CLSE2
+files:
+declares:
+needs:
+effort:
+branch:
+resume:
+created: 2026-10-02
+alpha: yes
+---
+## Why
+The maintainer, INBOX 2026-10-02 17:40: "the bot programme (incl. every build card BOTD cuts) -> PERF -> UCNT ... do not hand out PERF before the redesigned bots are on main." BOTD closes when its note is written and its build cards are opened, long before they land; this card is the one place every bot build card is listed, so PERF and UCNT wait on ONE id and nobody has to remember to edit three dep lists.
+
+## Rule for BOTD (and anyone who cuts a bot build card)
+Every build card cut from `analysis/bot-design.md` goes into THIS card's `deps:` (`loopctl.py set BOTV deps=...`) in the same session that creates it. PERF and UCNT depend on BOTV (planner 2026-10-02 17:45).
+
+## What to do
+1. On main with every dep landed: `sweep_seeds.py --botq` (BOTM's instrument, 8 seeds x 32 maps) and the PS2 column from `scripts/bot_quality_ps2.json`.
+2. One table per bar BOTD set (`analysis/bot-design.md`: which numbers must equal the PS2's, which must beat it): main | bar | PS2 | pass?
+3. The maintainer's F9 scene (`lead_tmp/jitr/snapshot_20261002_kam1_f9.json`, BF2 KAM1 at (-4, 60.3, 108.6)): reversals per 10 s within 20 m and team kills in 60 s.
+4. A failed bar becomes a card (value 5) and goes into this card's deps; this card closes only when every bar passes or the maintainer waives one in INBOX.
+
+## Acceptance
+- The bars table pasted with every row PASS (or a waiver line from the maintainer); 256 / 256 rounds finish over 8 seeds.
+- Before this card: BOTM's numbers at its landing (analysis/bot-quality.md) - worst gaps: staying-window path 6-20 m (PS2 1-9), teammate within 1.5 m 12-22 % (PS2 2-9), enemy within 20 m 2-4 % (PS2 15-19), team kills 16-26 % of kills.
+
+## BOTD (2026-10-03) - the bars are `analysis/bot-design.md` section 10 (B1-B14)
+- deps now name every build card of the design: SPL11, HUBP, MOVR, OBST, LLEG, RETW, FGHT, TPOS, TEAM, TURR, FLNK, GRAI, TIER, TCMP (ENGR and PWAI are adopted but not gating).
+- Before judging the EQUAL bands (B2, B5, B6, B7) add PS2 captures on two showcase maps (BF2 MYG1, UTA1) with BOTM's samplers: today the PS2 column is four maps, one capture each.
+- New counters to read: B9 (unexplained standing; card MOVR), B12 (fight time at a covered position; card TPOS), the share of bot time inside a soldier barrier (`lead_tmp/botd/tools/inbarr.py`: the PS2's 0.3-1.2 %), B13 (`lead_tmp/botd/tools/sample.sh` + `prof_keys.py`).
+
+## Planner 2026-10-03 03:35 - LOC3 added to deps; the baseline for the relative bars
+- **deps += LOC3** (audit HUBM's card: the PS2's 3-D locate; it moves every bot's path, is alpha and value 4). A table
+  taken before it lands would be stale by one locate change. ENGR and PWAI stay out, as BOTD decided.
+  Undo: `loopctl.py set BOTV deps=<the list without LOC3>`.
+- **Bars B10 ("each class halved") and B14 ("lost and recycled not up") need a "before" from the commit the chain
+  starts at** - the parent of the first bot build card's landing (SPL11 is a pure move, so either side of it). The
+  numbers in the note are older than three landings that moved them: OBST's 5.39 % is from 7b64fcd; HUBM took the
+  8-seed recycles 347 -> 215 and TAT1's hunting 42 -> 0.6 % of on-foot time, JARC 215 -> 206, PWUP moved the sweep.
+  Judged against the old numbers the redesign would be credited with HUBM's gain. Step 1 therefore also builds that
+  commit in a scratch worktree (one base for both sides) and takes the same table there.
+- HUBM's report and its audit asked for "BOTM's TAT1 row" to be re-taken: BOTM's table has no TAT1 row (KAM1, POL1,
+  DEA1, KAS2). TAT1 is in this card's 32 maps; no separate card was opened.
+
+## Notes
+- 2026-10-04 (the maintainer's playtest, via Claude): a bar for the redesign - "ai bots tend to just bunch up all next to each other on tighter maps like kamino when they encounter an enemy. They should do a better job at spreading out while being in the area of fighting ... When they're all next to each other you just throw a grenade and they're all dead." `playtest/pete_20261004/4_kam1_bots_bunched.png`. Measure on KAM1 and two other tight maps: of the bots in a fight, how many stand inside one grenade's blast radius of another (before the chain, and after); the bar is set from the before number and written here.
+- 2026-10-05 planner - **The maintainer has read the bot design: "BOTD read, go" (INBOX 2026-10-03 14:08). All eight decisions take the note's defaults; the 16 deviations D1-D16 are all on. This card is released (BOTD is done).** The bars of bot-design.md section 10 stand as written. Decisions that change what a bar expects: no garrison (4), flank share 20 % (5), no sprint (6), no corpse shot (7), one think rate (8).
+- 2026-10-05 (the maintainer, via Claude): a second bar beside the 2026-10-04 grenade one - "I'm seeing bots just walk and then when I come near and they switch to firefight mode, everyone stops in their tracks which puts them all right next to each other. They should move around in the area, spread out a little bit or something." Measure: of the bots that enter a fight while walking in a group (3+ within 5 m), the share that are still within 2 m of where they stood 3 s later, and the group's mean nearest-neighbour distance 5 s into the fight; before the chain and after.
+- 2026-10-06 planner, three things for the table's reader. (1) **HUBP landed with one of its four bars missed** (408bc9c): a teammate within 1.5 m on BF2 POL1 13.9 % against the PS2's 5.7 % (bar 12.3); what is left there is bots standing at posts ("hold" 6.6 %, `lead_tmp/hubp/ab/near.py`) and files down a corridor of hubs under 2 m radius - TPOS / TEAM's ground, so POL1's row is the one to read first. All 32 maps: mean 12.5 -> 7.2 %. (2) **BF1 Bespin Platforms got worse with HUBP** (deaths under the floor 147 -> 234 in 8 rounds; card BESR, post-alpha, after OBST and MOVR): if BESR has not landed when this table is taken, say so beside BES1's row. (3) **Named deviation D17 is on** (LOC3, 2026-10-06): units are located by the port's XZ locate + level rule, posts by the PS2's 3-D locate. Card LOC3B re-measures that after MOVR / OBST / LLEG; it is NOT in this card's deps (decision: the maintainer's gate in front of PERF is not lengthened by a value-3 re-measure). If LOC3B has not run, the table is D17's.
+- 2026-10-07 planner. (1) **Take the table after SPRD** (eece09f): bots' held fire stays tight 1.5 s (`TIGHT_HOLD_SECS_AI`), hits / shots 19.6 -> 21.0 % over 32 maps on one seed, a bot's far-range hit rate on a still dummy 0.25 -> 0.47 at 40 m; the kill-rate column against the PS2's was not re-taken. (2) **OBST landed in part** (e9ce6db; no report yet as I write, the session went on to OBSF): one-side commitment, the inside corner, the early turn for a small body. Its commit message says the barrier keep-out, vehicle footprints, soldiers in velocity space and the probe's cost (bars B10's barrier share and B13) 'are card OBST2' - **no card OBST2 exists yet (00:25). If none exists when you read this, the planner files it from bot-design.md 4.7 items 1-4 and adds it to this card's deps.** (3) deps += OBSF (the maintainer's Kamino scene: a holder circling a crate's rim, 17 reversals; in progress on lane 1) and MOVR2 is value 5 now. (4) Bars already read by a landing: B1 met on 4 maps and B2 missed on 3 (MOVR), HUBP's teammate-within-1.5 m rose a little with MOVR (KAM1 6.5 -> 7.2 %, POL1 14.0 -> 14.8 %; PS2 6.6 / 5.7) - TEAM's. HUBO (Hoth's hub centres, audit HUBP) and LOC3B are NOT in the deps. Undo (3): `loopctl.py set BOTV deps=...` without OBSF.
+
+- AUDIT OBST 2026-10-07 (PARTLY): card OBSR (value 5) - OBST holds bots at BF1 Tatooine's rock gap and BF1 Naboo's ruins column (both showcase maps) and adds 31 % to Bespin's falls. This table's B10 ("no spot recycles on 2 or more seeds") will carry them unless OBSR lands first: the planner may add it to `deps`. And B10's recycle count alone does not see the Naboo column (its recycles fell 102 -> 26 while the time bots spend there doubled): add unit-seconds at the top spots, or `lead_tmp/audit-obst/tools/laps.py`'s lap windows, to the table.
+- 2026-10-07 08:55 planner. **deps += OBSR, FGHTA** (the two audits of this morning: OBST PARTLY, FGHT PARTLY). OBSR is in progress on lane 1; FGHTA and OBST2 are raised 4 -> 5 so the picker reaches them (at 4 neither came in 44 picks and this card with them). For the table's reader: (1) LLEG (c0794eb) cured the Naboo Plains column by seating the spawn on top of it - B10's Naboo spot is a spawn pen, not steering; (2) MOVR2 (6f6160b) took one PS2 rule of four (the leg aim), B2 is still missed on Kamino (path), the Death Star and Kashyyyk 2; (3) FGHT (69f8c84) did not meet its own contact bars (Kamino 3.7 % against 12, Polis Massa 24.2 against 28) - FGHT2 owns them; (4) GRAI (79f1890): self kills 9 in 32 rounds, recycles 59 -> 82 over 8 seeds, not traced (note on RETW); (5) the PS2 "standing still" share by the port's measure is 24 % (attack rows, Kamino and Polis Massa), the port's fighters 49 / 56 % (audit FGHT). Undo the deps: remove the two IDs.
+- 2026-10-07 (the maintainer, via Claude): a bar from card REACT: of the fighter-seconds in which a bot has just been hit, the share spent standing still, per tier, before and after the chain.
+- AUDIT GRAI 2026-10-07 for bar B4 (team kills of kills, at most 3 % on every map): on main (8 seeds) team + self kills of kills are bf2_tan1 5.1 %, bf2_dea1 3.3 %, bf2_cor1 3.0 %, bf2_pol1 3.0 %; with the bots' grenade never forced every map is at or under 2.9 % (tan1 2.0 %), with card GRAI off five maps are over (tan1 4.3, pol1 4.0). Card GRAIA step 5 owns it (`lead_tmp/audit-grai/README.md`). New card GRAIA is not in this card's deps: planner's call (it is GRAI's audit follow-up, as FGHTA is FGHT's).
+- 2026-10-09 (card FGHT2, `needs: maintainer`): **bar B5 (an enemy within 20 m) is under a question to the maintainer.** The PS2's
+  number is a product of BF2's 4-8 s think away from the player (`analysis/re-soldier-ai.md` 15.5: knocked into the
+  port it takes Kamino 3.5 -> 10.3 %, the Death Star 5.9 -> 15.8, Polis Massa 22.4 -> 27.9; BF1 Kashyyyk Docks is at
+  the PS2's 5.3 % already, 4.9). With today's sharp bots B5 is met on Polis Massa and Kashyyyk Docks only. Until he
+  answers, read B5 as "reported, not gated" (the default taken) and do not hold BOTV for FGHT2. A like-for-like
+  replacement that does not depend on the think: died with an enemy inside 10 m (the PS2 56-77 %, main 18-51 %) -
+  also a product of it. New card CLSE (value 4) is FGHT2's follow-up; whether it joins this card's deps is the
+  planner's call.
+- 2026-10-09 (card FGHT2's session): **FGHT2 taken out of `deps`** - it waits on the maintainer (`needs:`) and would hold this
+  card, PERF and UCNT with it; under the default taken (today's sharp bots) it has nothing left to build. Undo:
+  put FGHT2 back in `deps` if the maintainer picks answer (b) or (c).
+
+- 2026-10-09 12:45 planner. **deps += REACT, TGAP, GRAIA** (FGHT2 stays out, as its session left it). REACT: this card already carries a bar from it (the 10-07 note above) and it changes what every fighter does when hit. TGAP: bar B10 (no spot recycles on 2 or more seeds) is missed by BF1 Tatooine's shut footpath alone (44 of the map's 47 recycles in 32 rounds; a showcase map; one build session). GRAIA: bar B4 is missed on Tantive IV and the Death Star by the bots' grenades. In the dry run (`lead_tmp/planner_1009_dry.py`) this card is the 16th pick and PERF the 18th. For the table's reader: (1) OBSR (d9db73c) met 4 of its 11 bars - recycles ROSE 197 -> 284 over 32 seeds because the watch now sees bots that lapped unseen; read recycles with `lead_tmp/obsr/tools/recbox.py`, not as a count; (2) FGHTA (b75d36b): contact 10.69 -> 11.16 %, Kamino's scene 47.3 -> 45.3 % still - the port's fighters still stand about twice as long as the PS2's; (3) BSPN (the PS2's spawn draw) is built and NOT on main (waits on the maintainer); if it lands, Bespin Platforms' row moves (world deaths 14.4 -> 18.9 %); (4) WALKB1 (eec32d1) turned BF1 Tatooine's wins from 4 / 4 to 0 / 8 over 8 seeds (the AT-STs steer now). Undo: `loopctl.py set BOTV deps=<the list without the three>`.
+
+- 2026-10-12 11:10 planner. **deps += MOUTH, RLOOP** (the maintainer's orders, INBOX 10-11 14:40 and 18:30), **DAGS** (the standing on Dagobah is bar B9's "unexplained standing" and the debt of BSPN's approval; it is `first: 2` anyway) and **CLSE2** (my call: it rewrites the aim error on both games - BF1 gets none, BF2 the target's own block - so every kill-rate and contact row moves with it; value 5, so it does not hold this card behind the fours). Undo: `loopctl.py set BOTV deps=<the list without them>`. GRAIA is done (e931532), BSPN is on main (2d1fb60; not a dep). NOT added: FGHTB (4; BF1's assassin droid stands where the PS2's circles - read BF1's CIS rows knowing it), CLSE4 (5 now, after CLSE2; see below), CLSE3 (4). For the table's reader, from audit CLSE (`reports/20261012_1104_audit_CLSE.md`): **bar B5 moved the wrong way with CLSE** - an enemy within 20 m 12.63 -> 10.27 % of unit-seconds on the 17 BF2 maps (Kamino 4.1 -> 2.5 against the PS2's 12-20), deaths with an enemy inside 10 m 30.3 -> 25.0 % (the PS2's Kamino 42-70); the cause is the port's fire beyond 30 m (2.2-3.2 x the PS2's damage per aimer-second), card CLSE4. `lead_tmp/audit-clse/tools/contact_spells.py <sweep dir>` prints the nearest enemy at death: put that row in the table. B4 (team kills): GRAIA's landing reads at most 2.4 % on any map (bf2_dea1), REACT's branch read 3.72 / 2.21 % on Bespin Platforms on two blocks - look again.

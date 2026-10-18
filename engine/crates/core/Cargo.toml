@@ -1,0 +1,18 @@
+[package]
+name = "core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+parry3d.workspace = true
+libm.workspace = true
+
+# Test-only: every `ron::` use in this crate is inside `#[cfg(test)] mod tests`
+# (check with `grep -n 'ron::' src/sim/input.rs` — line numbers are deliberately not
+# quoted here, they rotted twice). The sim itself reads no RON — `game` does the
+# loading and hands `core` typed values.
+[dev-dependencies]
+ron.workspace = true

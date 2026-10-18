@@ -1,0 +1,184 @@
+//! A bot's seat gun (card VTAI): the pad a seated bot makes for its seat's
+//! weapons. `Sim::seat_gun` then moves the look and the aimer and fires, as
+//! it does for a human, and holds the shot to the fairness rule.
+//!
+//! The rules are on foot's (`behave::think`, `gunner_foot::run`): the target is the one this
+//! bot's perception SEES (`perception::scan` looks from the seat's eye along
+//! the gun's look), aimed at through the lead point and the aim error (BF2: the target's own);
+//! FIRE waits for the tier's reaction, the weapon's range, D11's bursts and
+//! pauses, and the gun within [`AIM_TOLERANCE`] of the aim point.
+//!
+//! OURS, PROVISIONAL (the PS2's AI gunner, B1 FUN_00223850's MountedTurret
+//! acquisition, re-vehicles §9, is located, not transcribed): the look goes
+//! straight at the aim point at the aimer's full stick rates — the seat's
+//! rates stand in for on foot's D9 tracker; the tolerance is a cone about the
+//! BARREL (on foot's is per axis about the look); with nothing seen the look
+//! returns to the aimer's rest; a charge weapon in a seat is never fired.
+//! A building turret's look turns by the PS2's rate law (card VTURL,
+//! `gun::Turn`): the bot asks for the rate that would stop on its aim -
+//! at most what the filter can brake from (BF1 `gap x filter`, BF2
+//! `sqrt(2 filter gap)`) and the gap in one tick - and turns the short way
+//! round a turret that wraps.
+
+use super::gunner_foot::{fire_discipline, seen_aim};
+use super::state::AiState;
+use super::AIM_TOLERANCE;
+use crate::fmath;
+use crate::perception;
+use crate::sim::{buttons, PadState, Sim};
+use crate::unit::UnitHandle;
+use crate::vehicle::gun;
+
+/// Whose look [`aim`] moves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Look {
+    /// A gunner: both axes at the aimer's rates.
+    Seat,
+    /// A hover's pilot: the right stick's x is the driver's turn, so only
+    /// the pitch moves.
+    Steering,
+    /// A walker's pilot (card WAI): the look is the walker's own aim, moved
+    /// by its integrator at the class's rates (re-walker §3 I7-I15) — the
+    /// PS2's AI aims it with the same one-tick stick (re-walker-ai §4).
+    Walker { yaw_rate: f32, pitch_rate: f32 },
+}
+
+/// Aim `me`'s seat gun and press FIRE when the shot is on.
+pub(super) fn aim(sim: &Sim, me: UnitHandle, st: &mut AiState, pad: &mut PadState, look: Look) {
+    let (Some(s), Some(u)) = (sim.seat_look(me), sim.unit(me)) else {
+        return;
+    };
+    let Some(w) = s.gun.weapons.first() else {
+        return;
+    };
+    let wc = &sim.weapon_classes[w.class];
+    let skill = sim.difficulty.skill_at(u.skill);
+    let tier = sim.difficulty.tier();
+    let held = st.target.and_then(|h| perception::contact_of(st, h));
+    let enemy = held.filter(|c| c.seen_now).and_then(|c| sim.unit(c.handle));
+    let point = enemy.map(|e| seen_aim(sim, me, st, s.eye, e, wc.ordnance.velocity, wc));
+
+    if let (Look::Seat, Some(t)) = (look, s.gun.turn) {
+        let want = point.map(|p| gun::angles(s.rot.inverse() * (p - s.eye)));
+        turn_stick(&t, s.look, want, pad);
+    } else {
+        // The look: `Sim::seat_gun` turns yaw by −rx·rate·dt and pitch by
+        // +ry·rate·dt, so the stick that closes the gap in one tick, clamped.
+        let a = s.gun.aimer;
+        let want = point.map_or(a.rest(), |p| gun::angles(s.rot.inverse() * (p - s.eye)));
+        let want = (
+            want.0.clamp(a.yaw[0], a.yaw[1]),
+            want.1.clamp(a.pitch[0], a.pitch[1]),
+        );
+        let dt = crate::TICK_DT;
+        let (yaw_rate, pitch_rate) = match look {
+            Look::Walker {
+                yaw_rate,
+                pitch_rate,
+            } => (yaw_rate, pitch_rate),
+            _ => (a.yaw_rate, a.pitch_rate),
+        };
+        let yaws = match look {
+            Look::Seat => !s.gun.pilot,
+            Look::Steering => false,
+            Look::Walker { .. } => true,
+        };
+        if yaws && yaw_rate > 0.0 {
+            pad.rx = PadState::quantize(((s.look.0 - want.0) / (yaw_rate * dt)).clamp(-1.0, 1.0));
+        }
+        if pitch_rate > 0.0 {
+            pad.ry = PadState::quantize(((want.1 - s.look.1) / (pitch_rate * dt)).clamp(-1.0, 1.0));
+        }
+    }
+
+    fire_discipline(sim, me, u, st, wc, &skill);
+    let (Some(e), Some(p)) = (enemy, point) else {
+        return;
+    };
+    let on = (p - s.muzzle).normalize_or_zero().dot(s.barrel) >= fmath::sin_cos(AIM_TOLERANCE).1;
+    let range = (e.capsule().center() - s.muzzle).length();
+    let ready = held.is_some_and(|c| perception::fireable(&c, sim.tick, tier.reaction_ticks));
+    if ready
+        && on
+        && range <= wc.ordnance.max_range()
+        && sim.tick >= st.pause_until
+        && wc.max_pressed_time <= 0.0
+    {
+        pad.buttons |= buttons::FIRE;
+    }
+}
+
+/// The sticks that turn a [`gun::Turn`] look toward `want` (the rest when
+/// `None`) and stop there.
+fn turn_stick(t: &gun::Turn, look: (f32, f32), want: Option<(f32, f32)>, pad: &mut PadState) {
+    let want = want.unwrap_or(t.rest());
+    let dt = crate::TICK_DT;
+    let axis = |cur: f32, w: f32, l: [f32; 2], wraps: bool, speed: f32, filter: f32| {
+        let gap = if wraps {
+            gun::wrap(w - cur)
+        } else {
+            w.clamp(l[0], l[1]) - cur
+        };
+        let brake = match t.slew {
+            gun::Slew::Exp => gap.abs() * filter,
+            gun::Slew::Linear => (2.0 * filter * gap.abs()).sqrt(),
+        };
+        let rate = brake.min(gap.abs() / dt).copysign(gap);
+        if speed > 0.0 {
+            (rate / speed).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    let y = axis(look.0, want.0, t.yaw, t.yaw_wrap, t.yaw_speed, t.yaw_filter);
+    let p = axis(
+        look.1,
+        want.1,
+        t.pitch,
+        t.pitch_wrap,
+        t.pitch_speed,
+        t.pitch_filter,
+    );
+    pad.rx = PadState::quantize(-y);
+    pad.ry = PadState::quantize(p);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vehicle::gun::{wrap, Slew, Turn};
+
+    const DEG: f32 = std::f32::consts::PI / 180.0;
+
+    /// Card VTURL: on a full-circle turret (BF2's dish, BF1's gun turret)
+    /// the bot's stick turns the look the short way across the seam, and
+    /// settles on its aim within a degree without swinging past it by more
+    /// than two.
+    #[test]
+    fn a_bots_stick_turns_a_full_circle_turret_the_short_way_and_stops() {
+        for (slew, speed) in [(Slew::Linear, 1.0), (Slew::Exp, 0.85)] {
+            let t = Turn::from_class(
+                Some([-180.0, 180.0]),
+                Some([-10.0, 35.0]),
+                (speed, speed),
+                (10.0, 10.0),
+                slew,
+            );
+            let want = (170.0 * DEG, -20.0 * DEG);
+            let (mut look, mut rate) = ((-170.0 * DEG, 0.0), (0.0, 0.0));
+            let mut past = 0.0f32;
+            for _ in 0..60 {
+                let mut pad = PadState::default();
+                turn_stick(&t, look, Some(want), &mut pad);
+                let stick = (PadState::axis(pad.rx), PadState::axis(pad.ry));
+                (look, rate) = t.step(look, rate, stick, crate::TICK_DT);
+                // The short way is DOWN through -180: never up past -170.
+                assert!(wrap(look.0 + 170.0 * DEG) <= 1e-4, "{slew:?}: {look:?}");
+                past = past.max(-wrap(look.0 - want.0));
+            }
+            assert!(wrap(look.0 - want.0).abs() < DEG, "{slew:?}: {look:?}");
+            assert!((look.1 - want.1).abs() < DEG, "{slew:?}: {look:?}");
+            assert!(past < 2.0 * DEG, "{slew:?}: swung {} deg past", past / DEG);
+        }
+    }
+}

@@ -1,0 +1,899 @@
+//! Perception (Phase C decision 2): what an AI unit KNOWS about its enemies,
+//! and the rule that makes the top tiers fair — a bot may aim or fire only at
+//! a contact its perception holds.
+//!
+//! The shapes are the PS2's (`analysis/re-ai-difficulty.md` §5.1/§5.2/§9.1,
+//! quoted by the lead in `engine/artifacts/briefs/brief_phase_c.md` D6): a
+//! bounded memory of six contacts per unit, a 77.5° half-angle view cone with
+//! BF2's 10 m omni-directional bubble, a view distance of the shape
+//! `(20·bound_radius + 30) × mult × visibility`, and a line-of-sight ray that
+//! is the SAME one the AI's shots have to fly through. The tier columns that
+//! scale them (`view_mult`, `reaction_ticks`, `pressure`) are the lead's
+//! PROVISIONAL placeholders in [`crate::skill`], not RE.
+//!
+//! Nothing here reads wall time or the LCG: a scan is a pure function of the
+//! sim state, so it replays bit-exactly.
+
+use crate::ai::{AiState, THINK_PERIOD};
+use crate::collision::HullFilter;
+use crate::sim::Sim;
+use crate::skill::Tier;
+use crate::soldier::Stance;
+use crate::unit::{capsule_height, UnitHandle};
+use glam::Vec3;
+
+/// Threat slots per unit (the PS2's six, RE §5.2). The array keeps
+/// [`AiState`] `Copy`.
+pub const CONTACTS: usize = 6;
+
+/// cos 77.5° — the view cone's half-angle in BOTH games (RE §9.1). The
+/// constant is cited, not computed from a degree value at runtime.
+pub const COS_CONE: f32 = 0.21644;
+
+/// A contact is forgotten this many ticks after it was last seen or heard
+/// (3 s, design decision 2).
+pub const MEMORY_TICKS: u64 = 90;
+
+/// A shot fired within this radius is heard (m). PROVISIONAL (lead
+/// placeholder, no RE).
+pub const HEAR_RADIUS: f32 = 30.0;
+
+/// The visibility factor of the view-distance shape (RE §5.1). The port has
+/// no concealment byte (RE §5.3), so it is 1.0 — PROVISIONAL.
+pub const VIS: f32 = 1.0;
+
+/// Minimum ticks between target switches (1.5 s, RE §5.2).
+pub const RETARGET_TICKS: u64 = 45;
+
+/// A new target must beat the current one by this much to take it over
+/// (RE §5.2).
+pub const HYSTERESIS: f32 = 10.0;
+
+/// One remembered enemy. `last_pos` is where it was when it was last SEEN or
+/// HEARD — the point a unit that lost sight aims and walks at.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Contact {
+    pub handle: UnitHandle,
+    /// Tick the slot was created — the reaction timer's zero.
+    pub first_seen: u64,
+    /// Tick of the last sighting or hearing.
+    pub last_seen: u64,
+    pub last_pos: Vec3,
+    /// Seen by THIS think (eyes on it right now).
+    pub seen_now: bool,
+    /// The last record came from hearing, not sight.
+    pub heard: bool,
+}
+
+impl Contact {
+    /// Feed into the sim hash. Every field: two units whose memories differ
+    /// are different worlds even when they are looking at the same enemy.
+    pub fn hash_into(&self, eat: &mut impl FnMut(&[u8])) {
+        eat(&self.handle.index.to_le_bytes());
+        eat(&self.handle.gen.to_le_bytes());
+        eat(&self.first_seen.to_le_bytes());
+        eat(&self.last_seen.to_le_bytes());
+        for v in [self.last_pos.x, self.last_pos.y, self.last_pos.z] {
+            eat(&v.to_bits().to_le_bytes());
+        }
+        eat(&[self.seen_now as u8, self.heard as u8]);
+    }
+
+    /// Age in seconds since the last record.
+    pub fn age_s(&self, tick: u64) -> f32 {
+        tick.saturating_sub(self.last_seen) as f32 / crate::TICK_HZ as f32
+    }
+}
+
+/// The AI's line of sight: the terrain sheet first, then the world's
+/// `coll`/`prim` bodies on the ORDNANCE layer — the same two tests a bolt
+/// flies through (`analysis/re-collision-layers.md` §4, `FUN_00162E88`).
+///
+/// This was `ai::visible`; Phase C moved it here so the sweep's diagnostic
+/// column and the AI cannot drift apart again (brief D5).
+///
+/// Every vehicle hull blocks it (card VHULL); [`los_past`] skips some.
+pub fn los(sim: &Sim, from: Vec3, to: Vec3) -> bool {
+    los_past(sim, from, to, HullFilter::All)
+}
+
+/// [`los`] through the hulls `hulls` does not admit — a rider's own vehicle
+/// and its target's, whose centres sit inside them.
+pub fn los_past(sim: &Sim, from: Vec3, to: Vec3, hulls: HullFilter) -> bool {
+    los_terrain(sim, from, to) && los_world_past(sim, from, to, hulls)
+}
+
+/// Both vehicles `a` and `b` ride in, skipped ([`HullFilter::Except`]).
+pub fn past_mounts(sim: &Sim, a: UnitHandle, b: UnitHandle) -> HullFilter {
+    let m = |h| sim.unit(h).and_then(|u| u.mount).map(|m| m.vehicle);
+    HullFilter::Except([m(a), m(b)])
+}
+
+/// The terrain half of [`los`] — `true` when the heightfield does not block.
+pub fn los_terrain(sim: &Sim, from: Vec3, to: Vec3) -> bool {
+    match ray(from, to) {
+        Some((dir, len)) => sim.terrain_ray(from, dir, len, 1.0).is_none(),
+        None => true,
+    }
+}
+
+/// The model half of [`los`] — `true` when no `coll`/`prim` body blocks.
+pub fn los_world(sim: &Sim, from: Vec3, to: Vec3) -> bool {
+    los_world_past(sim, from, to, HullFilter::All)
+}
+
+/// [`los_world`] seeing only the hulls `hulls` admits.
+pub fn los_world_past(sim: &Sim, from: Vec3, to: Vec3, hulls: HullFilter) -> bool {
+    match ray(from, to) {
+        Some((dir, len)) => sim
+            .collision
+            .ray_with(from, dir, len, crate::collision::Layers::ORDNANCE, hulls)
+            .is_none(),
+        None => true,
+    }
+}
+
+/// `(direction, length)`, or `None` for a degenerate ray (which is clear).
+fn ray(from: Vec3, to: Vec3) -> Option<(Vec3, f32)> {
+    let d = to - from;
+    let len = d.length();
+    (len >= 1e-3).then(|| (d / len, len))
+}
+
+/// The PS2's view distance (RE §5.1): `(20·bound_radius + 30) × mult × vis`.
+///
+/// PROVISIONAL in one respect: the PS2's bound radius is the target MODEL's,
+/// ours is half the capsule height (unit.rs), so a standing soldier is seen
+/// at 49 m at mult 1.0, a crouching one at 46 m and a prone one at 35.5 m —
+/// about 14 m less than the PS2 would give a prone target.
+pub fn view_distance(stance: Stance, view_mult: f32) -> f32 {
+    (20.0 * (capsule_height(stance) * 0.5) + 30.0) * view_mult * VIS
+}
+
+/// The view cone (RE §9.1, exactly): everything inside `omni_radius` is seen
+/// regardless of facing (BF2's 10 m bubble; BF1 has none), then the 77.5°
+/// half-angle test on the squared distance. `off` is target − eye.
+pub fn in_cone(view: Vec3, off: Vec3, d2: f32, omni_radius: f32) -> bool {
+    if d2 < omni_radius * omni_radius || d2 <= 1e-4 {
+        return true;
+    }
+    let dot = view.dot(off);
+    dot > 0.0 && d2 * COS_CONE * COS_CONE < dot * dot
+}
+
+/// A contact may be FIRED at once the tier's reaction time has passed since
+/// the slot was created, and only while it is seen right now. A contact that
+/// was HEARD first counts its reaction from the hearing — a shot you heard is
+/// warning, which is what makes a heard contact useful at all.
+pub fn fireable(c: &Contact, tick: u64, reaction_ticks: u64) -> bool {
+    c.seen_now && tick.saturating_sub(c.first_seen) >= reaction_ticks
+}
+
+/// This unit's record of `h`, if it holds one.
+pub fn contact_of(st: &AiState, h: UnitHandle) -> Option<Contact> {
+    st.contacts
+        .iter()
+        .flatten()
+        .find(|c| c.handle == h)
+        .copied()
+}
+
+/// One perception pass for unit `me`: age the memory, look, listen.
+/// Returns `(contacts held, records made by hearing)` for the diagnostics.
+///
+/// Runs inside the think's `next_think` block, so at most once every
+/// [`THINK_PERIOD`] ticks — detection is quantised by that cadence (a unit
+/// that walks into view right after a think is seen up to 9 ticks later), and
+/// the measured time-to-first-shot is `U(0, 0.33 s) + reaction_s`.
+pub fn scan(sim: &Sim, me: UnitHandle, st: &mut AiState, tier: Tier) -> (u8, u8) {
+    let Some(u) = sim.unit(me) else {
+        return (0, 0);
+    };
+    let tick = sim.tick;
+    // A bot in an armed seat looks from the seat's eye along its gun's look
+    // (card VTAI); any other seat, and on foot, the soldier's own.
+    let (eye, view) = sim
+        .seat_look(me)
+        .map_or_else(|| (u.muzzle(), u.aim_frame().0), |s| (s.eye, s.view));
+
+    // 1. Age the memory. Nothing is seen until this think proves it, a record
+    //    older than MEMORY_TICKS is forgotten, and a dead or recycled handle
+    //    is dropped (a respawn is a new generation, so the slot cannot follow
+    //    a unit through death).
+    for slot in st.contacts.iter_mut() {
+        let gone = match slot {
+            Some(c) => {
+                c.seen_now = false;
+                tick.saturating_sub(c.last_seen) > MEMORY_TICKS || sim.unit(c.handle).is_none()
+            }
+            None => false,
+        };
+        if gone {
+            *slot = None;
+        }
+    }
+
+    // 2. Look. The cone and the view distance are cheap and cull first; the
+    //    LOS ray is the cost driver, so it runs in ascending distance (unit
+    //    index order on ties) and stops once six enemies are seen.
+    let mut cand: Vec<(f32, u32, UnitHandle, Vec3)> = Vec::new();
+    for (h, o) in sim.alive_units() {
+        if h == me || o.team == u.team {
+            continue;
+        }
+        let p = o.capsule().center();
+        let off = p - eye;
+        let d2 = off.dot(off);
+        if !in_cone(view, off, d2, sim.omni_radius) {
+            continue;
+        }
+        let vd = view_distance(o.soldier.stance, tier.view_mult);
+        if d2 >= vd * vd {
+            continue;
+        }
+        cand.push((d2, h.index, h, p));
+    }
+    cand.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    // The unit's own target is always ray-tested first, so a firefight never
+    // loses its target to five closer bodies it has not shot at yet.
+    if let Some(t) = st.target {
+        if let Some(i) = cand.iter().position(|c| c.2 == t) {
+            let c = cand.remove(i);
+            cand.insert(0, c);
+        }
+    }
+    let mut seen = 0usize;
+    for &(_, _, h, p) in &cand {
+        if seen >= CONTACTS {
+            break;
+        }
+        if los_past(sim, eye, p, past_mounts(sim, me, h)) {
+            see(st, h, tick, p);
+            seen += 1;
+        }
+    }
+
+    // 3. Listen (no cone, no LOS): a shot fired inside HEAR_RADIUS since the
+    //    last think, and — at any range — whoever hit me.
+    let mut heard = 0u8;
+    for (h, o) in sim.alive_units() {
+        if h == me || o.team == u.team {
+            continue;
+        }
+        let shot = tick
+            .checked_sub(o.last_shot_tick)
+            .is_some_and(|d| d < THINK_PERIOD)
+            && (o.soldier.pos - eye).length_squared() < HEAR_RADIUS * HEAR_RADIUS;
+        let hit_me = u
+            .last_hit
+            .is_some_and(|(s, t)| s == h && tick.checked_sub(t).is_some_and(|d| d < THINK_PERIOD));
+        if (shot || hit_me) && hear(st, h, tick, o.soldier.pos) {
+            heard += 1;
+        }
+    }
+
+    let held = st.contacts.iter().flatten().count() as u8;
+    (held, heard)
+}
+
+/// A NEW target restarts the aim tracker at the unit's own facing (brief D9)
+/// and drops the tracked position, so the error's growth term is not paid for
+/// a jump between two different enemies. The error RADIUS itself persists —
+/// it is a property of the shooter, not of the target (LEAD ADDENDUM 4a).
+fn restart_tracker(st: &mut AiState) {
+    st.aim_dir = Vec3::ZERO;
+    st.aim_vel = Vec3::ZERO;
+    st.err_pos = Vec3::ZERO;
+}
+
+/// The slot for `h`: its own, else a free one, else the one whose record is
+/// oldest (lowest slot index on ties). A new slot starts the reaction timer.
+fn slot_for(st: &mut AiState, h: UnitHandle, tick: u64, pos: Vec3) -> usize {
+    if let Some(i) = st
+        .contacts
+        .iter()
+        .position(|c| c.is_some_and(|c| c.handle == h))
+    {
+        return i;
+    }
+    let fresh = Contact {
+        handle: h,
+        first_seen: tick,
+        last_seen: tick,
+        last_pos: pos,
+        seen_now: false,
+        heard: false,
+    };
+    let i = match st.contacts.iter().position(Option::is_none) {
+        Some(i) => i,
+        None => (0..CONTACTS)
+            .min_by_key(|&i| st.contacts[i].map_or(u64::MAX, |c| c.last_seen))
+            .unwrap_or(0),
+    };
+    st.contacts[i] = Some(fresh);
+    i
+}
+
+fn see(st: &mut AiState, h: UnitHandle, tick: u64, pos: Vec3) {
+    let i = slot_for(st, h, tick, pos);
+    if let Some(c) = st.contacts[i].as_mut() {
+        c.last_seen = tick;
+        c.last_pos = pos;
+        c.seen_now = true;
+        c.heard = false;
+    }
+}
+
+/// Record a heard enemy. Returns `false` when the unit already has EYES on it
+/// this think — sight is the better record and hearing must not overwrite it
+/// (the design's "seen_now stays false" for a heard record).
+fn hear(st: &mut AiState, h: UnitHandle, tick: u64, pos: Vec3) -> bool {
+    if contact_of(st, h).is_some_and(|c| c.seen_now) {
+        return false;
+    }
+    let i = slot_for(st, h, tick, pos);
+    if let Some(c) = st.contacts[i].as_mut() {
+        c.last_seen = tick;
+        c.last_pos = pos;
+        c.heard = true;
+    }
+    true
+}
+
+/// Target choice over the memory (design decision 3): nearest-first with the
+/// originals' +10 hysteresis and 1.5 s minimum interval, plus the tier's
+/// PRESSURE weight for human targets.
+///
+/// The SCALE (200 / 100 over the standing view distance) is the port's — the
+/// PS2's `120000 − metric` is in untraced units (RE §5.1) — PROVISIONAL.
+///
+/// Returns true when the tracker TOOK a target this call (the first, or
+/// another in place of the held one): B1's tracker asks the soldier's
+/// `AcquiredTargetSound` then, with no test that it differs from the last
+/// (`FUN_0024d6d0` 167335; card UCALL, re-unit-chatter.md 2.2).
+pub fn choose_target(sim: &Sim, me: UnitHandle, st: &mut AiState, tier: Tier) -> bool {
+    let Some(u) = sim.unit(me) else {
+        return false;
+    };
+    let eye = u.muzzle();
+    let tick = sim.tick;
+    let scale = view_distance(Stance::Stand, tier.view_mult);
+    let score = |c: &Contact| -> f32 {
+        let d = (c.last_pos - eye).length();
+        let human = sim.unit(c.handle).is_some_and(|o| o.is_player);
+        let base = (200.0 - 100.0 * d / scale) * if human { tier.pressure } else { 1.0 };
+        if c.seen_now {
+            // Card HVYW (OURS): a bot with a launcher prefers the vehicle.
+            base + sim
+                .unit(c.handle)
+                .map_or(0.0, |o| crate::ai::vehicle_bonus(sim, u, o))
+        } else {
+            base - 10.0 * c.age_s(tick)
+        }
+    };
+    let mut best: Option<(f32, UnitHandle)> = None;
+    for c in st.contacts.iter().flatten() {
+        let s = score(c);
+        if best.is_none_or(|(bs, _)| s > bs) {
+            best = Some((s, c.handle));
+        }
+    }
+    let held = st.target.and_then(|h| contact_of(st, h));
+    match (held, best) {
+        // A target that left the memory is dropped at once — no interval, no
+        // hysteresis: the unit has nothing to aim at any more.
+        (None, best) => {
+            if let Some((_, h)) = best {
+                st.target = Some(h);
+                st.last_switch = tick;
+                restart_tracker(st);
+                return true;
+            }
+            st.target = None;
+        }
+        (Some(cur), Some((bs, bh))) => {
+            if bh != cur.handle
+                && tick.saturating_sub(st.last_switch) >= RETARGET_TICKS
+                && bs > score(&cur) + HYSTERESIS
+            {
+                st.target = Some(bh);
+                st.last_switch = tick;
+                restart_tracker(st);
+                return true;
+            }
+        }
+        (Some(_), None) => {}
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{think, AiState, THINK_PERIOD};
+    use crate::collision::{Body, Shape};
+    use crate::heightfield::Heightfield;
+    use crate::sim::{buttons, Sim};
+    use crate::skill::Difficulty;
+    use crate::unit::{Controller, UnitSpec};
+    use glam::Mat4;
+
+    /// Flat ground everywhere (without a heightfield units spawn at
+    /// `NO_GROUND` and fall away from anything placed for them).
+    fn ground() -> Heightfield {
+        Heightfield {
+            size: 2,
+            unit: 4000.0,
+            offset_x: 2000.0,
+            offset_z: 2000.0,
+            heights: vec![0.0; 4],
+        }
+    }
+
+    /// An AI soldier at the origin facing −Z, on flat ground.
+    fn watcher(seed: u32) -> (Sim, crate::unit::UnitHandle) {
+        let mut s = Sim::empty(seed);
+        s.heightfield = Some(ground());
+        let a = s
+            .spawn(&UnitSpec {
+                controller: Controller::Ai,
+                ..UnitSpec::trooper(0, Vec3::ZERO)
+            })
+            .unwrap();
+        (s, a)
+    }
+
+    fn enemy_at(s: &mut Sim, p: Vec3) -> crate::unit::UnitHandle {
+        s.spawn(&UnitSpec::trooper(1, p)).unwrap()
+    }
+
+    fn normal() -> Tier {
+        Difficulty::Normal.tier()
+    }
+
+    /// Line of sight is blocked by a WORLD model, not only by terrain: an
+    /// enemy on the far side of a wall body is invisible, and visible the
+    /// moment the wall is gone. Before this the AI shot through every
+    /// building on the map. (Phase C moved this test with `ai::visible` →
+    /// `perception::los`, brief D5.)
+    #[test]
+    fn a_wall_body_blocks_line_of_sight() {
+        let build = |wall: bool| {
+            let (mut s, a) = watcher(11);
+            let b = enemy_at(&mut s, Vec3::new(0.0, 0.0, -20.0));
+            if wall {
+                // Halfway between them, y in (0, 10): taller and wider than
+                // either soldier, so nothing sees over or round it.
+                s.collision.push_body(Body::new(
+                    Mat4::from_translation(Vec3::new(0.0, 5.0, -10.0)),
+                    Shape::Box {
+                        half: Vec3::new(5.0, 5.0, 0.5),
+                    },
+                ));
+            }
+            (s, a, b)
+        };
+        let eye_and_target = |s: &Sim, a, b| {
+            (
+                s.unit(a).unwrap().muzzle(),
+                s.unit(b).unwrap().capsule().center(),
+            )
+        };
+
+        let (s, a, b) = build(true);
+        let (eye, tgt) = eye_and_target(&s, a, b);
+        assert!(!los(&s, eye, tgt), "the wall blocks");
+        assert!(!los(&s, tgt, eye), "and blocks looking back");
+        // The terrain half alone still says clear — it is the world ray that
+        // is doing the work here, and the two halves are what the sweep's
+        // `BLOCKED terrain|world|both` column reads.
+        assert!(los_terrain(&s, eye, tgt), "terrain is clear");
+        assert!(!los_world(&s, eye, tgt), "the world body is not");
+
+        let (s, a, b) = build(false);
+        let (eye, tgt) = eye_and_target(&s, a, b);
+        assert!(los(&s, eye, tgt), "no wall, clear");
+        // A wall PAST the target does not block it.
+        let (mut s, a, b) = build(false);
+        s.collision.push_body(Body::new(
+            Mat4::from_translation(Vec3::new(0.0, 5.0, -30.0)),
+            Shape::Box {
+                half: Vec3::new(5.0, 5.0, 0.5),
+            },
+        ));
+        let (eye, tgt) = eye_and_target(&s, a, b);
+        assert!(los(&s, eye, tgt), "the wall is behind the target");
+
+        // ... and the AI acts on it: it targets the enemy it can see and
+        // never the one behind the wall.
+        let targeted = |wall: bool| {
+            let (s, a, _) = build(wall);
+            let mut st = AiState::default();
+            think(&s, a, &mut st);
+            st.target
+        };
+        assert!(targeted(false).is_some(), "targets a visible enemy");
+        assert_eq!(targeted(true), None, "never targets through a wall");
+    }
+
+    /// The cone is the PS2's (RE §9.1): a 77.5° half-angle about the aim
+    /// direction, with BF2's 10 m omni bubble that BF1 does not have.
+    #[test]
+    fn the_view_cone_is_77_5_degrees_over_bf2s_ten_metre_omni() {
+        let view = Vec3::new(0.0, 0.0, -1.0);
+        let at = |deg: f32, dist: f32| {
+            let r = deg.to_radians();
+            Vec3::new(r.sin() * dist, 0.0, -r.cos() * dist)
+        };
+        for &omni in &[0.0f32, 10.0] {
+            for &(deg, inside) in &[
+                (0.0, true),
+                (60.0, true),
+                (77.0, true),
+                (78.0, false),
+                (120.0, false),
+            ] {
+                let off = at(deg, 20.0);
+                assert_eq!(
+                    in_cone(view, off, off.dot(off), omni),
+                    inside,
+                    "{deg}° at 20 m, omni {omni}"
+                );
+            }
+        }
+        // Behind the unit at 5 m: BF2 sees it (inside the bubble), BF1 does
+        // not (RE §9.1 — BF1 has the same cone with NO omni).
+        let back = at(180.0, 5.0);
+        let d2 = back.dot(back);
+        assert!(in_cone(view, back, d2, 10.0), "BF2's 10 m omni");
+        assert!(!in_cone(view, back, d2, 0.0), "BF1 has no omni");
+        // The bubble ends exactly at its radius.
+        let just_out = at(180.0, 10.5);
+        assert!(!in_cone(view, just_out, just_out.dot(just_out), 10.0));
+    }
+
+    /// The view distance is `(20·bound_radius + 30) × mult × vis` with the
+    /// bound radius half the capsule height (RE §5.1; PROVISIONAL — the PS2's
+    /// bound is the model's).
+    #[test]
+    fn view_distance_by_stance_and_tier() {
+        let close = |a: f32, b: f32| assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        close(view_distance(Stance::Stand, 1.0), 49.0);
+        close(view_distance(Stance::Crouch, 1.0), 46.0);
+        close(view_distance(Stance::Prone, 1.0), 35.5);
+        // The tiers scale it: Easy 0.8, Normal 1.0, Hard 1.25, Elite 1.5.
+        for (d, mult) in [
+            (Difficulty::Easy, 0.8),
+            (Difficulty::Normal, 1.0),
+            (Difficulty::Hard, 1.25),
+            (Difficulty::Elite, 1.5),
+        ] {
+            close(
+                view_distance(Stance::Stand, d.tier().view_mult),
+                49.0 * mult,
+            );
+        }
+        // ... and an enemy just past it is not a contact.
+        let (mut s, a) = watcher(3);
+        enemy_at(&mut s, Vec3::new(0.0, 0.0, -50.0));
+        let mut st = AiState::default();
+        assert_eq!(scan(&s, a, &mut st, normal()), (0, 0), "50 m > 49 m");
+        let (mut s, a) = watcher(3);
+        enemy_at(&mut s, Vec3::new(0.0, 0.0, -48.0));
+        let mut st = AiState::default();
+        assert_eq!(scan(&s, a, &mut st, normal()).0, 1, "48 m < 49 m");
+        // Easy sees the same enemy 10 m closer only.
+        let mut st = AiState::default();
+        assert_eq!(scan(&s, a, &mut st, Difficulty::Easy.tier()).0, 0);
+    }
+
+    /// A contact is kept for MEMORY_TICKS after the last sighting and cleared
+    /// on the think after that.
+    #[test]
+    fn memory_expires_three_seconds_after_the_last_sighting() {
+        let (mut s, a) = watcher(5);
+        let e = enemy_at(&mut s, Vec3::new(0.0, 0.0, -20.0));
+        let mut st = AiState::default();
+        scan(&s, a, &mut st, normal());
+        let c = contact_of(&st, e).expect("seen");
+        assert!(c.seen_now && !c.heard && c.first_seen == 0);
+        // Take the sight away (a wall between them) and step the clock.
+        s.collision.push_body(Body::new(
+            Mat4::from_translation(Vec3::new(0.0, 5.0, -10.0)),
+            Shape::Box {
+                half: Vec3::new(5.0, 5.0, 0.5),
+            },
+        ));
+        s.tick = MEMORY_TICKS;
+        scan(&s, a, &mut st, normal());
+        let c = contact_of(&st, e).expect("still remembered at 90 ticks");
+        assert!(!c.seen_now, "not seen, only remembered");
+        assert_eq!(c.last_pos, Vec3::new(0.0, 0.0, -20.0) + Vec3::Y * 0.95);
+        s.tick = MEMORY_TICKS + 1;
+        scan(&s, a, &mut st, normal());
+        assert_eq!(contact_of(&st, e), None, "forgotten at 91 ticks");
+    }
+
+    /// Six slots: a seventh enemy takes the slot whose record is oldest.
+    #[test]
+    fn a_seventh_contact_evicts_the_oldest() {
+        let (mut s, a) = watcher(9);
+        let mut seen = Vec::new();
+        for i in 0..CONTACTS {
+            seen.push(enemy_at(&mut s, Vec3::new(i as f32 * 2.0, 0.0, -20.0)));
+        }
+        let mut st = AiState::default();
+        assert_eq!(scan(&s, a, &mut st, normal()).0, CONTACTS as u8);
+        // Age the first contact only: hide it behind a wall, keep the rest.
+        s.collision.push_body(Body::new(
+            Mat4::from_translation(Vec3::new(0.0, 5.0, -10.0)),
+            Shape::Box {
+                half: Vec3::new(0.9, 5.0, 0.5),
+            },
+        ));
+        s.tick = 30;
+        scan(&s, a, &mut st, normal());
+        assert!(!contact_of(&st, seen[0]).unwrap().seen_now, "hidden");
+        // A seventh enemy arrives; the memory is full, so the oldest goes.
+        let newcomer = enemy_at(&mut s, Vec3::new(-4.0, 0.0, -18.0));
+        s.tick = 60;
+        scan(&s, a, &mut st, normal());
+        assert_eq!(contact_of(&st, seen[0]), None, "the oldest was evicted");
+        assert!(contact_of(&st, newcomer).is_some(), "the seventh is held");
+        assert_eq!(st.contacts.iter().flatten().count(), CONTACTS);
+    }
+
+    /// A first sighting is not a shot: the tier's reaction time must pass
+    /// first (`reaction_ticks`, PROVISIONAL). Normal is 9 ticks (0.3 s).
+    #[test]
+    fn a_first_sighting_only_fires_after_the_reaction_time() {
+        let (mut s, a) = watcher(13);
+        enemy_at(&mut s, Vec3::new(0.0, 0.0, -20.0));
+        let r = normal().reaction_ticks;
+        assert_eq!(r, 9);
+        let mut st = AiState::default();
+        // Tick 0: seen for the first time, no shot.
+        let (pad, _) = think(&s, a, &mut st);
+        assert!(st.target.is_some(), "target acquired");
+        assert_eq!(pad.buttons & buttons::FIRE, 0, "no shot on sight");
+        let c = contact_of(&st, st.target.unwrap()).unwrap();
+        assert!(!fireable(&c, 0, r) && !fireable(&c, r - 1, r));
+        assert!(fireable(&c, r, r), "fireable once the reaction has passed");
+        assert!(THINK_PERIOD > r, "the reaction is inside one think period");
+        // ... and the think agrees: nothing before tick r, and the trigger
+        // does go down after it (the aim tracker's slew, brief D9, still costs
+        // a few ticks of alignment).
+        for t in 1..r {
+            s.tick = t;
+            let (pad, _) = think(&s, a, &mut st);
+            assert_eq!(pad.buttons & buttons::FIRE, 0, "no shot at tick {t}");
+        }
+        let mut fired = None;
+        for t in r..r + 60 {
+            s.tick = t;
+            let (pad, _) = think(&s, a, &mut st);
+            if pad.buttons & buttons::FIRE != 0 {
+                fired = Some(t);
+                break;
+            }
+        }
+        assert!(fired.is_some(), "fires once the reaction has passed");
+    }
+
+    /// Hearing (design decision 2): a shot inside HEAR_RADIUS is a contact
+    /// with no line of sight at all; one outside it is not; and being hit
+    /// records the shooter at any range.
+    #[test]
+    fn hearing_records_a_shooter_behind_a_wall() {
+        let heard_at = |dist: f32| {
+            let (mut s, a) = watcher(17);
+            // Behind the listener AND behind a wall: neither the cone nor
+            // the LOS ray can find this one.
+            let e = enemy_at(&mut s, Vec3::new(0.0, 0.0, dist));
+            s.collision.push_body(Body::new(
+                Mat4::from_translation(Vec3::new(0.0, 5.0, dist / 2.0)),
+                Shape::Box {
+                    half: Vec3::new(5.0, 5.0, 0.5),
+                },
+            ));
+            s.units[e.index as usize].last_shot_tick = 0;
+            s.tick = 1;
+            let mut st = AiState::default();
+            let counts = scan(&s, a, &mut st, normal());
+            (counts, contact_of(&st, e))
+        };
+        let ((held, heard), c) = heard_at(25.0);
+        assert_eq!((held, heard), (1, 1), "a shot at 25 m is heard");
+        let c = c.expect("heard contact");
+        assert!(c.heard && !c.seen_now, "heard, not seen");
+        assert_eq!(c.last_pos, Vec3::new(0.0, 0.0, 25.0), "the shooter's feet");
+        let ((held, heard), c) = heard_at(35.0);
+        assert_eq!((held, heard), (0, 0), "a shot at 35 m is not");
+        assert_eq!(c, None);
+
+        // Being HIT records the shooter at any range.
+        let (mut s, a) = watcher(19);
+        let e = enemy_at(&mut s, Vec3::new(0.0, 0.0, 80.0));
+        s.units[a.index as usize].last_hit = Some((e, 0));
+        s.tick = 1;
+        let mut st = AiState::default();
+        assert_eq!(scan(&s, a, &mut st, normal()), (1, 1), "hit from 80 m");
+        assert!(contact_of(&st, e).unwrap().heard);
+    }
+
+    /// Target choice (decision 3): the current target is kept until a rival
+    /// beats it by more than HYSTERESIS, and never before RETARGET_TICKS.
+    #[test]
+    fn hysteresis_and_the_retarget_interval() {
+        // Two enemies in view; the score is the distance term alone (no
+        // humans, both seen), so the closer one wins by
+        // 100·(d₂ − d₁)/view_dist points.
+        let scale = view_distance(Stance::Stand, 1.0);
+        let gap = |points: f32| points * scale / 100.0;
+        let build = |second: f32| {
+            let (mut s, a) = watcher(23);
+            let far = enemy_at(&mut s, Vec3::new(0.0, 0.0, -30.0));
+            let near = enemy_at(&mut s, Vec3::new(0.0, 0.0, -(30.0 - second)));
+            (s, a, far, near)
+        };
+        // Start with the FAR one as the target, at tick 0.
+        let run = |second: f32, tick: u64| {
+            let (mut s, a, far, near) = build(second);
+            s.tick = tick;
+            let mut st = AiState {
+                target: Some(far),
+                last_switch: 0,
+                ..Default::default()
+            };
+            scan(&s, a, &mut st, normal());
+            // The far one must still be a contact for the "keeps" case to
+            // mean anything.
+            assert!(contact_of(&st, far).is_some());
+            choose_target(&s, a, &mut st, normal());
+            (st.target == Some(near), far, near)
+        };
+        let (switched, ..) = run(gap(9.0), RETARGET_TICKS);
+        assert!(!switched, "+9 points does not beat +10 hysteresis");
+        let (switched, ..) = run(gap(11.0), RETARGET_TICKS);
+        assert!(switched, "+11 points does");
+        let (switched, ..) = run(gap(11.0), RETARGET_TICKS - 1);
+        assert!(!switched, "... but never before the 1.5 s interval");
+        // A target that left the memory is dropped at once, interval or not.
+        let (mut s, a, far, near) = build(gap(11.0));
+        s.units[far.index as usize].alive = false;
+        let mut st = AiState {
+            target: Some(far),
+            last_switch: 0,
+            ..Default::default()
+        };
+        scan(&s, a, &mut st, normal());
+        choose_target(&s, a, &mut st, normal());
+        assert_eq!(st.target, Some(near), "a lost target is replaced at once");
+    }
+
+    /// The PRESSURE weight (decision 3): at Hard a human is worth ×1.3, so a
+    /// farther human outscores a nearer bot; at Normal (×1.0) it does not.
+    #[test]
+    fn the_pressure_weight_prefers_a_farther_human_at_hard() {
+        let pick = |tier: Tier| {
+            let mut s = Sim::empty(29);
+            s.heightfield = Some(ground());
+            let a = s
+                .spawn(&UnitSpec {
+                    controller: Controller::Ai,
+                    ..UnitSpec::trooper(0, Vec3::ZERO)
+                })
+                .unwrap();
+            let bot = s
+                .spawn(&UnitSpec::trooper(1, Vec3::new(4.0, 0.0, -10.0)))
+                .unwrap();
+            let human = s
+                .spawn(&UnitSpec::player_in_slot(0, 1, Vec3::new(0.0, 0.0, -30.0)))
+                .unwrap();
+            let mut st = AiState::default();
+            scan(&s, a, &mut st, tier);
+            assert_eq!(st.contacts.iter().flatten().count(), 2, "both in view");
+            choose_target(&s, a, &mut st, tier);
+            (st.target, bot, human)
+        };
+        let (t, bot, _) = pick(normal());
+        assert_eq!(t, Some(bot), "Normal takes the nearer bot");
+        let (t, _, human) = pick(Difficulty::Hard.tier());
+        assert_eq!(t, Some(human), "Hard leans on the human");
+    }
+
+    /// A unit that LOSES sight aims at the last known position and does not
+    /// fire at it (brief D7).
+    #[test]
+    fn a_remembered_target_is_aimed_at_but_never_shot_at() {
+        let (mut s, a) = watcher(31);
+        let e = enemy_at(&mut s, Vec3::new(0.0, 0.0, -20.0));
+        let mut st = AiState::default();
+        let mut fired = false;
+        for t in 0..60u64 {
+            s.tick = t;
+            let (pad, _) = think(&s, a, &mut st);
+            fired |= pad.buttons & buttons::FIRE != 0;
+        }
+        assert!(fired, "shoots what it sees");
+        // The enemy steps behind a wall: the memory keeps it, the trigger
+        // does not.
+        s.collision.push_body(Body::new(
+            Mat4::from_translation(Vec3::new(0.0, 5.0, -10.0)),
+            Shape::Box {
+                half: Vec3::new(5.0, 5.0, 0.5),
+            },
+        ));
+        s.tick += THINK_PERIOD;
+        let (pad, _) = think(&s, a, &mut st);
+        assert_eq!(st.target, Some(e), "still the target");
+        let c = contact_of(&st, e).unwrap();
+        assert!(!c.seen_now, "out of sight");
+        assert_eq!(pad.buttons & buttons::FIRE, 0, "never fires at a memory");
+    }
+
+    /// `PadState` is not part of this module's contract, but the fairness
+    /// rule is: every FIRE the AI presses is at a contact it holds.
+    #[test]
+    fn every_ai_shot_is_at_a_held_contact() {
+        let (mut s, a) = watcher(37);
+        enemy_at(&mut s, Vec3::new(0.0, 0.0, -20.0));
+        let mut st = AiState::default();
+        for t in 0..90u64 {
+            s.tick = t;
+            let (pad, _) = think(&s, a, &mut st);
+            if pad.pressed(buttons::FIRE) {
+                let target = st.target.expect("fired with no target");
+                assert!(contact_of(&st, target).is_some(), "fired at tick {t}");
+            }
+        }
+    }
+
+    /// The whole state a scan writes is hashed: two sims whose units carry
+    /// different memories must not hash alike.
+    #[test]
+    fn the_contact_memory_is_part_of_the_hash() {
+        let (mut s, a) = watcher(41);
+        let e = enemy_at(&mut s, Vec3::new(0.0, 0.0, -20.0));
+        let base = s.hash();
+        let mut st = AiState::default();
+        scan(&s, a, &mut st, normal());
+        s.units[a.index as usize].ai = st;
+        let with_contact = s.hash();
+        assert_ne!(base, with_contact, "a contact is state");
+        // Every field of the record, one at a time (`Sim` is not `Clone`, so
+        // each probe puts the slot back).
+        let probe = |s: &mut Sim, name: &str, f: &dyn Fn(&mut Contact)| {
+            let before = s.units[a.index as usize].ai.contacts[0];
+            f(s.units[a.index as usize].ai.contacts[0].as_mut().unwrap());
+            assert_ne!(s.hash(), with_contact, "{name} is state");
+            s.units[a.index as usize].ai.contacts[0] = before;
+            assert_eq!(s.hash(), with_contact, "{name} restored");
+        };
+        probe(&mut s, "first_seen", &|c| c.first_seen += 1);
+        probe(&mut s, "last_seen", &|c| c.last_seen += 1);
+        probe(&mut s, "last_pos", &|c| c.last_pos.x += 1.0);
+        probe(&mut s, "seen_now", &|c| c.seen_now = !c.seen_now);
+        probe(&mut s, "heard", &|c| c.heard = !c.heard);
+        probe(&mut s, "handle", &|c| c.handle.gen += 1);
+        // ... the empty slot's sentinel: dropping a contact must move it too.
+        let keep = s.units[a.index as usize].ai.contacts[0];
+        s.units[a.index as usize].ai.contacts[0] = None;
+        assert_ne!(s.hash(), with_contact, "an empty slot is state");
+        s.units[a.index as usize].ai.contacts[0] = keep;
+        // ... and the two `Unit` fields the hearing rule writes.
+        s.units[a.index as usize].last_shot_tick = 3;
+        assert_ne!(s.hash(), with_contact, "last_shot_tick is state");
+        s.units[a.index as usize].last_shot_tick = u64::MAX;
+        s.units[a.index as usize].last_hit = Some((e, 1));
+        assert_ne!(s.hash(), with_contact, "last_hit is state");
+        s.units[a.index as usize].last_hit = None;
+        assert_eq!(s.hash(), with_contact, "both restored");
+        // ... and the target / last_switch pair.
+        s.units[a.index as usize].ai.target = Some(e);
+        let with_target = s.hash();
+        assert_ne!(with_target, with_contact, "the target is state");
+        s.units[a.index as usize].ai.last_switch = 7;
+        assert_ne!(s.hash(), with_target, "last_switch is state");
+    }
+}

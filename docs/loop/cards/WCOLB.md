@@ -1,0 +1,23 @@
+---
+id: WCOLB
+title: Build the flat water's PS2 colour model: unlit, the LUT mean, the view-angle term (+ SpecularColor x (1 - V.y)^3), the speckle's sun lobe, the ocean at unity
+milestone: M1
+value: 5
+phase: build
+status: done
+deps:
+files: game/src/viewer/{look,scene}.rs, game/tests/water_look.rs, render/src/{shader.wgsl,lighting,frame,lib}.rs, CRATES.md
+declares: goldens=maps/bf1_kas1.png,maps/bf1_kas2.png,maps/bf1_nab2.png,maps/bf1_yav1.png,maps/bf2_kas2.png,maps/bf2_nab2.png,maps/bf2_yav1.png,maps/bf2_dea1.png,maps/bf2_fel1.png,maps/bf2_dag1.png,maps/bf2_kam1.png
+needs:
+branch: wcolb
+resume: landed 1f43333b 2026-09-25
+created: 2026-09-25 (from QUEUE.md)
+---
+
+## Why / Evidence / Acceptance
+- **Why:** the PS2's flat water is a light, see-through teal (a view-angle term); the port's is a dark lit tint with a white speckle mottle (PCSX2 F1/F8/F13/F18/F25).
+- **Evidence:** `analysis/re-water-colour.md` §0/§1/§5 [O] (VU1 overlay routine B/A, the ocean at unity), §2/§3 measured tables.
+- **Acceptance:** ci 0; gates show only the declared wet-map goldens move (bf1_kam1 expected still — its sea is the terrain plate); the PCSX2 pairs' water boxes move toward §2's "port + the PS2 terms" column.
+
+## Original QUEUE.md entry (verbatim, 2026-09-25)
+WCOLB. [TODO — ADDED 2026-09-25 (lane 1) by WCOL's [RE] half; the PCSX2 fix list's WCOL build (job C at medium); FREE; no dependency (SUND later corrects ĥ, see (4)); files `game/src/viewer/look.rs` (`water_look`, `speckle_look`, their tests), `game/src/viewer/scene.rs` (the water / speckle / foam draws' instance data), `render/src/shader.wgsl` (`fs_water`, `fs_speckle`, a world-position varying), `render/src/{lighting,frame,lib}.rs` (the water's light vector and view shift into the globals)] **The flat water's PS2 colour model — unlit, the LUT mean, the view-angle term, the speckle's sun lobe, the ocean at unity** [GOLDENS] — `analysis/re-water-colour.md` §0/§1/§5 [V][O]. Build: (1) `fs_water`: NO scene lighting on a Water draw; colour (GS/gamma terms, into the linear pipeline as `srgb_to_linear`) = MaxDiffuse/255 + `SpecularColor`.rgb/255·F, alpha = mean(Min.a, Max.a)/255 + `SpecularColor`.a/255·F, F = (1 − max(0, V̂.y))³ with V = (eye − 10·ĥ) − p per fragment (the 10 is the ELF's reset value, BF1 DAT_00564984 / BF2 DAT_0066168c), both clamped at 255/128, blend weight = texel.a × alpha clamped to 1; the per-vertex LUT noise (entries 5..15) may stand as the mean (PROVISIONAL [O]); (2) `fs_speckle`: colour = `SpeckleAmbientColor` + `SpeckleSpecularColor`·lobe³², weight = the same sum's alpha (TCC cleared), lobe = max(0, l̂·normalize((p − eye + SCS·ĥ) × (b4, −b8, b4))) with l̂ = normalize(−L.x·b4, −L.y·b8, −L.z·b4), (b4, b8) = `LightAzimAndElev` ((1, 0) on every map), SCS = `SpeckleCoordShift`; (3) the ocean base (both KAM1s) at unity and unlit, the foam's RGB at unity (`re-water-colour.md` §1.9); (4) L / ĥ = the PS2's light vector: until SUND lands derive it from the manifest's `sun_dir` per `re-water-colour.md` §4 (BF1 L = (s.z, s.y, −s.x), BF2 L = (s.x, s.y, −s.z)), PROVISIONAL, and say so where it is computed. The manifest already carries every field (`specular_color`, `speckle_ambient_color`, `speckle_coord_shift`, `light_azim_and_elev`) — no REBAKE expected; if one is missing, [REBAKE] `maps`. GATE: ci EXIT 0 (the look tests rewritten: MaxDiffuse, unlit, the ocean at 1.0); `scripts/gpu_tests.sh` 0 with the declared moves = the wet-map goldens `maps/bf1_kas1`, `bf1_kas2`, `bf1_nab2`, `bf1_yav1`, `bf2_kas2`, `bf2_nab2`, `bf2_yav1`, `bf2_dea1`, `bf2_fel1`, `bf2_dag1`, `bf2_kam1` (`bf1_kam1`'s sea is its terrain plate — expect no move; any other move is undeclared); re-render the PCSX2 pairs for bf1_kas2, bf1_yav1, bf1_nab2, bf2_fel1, bf2_yav1, bf2_kam1 (`engine/artifacts/pcsx2/port.py --all`, the pairs) and report the water boxes against `re-water-colour.md` §2's table — the scratch "port + the PS2 terms" column is the target, bed differences excepted (COMPARISON_RULES apply); no sim gate can move. Files: as listed.

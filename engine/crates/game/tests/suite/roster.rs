@@ -1,0 +1,1711 @@
+//! Tier-1 (data-gated): factions build from the baked side classes — every
+//! soldier class of a faction, the mission's own mix when the map ships one,
+//! the rifles reproducing the byte-verified fixtures, and soldier constants
+//! from the ODF chain (era mix loads both games).
+
+use core::weapon::{HealthType, WeaponClass};
+use game::mission::MissionDef;
+use game::roster::{ClassRoster, FactionRoster};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// The baked class RONs, baked ONCE per test binary: every test reads the
+/// same ten files, so the first caller bakes them and the rest share the dir.
+fn classes_dir() -> Option<PathBuf> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(bake_classes_dir).clone()
+}
+
+/// The shared dir's pid-scoped path. A static is never dropped, so the dir
+/// goes at process exit instead (queue CLN3: `/tmp` is a tmpfs and ci runs
+/// many times a night); `OPENBF_KEEP_SCRATCH=1` keeps it for triage.
+fn scratch_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("openbf-roster-classes-{}", std::process::id()))
+}
+
+extern "C" fn remove_scratch_dir() {
+    let _ = std::fs::remove_dir_all(scratch_dir());
+}
+
+extern "C" {
+    fn atexit(f: extern "C" fn()) -> std::os::raw::c_int;
+}
+
+fn bake_classes_dir() -> Option<PathBuf> {
+    let ex = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../extracted"));
+    // All four sides of BOTH discs: a BF2 GCW map fields `all`/`imp` out of
+    // BF2's own SIDE LVLs and a BF1 CW map fields `rep`/`cis` out of BF1's.
+    let files = [
+        ("bf1/lvl/DATA/_LVL_PS2/SIDE/ALL.LVL", "bf1_all.ron"),
+        ("bf1/lvl/DATA/_LVL_PS2/SIDE/IMP.LVL", "bf1_imp.ron"),
+        ("bf1/lvl/DATA/_LVL_PS2/SIDE/REP.LVL", "bf1_rep.ron"),
+        ("bf1/lvl/DATA/_LVL_PS2/SIDE/CIS.LVL", "bf1_cis.ron"),
+        (
+            "bf1/lvl/DATA/_LVL_PS2/COMMON/ENG/COMMON.LVL",
+            "bf1_common.ron",
+        ),
+        ("bf2/lvl/DATA/_LVL_PS2/SIDE/ALL.LVL", "bf2_all.ron"),
+        ("bf2/lvl/DATA/_LVL_PS2/SIDE/IMP.LVL", "bf2_imp.ron"),
+        ("bf2/lvl/DATA/_LVL_PS2/SIDE/REP.LVL", "bf2_rep.ron"),
+        ("bf2/lvl/DATA/_LVL_PS2/SIDE/CIS.LVL", "bf2_cis.ron"),
+        ("bf2/lvl/DATA/_LVL_PS2/INGAME.LVL", "bf2_ingame.ron"),
+    ];
+    if files.iter().any(|(rel, _)| !ex.join(rel).exists()) {
+        eprintln!("SKIP: extracted side LVLs not present");
+        return None;
+    }
+    let dir = scratch_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    if std::env::var_os("OPENBF_KEEP_SCRATCH").is_none() {
+        // SAFETY: libc's `atexit` with a plain `extern "C"` callback that
+        // cannot unwind (it discards the only fallible call's result).
+        unsafe { atexit(remove_scratch_dir) };
+    }
+    for (rel, out) in files {
+        bake::classes::bake_classes(
+            ex.join(rel).to_str().unwrap(),
+            dir.join(out).to_str().unwrap(),
+        )
+        .expect("bake classes");
+    }
+    Some(dir)
+}
+
+fn missions_dir() -> &'static Path {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../missions"))
+}
+
+/// Every faction, for the tests that want one disc's WHOLE class db rather
+/// than the two sides a particular round fields.
+const FOUR: [&str; 4] = ["all", "imp", "rep", "cis"];
+
+fn load_classdb_all(dir: &Path, game: &str) -> game::classdb::ClassDb {
+    game::roster::load_classdb(dir, game, &FOUR).expect("class db")
+}
+
+fn row(c: &ClassRoster) -> String {
+    format!(
+        "  {:<28} {:<22} {:<28} dmg {:>6.1}  vel {:>6.1}  clip {:>3}  delay {:?}  hp {:>7.1}  \
+         spd {:.1}  jet {}  min {} max {:?}",
+        c.class,
+        c.label,
+        c.weapon.name,
+        c.weapon.ordnance.max_damage,
+        c.weapon.ordnance.velocity,
+        c.weapon.rounds_per_clip,
+        c.weapon.shot_delay,
+        c.max_health,
+        c.consts.max_speed,
+        c.jet,
+        c.min,
+        c.max,
+    )
+}
+
+/// Every faction's DEFAULT list builds, with distinct primary weapons and a
+/// real ordnance behind each — the class table the README prints.
+#[test]
+fn every_faction_builds_its_whole_default_class_list() {
+    let Some(dir) = classes_dir() else { return };
+    for (game, a, b) in [
+        ("bf1", "all", "imp"),
+        ("bf1", "rep", "cis"),
+        ("bf2", "all", "imp"),
+        ("bf2", "rep", "cis"),
+    ] {
+        let ([ra, rb], _) = FactionRoster::pair(&dir, game, [a, b], None).expect("default rosters");
+        println!("== {game} map: {a} vs {b}");
+        for r in [&ra, &rb] {
+            println!("faction {} — {} classes", r.faction, r.classes.len());
+            for c in &r.classes {
+                println!("{}", row(c));
+            }
+            // Four, not five: BF1's CIS mission mix is four soldier droids
+            // plus `cis_inf_droideka`, which is a `walkerdroid` and is left
+            // out of the default list (as BF2's CIS list leaves it out too).
+            // Every other pair fields five or six.
+            assert!(
+                r.classes.len() >= if r.faction == "cis" { 4 } else { 5 },
+                "{}: only {} classes",
+                r.faction,
+                r.classes.len()
+            );
+            let mut weapons: Vec<&str> = r.classes.iter().map(|c| c.weapon.name.as_str()).collect();
+            let n = weapons.len();
+            weapons.sort_unstable();
+            weapons.dedup();
+            assert_eq!(
+                weapons.len(),
+                n,
+                "{}: two classes share a primary",
+                r.faction
+            );
+            for c in &r.classes {
+                assert!(
+                    c.weapon.ordnance.max_damage > 0.0 && c.weapon.ordnance.velocity > 0.0,
+                    "{} {}: ordnance {:?}",
+                    r.faction,
+                    c.class,
+                    c.weapon.ordnance
+                );
+                assert!(!c.label.is_empty());
+            }
+        }
+    }
+}
+
+/// The class-0 (fill) class of each faction still reproduces the v0 numbers:
+/// the byte-verified rifle fixtures and the ODF-chain soldier constants.
+#[test]
+fn fill_classes_keep_the_v0_fixtures() {
+    let Some(dir) = classes_dir() else { return };
+    let ([all, imp], _) =
+        FactionRoster::pair(&dir, "bf1", ["all", "imp"], None).expect("bf1 rosters");
+    let a = all.fill_class();
+    assert_eq!(a.class, "all_inf_soldier");
+    assert_eq!(a.max_health, 300.0);
+    assert_eq!(a.consts.max_speed, 6.5);
+    assert_eq!(a.consts.max_strafe_speed, 4.5);
+    assert_eq!(a.consts.max_turn_speed, 4.0);
+    assert_eq!(a.consts.acceleration, 70.0);
+    assert_eq!(a.spare_clips, 6);
+    assert_eq!(
+        a.weapon,
+        WeaponClass::bf1_rifle(),
+        "all rifle == §8.1 fixture"
+    );
+    let i = imp.fill_class();
+    assert_eq!(i.weapon.name, "imp_weap_inf_rifle");
+    assert_eq!(i.weapon.ordnance.max_damage, 60.0);
+    assert_eq!(i.spare_clips, 5);
+
+    // BF2 default matchup: constants through the four-level chain.
+    let ([rep, cis], _) =
+        FactionRoster::pair(&dir, "bf2", ["rep", "cis"], None).expect("bf2 rosters");
+    let r = rep.fill_class();
+    assert_eq!(r.class, "rep_inf_ep3_rifleman");
+    assert_eq!(r.max_health, 400.0);
+    assert_eq!(r.consts.max_speed, 7.0);
+    assert_eq!(r.consts.max_turn_speed, 5.0);
+    assert_eq!(
+        r.consts.roll_speed_factor, 1.5,
+        "ODF overrides the 1.7 ctor default"
+    );
+    assert_eq!(r.consts.energy_cost_roll, 25.0);
+    assert_eq!(r.consts.sprint_accelerate_time, 0.35);
+    let mut want = WeaponClass::bf2_rifle();
+    want.name = "rep_weap_inf_rifle".into();
+    assert_eq!(
+        r.weapon, want,
+        "rep rifle == §8.2 fixture via the ordc reskin chain"
+    );
+    assert_eq!(r.spare_clips, 4);
+    let c = cis.fill_class();
+    assert_eq!(c.health_type, HealthType::Droid);
+    assert_eq!(c.weapon.name, "cis_weap_inf_wrist_blaster");
+    assert!(c.weapon.ordnance.velocity > 0.0 && c.weapon.ordnance.max_damage > 0.0);
+
+    // Era mix (`--teams all,cis`): BOTH sides come off the MAP's disc, so the
+    // same pair of faction keys fields different classes on a BF1 map than on
+    // a BF2 one — which is the whole point of choosing the db by map.
+    let ([a, c], _) = FactionRoster::pair(&dir, "bf1", ["all", "cis"], None).expect("bf1 era mix");
+    assert_eq!(
+        (a.fill_class().class.as_str(), c.fill_class().class.as_str()),
+        ("all_inf_soldier", "cis_inf_battledroid")
+    );
+    let ([a2, c2], _) =
+        FactionRoster::pair(&dir, "bf2", ["all", "cis"], None).expect("bf2 era mix");
+    assert_eq!(
+        (
+            a2.fill_class().class.as_str(),
+            c2.fill_class().class.as_str()
+        ),
+        ("all_inf_rifleman", "cis_inf_rifleman")
+    );
+    assert!(FactionRoster::pair(&dir, "bf1", ["all", "ewok"], None).is_err());
+}
+
+/// BF1 `AddUnitClass` order reaches the roster: tat1i's Alliance is five
+/// classes with the desert trooper first and its own per-class count.
+#[test]
+fn tat1_alliance_roster_is_the_missions_mix() {
+    let Some(dir) = classes_dir() else { return };
+    let m = MissionDef::load(&missions_dir().join("tat1_con.ron")).expect("tat1_con");
+    // tat1i's teams are (imp, all) in MISSION order.
+    assert_eq!(m.factions(), ["imp".to_string(), "all".to_string()]);
+    let ([imp, all], _) =
+        FactionRoster::pair(&dir, "bf1", ["imp", "all"], Some(&m)).expect("tat1 rosters");
+    let got: Vec<(&str, u32, Option<u32>)> = all
+        .classes
+        .iter()
+        .map(|c| (c.class.as_str(), c.min, c.max))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("all_inf_soldierdesert", 11, None),
+            ("all_inf_vanguard", 3, None),
+            ("all_inf_pilot", 4, None),
+            ("all_inf_marksman", 4, None),
+            ("all_inf_smuggler", 1, None),
+        ]
+    );
+    for c in &all.classes {
+        println!("{}", row(c));
+    }
+    assert_eq!(all.fill_class().class, "all_inf_soldierdesert");
+    assert_eq!(all.classes[3].label, "Rebel Scout");
+    assert_eq!(all.classes[3].max_health, 240.0);
+    assert_eq!(all.classes[4].geometry.as_deref(), Some("all_inf_wookie"));
+    let imp_names: Vec<&str> = imp.classes.iter().map(|c| c.class.as_str()).collect();
+    assert_eq!(
+        imp_names,
+        [
+            "imp_inf_storm_trooper",
+            "imp_inf_shock_trooper",
+            "imp_inf_pilottie",
+            "imp_inf_scout_trooper",
+            "imp_inf_dark_trooper",
+        ]
+    );
+    assert_eq!(imp.classes.iter().map(|c| c.min).sum::<u32>(), 12);
+}
+
+/// BF2 `SetupTeams` slot order reaches the roster with both counts, and the
+/// CIS `special` slot — the droideka — is REJECTED (a `walkerdroid`, not a
+/// soldier chain), leaving five classes and one skip.
+#[test]
+fn kam1_clone_wars_rosters_carry_slot_order_min_and_max() {
+    let Some(dir) = classes_dir() else { return };
+    // `kam1c_con` is the clone-wars era of BF2 Kamino.
+    let m = MissionDef::load(&missions_dir().join("bf2_kam1_con_cw.ron")).expect("kam1_con_cw");
+    assert_eq!(m.factions(), ["cis".to_string(), "rep".to_string()]);
+    let ([cis, rep], _) =
+        FactionRoster::pair(&dir, "bf2", ["cis", "rep"], Some(&m)).expect("kam1 rosters");
+    let got: Vec<(&str, u32, Option<u32>)> = rep
+        .classes
+        .iter()
+        .map(|c| (c.class.as_str(), c.min, c.max))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("rep_inf_ep3_rifleman", 9, Some(25)),
+            ("rep_inf_ep3_rocketeer", 1, Some(4)),
+            ("rep_inf_ep3_engineer", 1, Some(4)),
+            ("rep_inf_ep3_sniper", 1, Some(4)),
+            ("rep_inf_ep3_officer", 1, Some(4)),
+            ("rep_inf_ep3_jettrooper", 1, Some(4)),
+        ],
+        "SetupTeams slot order: soldier, assault, engineer, sniper, officer, special"
+    );
+    for c in &rep.classes {
+        println!("{}", row(c));
+    }
+    // The CIS side names the droideka in its `special` slot; it drops out.
+    let cis_names: Vec<&str> = cis.classes.iter().map(|c| c.class.as_str()).collect();
+    assert_eq!(
+        cis_names,
+        [
+            "cis_inf_rifleman",
+            "cis_inf_rocketeer",
+            "cis_inf_engineer",
+            "cis_inf_sniper",
+            "cis_inf_officer",
+        ],
+        "the mission's sixth CIS class (cis_inf_droideka) is not a soldier"
+    );
+    assert_eq!(cis.classes[4].class, "cis_inf_officer");
+}
+
+/// The droideka is rejected by the BASE-chain test, not by a name list, and
+/// the heroes go the same way if a mission ever names one.
+#[test]
+fn non_soldier_chains_are_rejected() {
+    let Some(dir) = classes_dir() else { return };
+    let bf2 = game::roster::load_classdb(&dir, "bf2", &FOUR).expect("bf2 db");
+    assert!(bf2.get("cis_inf_droideka").is_some(), "the class IS baked");
+    assert_eq!(bf2.engine_base("cis_inf_droideka"), Some("walkerdroid"));
+    assert!(!game::roster::is_soldier_chain(&bf2, "cis_inf_droideka"));
+    let e = ClassRoster::build(&bf2, "cis_inf_droideka", 1, None).unwrap_err();
+    assert!(format!("{e:#}").contains("walkerdroid"), "{e:#}");
+    assert!(game::roster::is_soldier_chain(&bf2, "rep_inf_ep3_rifleman"));
+
+    let bf1 = game::roster::load_classdb(&dir, "bf1", &FOUR).expect("bf1 db");
+    // BF1's heroes ARE soldier chains — they are excluded because no
+    // conquest AddUnitClass list names them, not by this test.
+    assert!(game::roster::is_soldier_chain(
+        &bf1,
+        "all_inf_lukeskywalker"
+    ));
+    assert_eq!(
+        bf1.prop_f32("all_inf_lukeskywalker", "MaxHealth"),
+        Some(1_000_000.0)
+    );
+    for (_, _, list) in game::roster::DEFAULT_CLASSES {
+        assert!(!list.contains(&"all_inf_lukeskywalker"));
+        assert!(!list.contains(&"imp_inf_darthvader"));
+    }
+}
+
+/// `jet` is `JetJump > 0`, and exactly two default-list classes have one.
+#[test]
+fn only_the_jet_pack_classes_are_jet() {
+    let Some(dir) = classes_dir() else { return };
+    let mut jets = Vec::new();
+    for (game, a, b) in [("bf1", "all", "imp"), ("bf2", "rep", "cis")] {
+        let ([ra, rb], _) = FactionRoster::pair(&dir, game, [a, b], None).expect("rosters");
+        for r in [&ra, &rb] {
+            for c in &r.classes {
+                if c.jet {
+                    jets.push(c.class.clone());
+                }
+            }
+        }
+    }
+    jets.sort();
+    assert_eq!(jets, ["imp_inf_dark_trooper", "rep_inf_ep3_jettrooper"]);
+    let bf1 = game::roster::load_classdb(&dir, "bf1", &FOUR).expect("bf1 db");
+    assert_eq!(bf1.prop_f32("imp_inf_dark_trooper", "JetJump"), Some(21.0));
+    let bf2 = game::roster::load_classdb(&dir, "bf2", &FOUR).expect("bf2 db");
+    assert_eq!(bf2.prop_f32("rep_inf_ep3_jettrooper", "JetJump"), Some(5.0));
+}
+
+/// The BF2 GCW case, which used to be the reason the fallback rule existed:
+/// tat2's mission names BF2 classes, and against the db its own disc supplies
+/// every one of them resolves — no skip, no fallback.
+#[test]
+fn a_bf2_gcw_mission_resolves_against_its_own_disc() {
+    let Some(dir) = classes_dir() else { return };
+    let m = MissionDef::load(&missions_dir().join("tat2_con.ron")).expect("tat2_con");
+    assert_eq!(m.source_game, "bf2");
+    assert_eq!(m.factions(), ["imp".to_string(), "all".to_string()]);
+    let bf2 = game::roster::load_classdb(&dir, "bf2", &["imp", "all"]).expect("bf2 db");
+
+    for (t, faction) in [(0usize, "imp"), (1, "all")] {
+        let mix = &m.teams[t].classes;
+        let (r, skipped) = FactionRoster::build(&bf2, "bf2", faction, mix).expect("mission roster");
+        for s in &skipped {
+            println!("skipped {} — {}", s.class, s.reason);
+        }
+        assert!(skipped.is_empty(), "{faction}: {} skipped", skipped.len());
+        assert_eq!(
+            r.fill_class().class,
+            mix[0].0,
+            "{faction}: the mission's own fill class"
+        );
+        assert_eq!(r.classes.len(), mix.len());
+    }
+    // And the classes really are BF2's: `all_inf_rifleman` exists on the BF2
+    // disc and on no BF1 one.
+    let bf1 = game::roster::load_classdb(&dir, "bf1", &FOUR).expect("bf1 db");
+    assert!(bf2.get("all_inf_rifleman").is_some());
+    assert!(bf1.get("all_inf_rifleman").is_none(), "not in BF1 ALL.LVL");
+}
+
+/// The fallback RULE itself is unchanged and still whole-mix: a mix whose
+/// FIRST entry cannot be built is discarded even when a later entry can.
+///
+/// The db mismatch is now constructed deliberately (tat2's BF2 mix against
+/// the BF1 db) rather than being what every BF2 GCW map did: exactly one of
+/// the Empire's six BF2 names, `imp_inf_dark_trooper`, also exists on the BF1
+/// disc, and keeping that partial mix fielded sixteen shotgun dark troopers.
+#[test]
+fn a_mission_mix_without_its_fill_class_falls_back_whole() {
+    let Some(dir) = classes_dir() else { return };
+    let m = MissionDef::load(&missions_dir().join("tat2_con.ron")).expect("tat2_con");
+    let bf1 = game::roster::load_classdb(&dir, "bf1", &FOUR).expect("bf1 db");
+
+    // The Alliance: not one of its six BF2 classes is in the BF1 db.
+    assert_eq!(m.teams[1].classes[0].0, "all_inf_rifleman", "a BF2 class");
+    let (r, skipped) =
+        FactionRoster::build(&bf1, "bf1", "all", &m.teams[1].classes).expect("fallback roster");
+    assert_eq!(
+        skipped.len(),
+        m.teams[1].classes.len(),
+        "every class skipped"
+    );
+    assert_eq!(r.fill_class().class, "all_inf_soldier", "the default list");
+    assert_eq!(r.classes.len(), 5);
+
+    // The Empire: the fill class is missing but `imp_inf_dark_trooper` is
+    // not, and the partial mix is discarded anyway.
+    let imp = &m.teams[0].classes;
+    assert_eq!(imp[0].0, "imp_inf_rifleman");
+    assert!(bf1.get("imp_inf_rifleman").is_none());
+    assert!(
+        imp.iter().any(|c| bf1.get(&c.0).is_some()),
+        "one BF2 name collides with a BF1 class"
+    );
+    let (r, skipped) = FactionRoster::build(&bf1, "bf1", "imp", imp).expect("fallback roster");
+    assert_eq!(r.fill_class().class, "imp_inf_storm_trooper", "the default");
+    assert_eq!(r.classes.len(), 5);
+    assert!(skipped.len() < imp.len(), "not every class failed to build");
+
+    // A mix that KEEPS its fill class stays the mission's, short or not.
+    let t1 = MissionDef::load(&missions_dir().join("tat1_con.ron")).expect("tat1_con");
+    let (r, _) = FactionRoster::build(&bf1, "bf1", "all", &t1.teams[1].classes).expect("tat1 all");
+    assert_eq!(r.fill_class().class, "all_inf_soldierdesert");
+}
+
+/// `pair` RETURNS its warnings instead of printing them, so the sweep can put
+/// them in the map's own ordered block (its workers interleave stderr).
+#[test]
+fn pair_returns_its_warnings_rather_than_printing_them() {
+    let Some(dir) = classes_dir() else { return };
+    let t2 = MissionDef::load(&missions_dir().join("tat2_con.ron")).expect("tat2_con");
+
+    // The mission on its own map: nothing to say.
+    let (_, quiet) =
+        FactionRoster::pair(&dir, "bf2", ["imp", "all"], Some(&t2)).expect("tat2 rosters");
+    assert!(quiet.is_empty(), "{quiet:#?}");
+
+    // The same mission against the wrong disc: every class skipped and both
+    // sides falling back, all of it handed back to the caller.
+    let (_, loud) =
+        FactionRoster::pair(&dir, "bf1", ["imp", "all"], Some(&t2)).expect("mismatched rosters");
+    assert_eq!(
+        loud.iter().filter(|w| w.contains("falling back")).count(),
+        2,
+        "{loud:#?}"
+    );
+    assert!(loud.len() > 2);
+    for w in &loud {
+        assert!(w.starts_with("roster "), "{w}");
+    }
+}
+
+/// The item's referee: EVERY shipped mission RON's class mix resolves against
+/// the db its own map's source game supplies. No mission falls back, and the
+/// only classes skipped are the ones a base-chain test rejects
+/// (`cis_inf_droideka`, a `walkerdroid`) — never a missing name.
+#[test]
+fn every_mission_mix_resolves_against_its_maps_own_disc() {
+    let Some(dir) = classes_dir() else { return };
+    let mut files: Vec<_> = std::fs::read_dir(missions_dir())
+        .expect("missions dir")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ron"))
+        .collect();
+    files.sort();
+    assert!(files.len() >= 32, "expected a mission per baked map");
+
+    let mut dbs: Vec<(String, game::classdb::ClassDb)> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut fell_back: Vec<String> = Vec::new();
+    let mut not_soldier: Vec<String> = Vec::new();
+    for path in &files {
+        let m = MissionDef::load(path).expect("mission");
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+        let factions = m.factions();
+        let key = format!("{}:{}+{}", m.source_game, factions[0], factions[1]);
+        if !dbs.iter().any(|(k, _)| *k == key) {
+            let db = game::roster::load_classdb(
+                &dir,
+                &m.source_game,
+                &[factions[0].as_str(), factions[1].as_str()],
+            )
+            .expect("class db");
+            dbs.push((key.clone(), db));
+        }
+        let db = &dbs.iter().find(|(k, _)| *k == key).unwrap().1;
+        for (t, faction) in factions.iter().enumerate() {
+            let mix = &m.teams[t].classes;
+            if mix.is_empty() {
+                continue;
+            }
+            let (r, skipped) = FactionRoster::build(db, &m.source_game, faction, mix)
+                .unwrap_or_else(|e| panic!("{stem} {faction}: {e:#}"));
+            for s in &skipped {
+                if s.reason.contains("not in the baked class db") {
+                    missing.push(format!("{stem} {faction} {}", s.class));
+                } else {
+                    not_soldier.push(format!("{stem} {faction} {}", s.class));
+                }
+            }
+            if r.fill_class().class != mix[0].0.to_ascii_lowercase() {
+                fell_back.push(format!("{stem} {faction} {}", mix[0].0));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "classes not in their map's db: {missing:#?}"
+    );
+    assert!(
+        fell_back.is_empty(),
+        "missions still falling back: {fell_back:#?}"
+    );
+    // What IS still skipped, and only this: the droideka's base chain.
+    assert!(
+        not_soldier.iter().all(|s| s.ends_with("cis_inf_droideka")),
+        "{not_soldier:#?}"
+    );
+    println!(
+        "{} missions, 0 missing, 0 fallbacks, {} non-soldier skips (all droideka)",
+        files.len(),
+        not_soldier.len()
+    );
+}
+
+/// The soldier MODEL follows the class db onto the map's own disc. A class
+/// fielded on a `game` map carries the `GeometryName` ITS disc spells, so
+/// `SoldierVisuals::load` has to look in `side_<map game>/soldiers/` and not
+/// in the side bake of the faction's native disc.
+///
+/// Data-gated twice: on the extracted side LVLs (the class db) and on the
+/// shipped bake (the models).
+#[test]
+fn every_mission_class_model_is_in_its_maps_own_side_bake() {
+    let Some(dir) = classes_dir() else { return };
+    let baked = game::assets::baked_root();
+    if !baked.join("side_bf1/soldiers").is_dir() || !baked.join("side_bf2/soldiers").is_dir() {
+        eprintln!("SKIP: no side bakes under {}", baked.display());
+        return;
+    }
+    let native = |faction: &str| game::roster::faction_game(faction).expect("known faction");
+    let has = |g: &str, geom: &str| baked.join(format!("side_{g}/soldiers/{geom}.glb")).exists();
+
+    let mut files: Vec<_> = std::fs::read_dir(missions_dir())
+        .expect("missions dir")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ron"))
+        .collect();
+    files.sort();
+    let mut dbs: Vec<(String, game::classdb::ClassDb)> = Vec::new();
+    let (mut slots, mut on_map, mut on_native) = (0usize, 0usize, 0usize);
+    let mut missing: Vec<String> = Vec::new();
+    for path in &files {
+        let m = MissionDef::load(path).expect("mission");
+        let g = m.source_game.clone();
+        if !dbs.iter().any(|(k, _)| *k == g) {
+            dbs.push((g.clone(), load_classdb_all(&dir, &g)));
+        }
+        let db = &dbs.iter().find(|(k, _)| *k == g).unwrap().1;
+        for (t, faction) in m.factions().iter().enumerate() {
+            if native(faction) == g {
+                continue; // the two agree; nothing to tell apart
+            }
+            for (class, _, _) in &m.teams[t].classes {
+                let Some(geom) = db.prop(class, "GeometryName") else {
+                    continue;
+                };
+                let geom = geom.trim();
+                slots += 1;
+                on_map += usize::from(has(&g, geom));
+                on_native += usize::from(has(native(faction), geom));
+                if !has(&g, geom) {
+                    missing.push(geom.to_owned());
+                }
+            }
+        }
+    }
+    println!("{slots} class slots on a non-native (map, faction) pair: {on_map} models in the map's own side bake, {on_native} in the faction's native one");
+    assert!(slots > 0, "no cross-era mission in the corpus?");
+    assert!(
+        on_map > on_native,
+        "the map's own side bake must resolve more models, not fewer"
+    );
+    // What is left is the droideka, and the droideka is not a fieldable class
+    // (`non_soldier_chains_are_rejected`).
+    missing.sort();
+    missing.dedup();
+    assert_eq!(missing, ["cis_walk_droideka"], "unbaked soldier models");
+}
+
+/// Card UWPN: in the battle every class holds its OWN primary's model. The
+/// battle's draw plan (`game::soldier_vis::DrawPlan`) over every shipped
+/// mission's rosters draws each class with the roster's `weapon_geometry`,
+/// while classes still share one body upload. The count printed is what the
+/// old per-body cache got wrong — the first class with a body lent its gun
+/// to every later class with that body (UAUD1 / UAUD2's MISMATCH lines).
+#[test]
+fn battle_classes_hold_their_own_weapon_model() {
+    let Some(dir) = classes_dir() else { return };
+    let mut files: Vec<_> = std::fs::read_dir(missions_dir())
+        .expect("missions dir")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ron"))
+        .collect();
+    files.sort();
+    // Per game: (classes, drawn with another gun now, with another gun under
+    // the per-body cache).
+    let mut tally = [("bf1", 0usize, 0usize, 0usize), ("bf2", 0, 0, 0)];
+    let mut wrong: Vec<String> = Vec::new();
+    for path in &files {
+        let m = MissionDef::load(path).expect("mission");
+        let f = m.factions();
+        let (rosters, _) = FactionRoster::pair(
+            &dir,
+            &m.source_game,
+            [f[0].as_str(), f[1].as_str()],
+            Some(&m),
+        )
+        .expect("rosters");
+        // The battle's own templates (`main/battle.rs`).
+        let teams = [&rosters[0], &rosters[1]].map(|r| {
+            let mut t = game::walk::TeamTemplate::default_trooper();
+            t.classes = r
+                .classes
+                .iter()
+                .map(|c| game::walk::ClassVisual {
+                    name: c.class.clone(),
+                    label: c.label.clone(),
+                    geometry: c.geometry.clone(),
+                    weapon_geometry: c.weapon_geometry.clone(),
+                    weapon_hud: c.weapon_hud.clone(),
+                    held_hud: Vec::new(),
+                    foley_class: c.foley_class,
+                    cries: c.cries.clone(),
+                    anim: c.anim.clone(),
+                })
+                .collect();
+            t
+        });
+        let plan = game::soldier_vis::DrawPlan::of(&teams);
+        let row = tally
+            .iter_mut()
+            .find(|t| t.0 == m.source_game)
+            .expect("bf1 or bf2");
+        // The per-body cache was one for both teams: the first class with a
+        // body, in team order, set the gun.
+        let mut first_by_body: Vec<(&str, Option<&str>)> = Vec::new();
+        for (t, r) in rosters.iter().enumerate() {
+            for (k, c) in r.classes.iter().enumerate() {
+                row.1 += 1;
+                let own = c.weapon_geometry.as_deref();
+                if plan.weapon_of(t, k) != own {
+                    row.2 += 1;
+                    wrong.push(format!(
+                        "{} {}: draws {:?}, its primary's model is {own:?}",
+                        path.display(),
+                        c.class,
+                        plan.weapon_of(t, k)
+                    ));
+                }
+                let Some(body) = c.geometry.as_deref() else {
+                    continue;
+                };
+                match first_by_body.iter().find(|(b, _)| *b == body) {
+                    Some((_, w)) => row.3 += usize::from(*w != own),
+                    None => first_by_body.push((body, own)),
+                }
+            }
+        }
+    }
+    for (game, classes, now, before) in tally {
+        println!(
+            "{game}: {classes} class slots, another class's gun: {now} (per-body cache: {before})"
+        );
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    // The rosters do hold the case: classes sharing a body, not a gun.
+    assert!(tally.iter().all(|t| t.3 > 0), "{tally:?}");
+}
+
+/// Card ZOOM acceptance 1, data-gated: the press sequence the PS2 gave live
+/// (`analysis/re-zoom.md` §3, §9), from the BAKED classes through the sim -
+/// a rifle on, off; a sniper rifle 2, 8, off in the scope view; BF1's
+/// Empire one 6, off; a shotgun 2; a thermal detonator in hand: no zoom.
+#[test]
+fn the_baked_weapons_zoom_as_the_ps2s_do() {
+    use core::sim::{buttons, PadState, Sim};
+    let Some(dir) = classes_dir() else { return };
+    let bf1 = game::roster::load_classdb(&dir, "bf1", &FOUR).expect("bf1 db");
+    let bf2 = game::roster::load_classdb(&dir, "bf2", &FOUR).expect("bf2 db");
+    let rifle: &[Option<f32>] = &[Some(2.5), None, Some(2.5), None];
+    let sniper: &[Option<f32>] = &[Some(2.0), Some(8.0), None, Some(2.0)];
+    let six: &[Option<f32>] = &[Some(6.0), None, Some(6.0), None];
+    let two: &[Option<f32>] = &[Some(2.0), None, Some(2.0), None];
+    let none: &[Option<f32>] = &[None; 4];
+    for (game, db, weapon, want, scope) in [
+        ("bf1", &bf1, "all_weap_inf_rifle", rifle, false),
+        ("bf1", &bf1, "all_weap_inf_sniperrifle", sniper, true),
+        ("bf1", &bf1, "imp_weap_inf_sniperrifle", six, true),
+        ("bf1", &bf1, "all_weap_inf_shotgun", two, false),
+        ("bf1", &bf1, "all_weap_inf_thermaldetonator", none, false),
+        ("bf2", &bf2, "rep_weap_inf_rifle", rifle, false),
+        ("bf2", &bf2, "rep_weap_inf_sniper_rifle", sniper, true),
+        ("bf2", &bf2, "rep_weap_inf_thermaldetonator", none, false),
+    ] {
+        let w = game::roster::weapon_from_db(db, weapon).expect(weapon);
+        let mut s = Sim::empty(1);
+        s.ground_rules = core::soldier::GroundRules::for_game(game);
+        let class = s.add_weapon_class(w.clone());
+        s.spawn(&core::unit::UnitSpec {
+            weapon_class: class,
+            ..core::unit::UnitSpec::player(0, glam::Vec3::ZERO)
+        })
+        .unwrap();
+        let mut seq = Vec::new();
+        for _ in 0..4 {
+            for buttons in [buttons::ZOOM, 0] {
+                s.step(&[PadState {
+                    buttons,
+                    ..Default::default()
+                }]);
+            }
+            let z = s.units[0].zoom;
+            assert!(z.is_none_or(|z| z.divisor == z.value && z.scope == scope));
+            seq.push(z.map(|z| z.value));
+        }
+        println!(
+            "{game} {weapon}: ZoomMin {} ZoomMax {} ZoomRate {} first person {} -> {seq:?}",
+            w.zoom_min, w.zoom_max, w.zoom_rate, w.zoom_first_person
+        );
+        assert_eq!(seq, want, "{game} {weapon}");
+        assert_eq!(w.zoom_first_person, scope, "{game} {weapon}");
+    }
+}
+
+/// Phase C D9 (brief LEAD ADDENDUM 4b (iv)), data-gated: the four sniper
+/// primaries on the discs hit the AI distance table through the real ODF
+/// chains, and the two rifle controls do not — the byte-verified rows of
+/// `analysis/re-ai-sniper.md` §3, reproduced by the port's own loader.
+#[test]
+fn sniper_primaries_hit_the_ai_distance_table() {
+    let Some(dir) = classes_dir() else { return };
+    let bf1 = game::roster::load_classdb(&dir, "bf1", &FOUR).expect("bf1 db");
+    let bf2 = game::roster::load_classdb(&dir, "bf2", &FOUR).expect("bf2 db");
+    // `imp_weap_inf_sniperrifle` ships ZoomMax exactly 6.0: it is in the
+    // table only because the PS2 test is `6.0 <= zoom`.
+    for (db, weapon, zoom) in [
+        (&bf1, "all_weap_inf_sniperrifle", 8.0),
+        (&bf1, "imp_weap_inf_sniperrifle", 6.0),
+        (&bf2, "rep_weap_inf_sniper_rifle", 8.0),
+        (&bf2, "cis_weap_inf_sniper_rifle", 8.0),
+    ] {
+        let w = game::roster::weapon_from_db(db, weapon).expect(weapon);
+        assert_eq!(w.zoom_max, zoom, "{weapon} zoom_max");
+        assert_eq!(w.yaw_spread, 0.0, "{weapon} yaw_spread");
+        assert!(w.trigger_single, "{weapon} trigger_single");
+        assert!(w.ai_distance_table(), "{weapon} should use the table");
+    }
+    for (db, weapon) in [(&bf1, "all_weap_inf_rifle"), (&bf2, "rep_weap_inf_rifle")] {
+        let w = game::roster::weapon_from_db(db, weapon).expect(weapon);
+        assert_eq!(w.zoom_max, 2.5, "{weapon} zoom_max");
+        assert!(
+            (w.yaw_spread - 0.25f32.to_radians()).abs() < 1e-7,
+            "{weapon} yaw_spread {}",
+            w.yaw_spread
+        );
+        assert!(!w.trigger_single, "{weapon} trigger_single");
+        assert!(!w.ai_distance_table(), "{weapon} must not use the table");
+    }
+}
+
+/// The unit gallery (card UGAL) shows the gun the GAME draws for a body —
+/// its class's primary weapon geometry — not the side's rifle: the super
+/// battle droid fires from its wrists and holds nothing in either game, the
+/// wookiee holds its bowcaster, the BF2 battle droid body stands for the
+/// rocketeer (first in the CIS default mix to wear it).
+#[test]
+fn gallery_units_hold_their_classs_own_weapon() {
+    let Some(dir) = classes_dir() else { return };
+    let bf1 = load_classdb_all(&dir, "bf1");
+    let bf2 = load_classdb_all(&dir, "bf2");
+    let held = |db: &game::classdb::ClassDb, game: &str, model: &str| {
+        let class = game::gallery::model_class(db, game, model).expect("a class wears it");
+        let weapon = game::roster::weapon_geometry(db, &class);
+        (class, weapon)
+    };
+    assert_eq!(
+        held(&bf2, "bf2", "cis_inf_sbdroid"),
+        ("cis_inf_rifleman".to_owned(), None)
+    );
+    assert_eq!(
+        held(&bf1, "bf1", "cis_inf_sbdroid"),
+        ("cis_inf_battledroid".to_owned(), None)
+    );
+    assert_eq!(
+        held(&bf2, "bf2", "cis_inf_bdroid"),
+        (
+            "cis_inf_rocketeer".to_owned(),
+            Some("cis_weap_inf_launcher".to_owned())
+        )
+    );
+    assert_eq!(
+        held(&bf1, "bf1", "all_inf_wookie"),
+        (
+            "all_inf_smuggler".to_owned(),
+            Some("all_weap_inf_bowcaster".to_owned())
+        )
+    );
+    assert_eq!(
+        held(&bf2, "bf2", "imp_inf_stormtrooper"),
+        (
+            "imp_inf_rifleman".to_owned(),
+            Some("imp_weap_inf_rifle".to_owned())
+        )
+    );
+}
+
+/// Card FXB: the laser keys through the real chains reproduce re-bolt §2's
+/// census rows — the BF2 Republic rifle inherits `com_`'s red End colours,
+/// the pistol's later GlowLength / BlurLength beat LaserLength's reset, the
+/// snipers fade out over 1 s — and the key hashes are the loader's fnv.
+#[test]
+fn laser_looks_are_the_census_rows() {
+    use core::laser::*;
+    let h = game::classdb::fnv1a_lowercase;
+    for (name, hash) in [
+        ("LaserWidth", HASH_LASER_WIDTH),
+        ("LaserLength", HASH_LASER_LENGTH),
+        ("LaserTexture", HASH_LASER_TEXTURE),
+        ("LaserGlowColor", HASH_LASER_GLOW_COLOR),
+        ("EndLaserGlowColor", HASH_END_LASER_GLOW_COLOR),
+        ("GlowLength", HASH_GLOW_LENGTH),
+        ("BlurLength", HASH_BLUR_LENGTH),
+        ("FadeOutTime", HASH_FADE_OUT_TIME),
+        ("FadeLightColor", HASH_FADE_LIGHT_COLOR),
+        ("LightColor", HASH_LIGHT_COLOR),
+        ("LightRadius", HASH_LIGHT_RADIUS),
+        ("EndLightColor", HASH_END_LIGHT_COLOR),
+    ] {
+        assert_eq!(h(name), hash, "{name}");
+    }
+    let Some(dir) = classes_dir() else { return };
+    let bf1 = game::roster::load_classdb(&dir, "bf1", &FOUR).expect("bf1 db");
+    let bf2 = game::roster::load_classdb(&dir, "bf2", &FOUR).expect("bf2 db");
+    let look = |db, w| {
+        game::roster::weapon_from_db(db, w)
+            .expect(w)
+            .ordnance
+            .laser
+            .unwrap_or_else(|| panic!("{w}: no laser look"))
+    };
+    let l = look(&bf1, "rep_weap_inf_rifle");
+    assert_eq!(
+        l.texture.as_deref().map(str::to_ascii_lowercase).as_deref(),
+        Some("bluelaser_d")
+    );
+    assert_eq!(
+        (l.width, l.length, l.glow_length, l.blur_length),
+        (0.1, 1.0, 3.0, 5.0)
+    );
+    assert_eq!(l.glow_color, [92, 136, 250, 100]);
+    assert!(!l.fade_light);
+    let l = look(&bf1, "imp_weap_inf_pistol");
+    assert_eq!(
+        (l.width, l.length, l.glow_length, l.blur_length),
+        (0.09, 0.75, 3.0, 5.0)
+    );
+    let l = look(&bf1, "all_weap_inf_sniperrifle");
+    assert_eq!(
+        (l.width, l.length, l.glow_length, l.blur_length),
+        (0.15, 20.0, 24.0, 32.0)
+    );
+    assert_eq!(l.fade_out_rate, 1.0);
+    let l = look(&bf2, "rep_weap_inf_rifle");
+    assert_eq!(l.texture.as_deref(), Some("com_sfx_laser_blue"));
+    assert_eq!(l.glow_color, [92, 136, 250, 100]);
+    assert_eq!(l.end_glow_color, [160, 43, 43, 100]);
+    assert!(l.fade_light);
+    assert_eq!((l.fade_start, l.fade_duration), (0.4, 0.2));
+    // The light (re-bolt §2, card FXBL): blue, red End inherited from `com_`.
+    assert_eq!(l.light(0.0), Some(([36, 53, 98], 4.0)));
+    assert_eq!(l.light(1.0), Some(([94, 25, 25], 4.0)));
+    let l = look(&bf2, "cis_weap_inf_rifle");
+    assert_eq!(l.texture.as_deref(), Some("com_sfx_laser_red"));
+    assert_eq!(l.glow_color, [253, 43, 43, 100]);
+    assert_eq!(l.end_glow_color, [160, 43, 43, 100]);
+    assert_eq!(l.light(0.0), Some(([148, 25, 25], 4.0)));
+}
+
+/// Card FXMF: the muzzle flash through the real chains reproduces
+/// re-muzzle-flash §2's census — BF1's Republic rifle violet, BF2's
+/// `com_weap_inf_rifle` pink inherited by the side rifles, the `med` preset
+/// on the vehicle guns, the per-game model — and, where the RE's census
+/// files are on disk (`lead_tmp/fxmf/census_bf{1,2}.txt`), every census row
+/// of a class the db holds.
+#[test]
+fn flash_looks_are_the_census_rows() {
+    use core::flash::*;
+    let h = game::classdb::fnv1a_lowercase;
+    for (name, hash) in [
+        ("MuzzleFlash", HASH_MUZZLE_FLASH),
+        ("FlashRadius", HASH_FLASH_RADIUS),
+        ("FlashLength", HASH_FLASH_LENGTH),
+        ("FlashColor", HASH_FLASH_COLOR),
+        ("MuzzleFlashModel", HASH_MUZZLE_FLASH_MODEL),
+        ("FirePointName", HASH_FIRE_POINT_NAME),
+    ] {
+        assert_eq!(h(name), hash, "{name}");
+    }
+    let Some(dir) = classes_dir() else { return };
+    let bf1 = game::roster::load_classdb(&dir, "bf1", &FOUR).expect("bf1 db");
+    let bf2 = game::roster::load_classdb(&dir, "bf2", &FOUR).expect("bf2 db");
+    let row = |l: &MuzzleFlashLook| (l.radius, l.length, l.color, l.model.clone());
+    let m1 = Some(BF1_MODEL.to_owned());
+    let m2 = Some(BF2_MODEL.to_owned());
+    for (db, w, want) in [
+        (
+            &bf1,
+            "rep_weap_inf_rifle",
+            (0.6, 0.025, [80, 80, 255, 255], m1.clone()),
+        ),
+        (
+            &bf1,
+            "all_weap_inf_rifle",
+            (0.6, 0.025, [255, 100, 100, 255], m1.clone()),
+        ),
+        (
+            &bf2,
+            "com_weap_inf_rifle",
+            (0.6, 0.025, [255, 100, 100, 255], m2.clone()),
+        ),
+        (
+            &bf2,
+            "rep_weap_inf_rifle",
+            (0.6, 0.025, [100, 100, 255, 255], m2.clone()),
+        ),
+    ] {
+        let got = game::roster::flash_look(db, w);
+        assert_eq!(row(&got), want, "{w}");
+        assert_eq!(got.fire_point, DEFAULT_FIRE_POINT, "{w}");
+    }
+    // The loader attaches it to a fielded weapon.
+    let w = game::roster::weapon_from_db(&bf1, "rep_weap_inf_rifle").unwrap();
+    assert_eq!(
+        w.flash,
+        Some(game::roster::flash_look(&bf1, "rep_weap_inf_rifle"))
+    );
+    let census = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../artifacts/lead_tmp/fxmf"
+    ));
+    for (game, db) in [("bf1", &bf1), ("bf2", &bf2)] {
+        let Ok(text) = std::fs::read_to_string(census.join(format!("census_{game}.txt"))) else {
+            eprintln!("no census_{game}.txt: the per-row sweep skipped");
+            continue;
+        };
+        let (mut matched, mut draws) = (0, 0);
+        for line in text.lines().filter(|l| !l.starts_with("--")) {
+            let name = line.split_whitespace().next().unwrap();
+            if db.get_kind("wpnc", name).is_none() {
+                continue;
+            }
+            let field = |k: &str| {
+                let at = line.find(&format!(" {k}=")).unwrap() + k.len() + 2;
+                line[at..].split_whitespace().next().unwrap().to_owned()
+            };
+            let c0 = line.find(" C=(").unwrap() + 4;
+            let c: Vec<u8> = line[c0..line[c0..].find(')').unwrap() + c0]
+                .split(", ")
+                .map(|v| v.parse().unwrap())
+                .collect();
+            let l = game::roster::flash_look(db, name);
+            assert_eq!(
+                l.radius,
+                field("R").parse::<f32>().unwrap(),
+                "{game} {name}"
+            );
+            assert_eq!(
+                l.length,
+                field("L").parse::<f32>().unwrap(),
+                "{game} {name}"
+            );
+            assert_eq!(l.color.to_vec(), c, "{game} {name}");
+            assert_eq!(l.draws(), line.contains(" DRAWS "), "{game} {name}");
+            assert_eq!(l.fire_point, field("fp"), "{game} {name}");
+            matched += 1;
+            draws += usize::from(l.draws());
+        }
+        eprintln!("{game}: {matched} census rows matched, {draws} draw a flash");
+        assert!(matched > 20, "{game}: only {matched} census rows in the db");
+    }
+}
+
+/// Card FXP3 (`analysis/re-fx.md` §7's census): what each ordnance's hits
+/// spawn. Every showcase infantry bolt reads the game's rifle impact on all
+/// five surfaces; a vehicle cannon keeps the ctor's terrain default and
+/// detonates its explosion's effect; a thrown grenade has no surface slots,
+/// only its trail.
+#[test]
+fn impact_looks_are_the_census_rows() {
+    use core::impact::Surface;
+    let Some(dir) = classes_dir() else { return };
+    let bf1 = game::roster::load_classdb(&dir, "bf1", &FOUR).expect("bf1 db");
+    let bf2 = game::roster::load_classdb(&dir, "bf2", &FOUR).expect("bf2 db");
+    let five = [
+        Surface::Soldier,
+        Surface::Vehicle,
+        Surface::Building,
+        Surface::Terrain,
+        Surface::Shield,
+    ];
+    let ord = |db: &game::classdb::ClassDb, w: &str| {
+        game::roster::weapon_from_db(db, w)
+            .expect(w)
+            .ordnance
+            .impact
+            .expect(w)
+    };
+    for w in [
+        "all_weap_inf_rifle",
+        "imp_weap_inf_rifle",
+        "rep_weap_inf_rifle",
+        "cis_weap_inf_pistol",
+        "all_weap_inf_sniperrifle",
+    ] {
+        let l = ord(&bf1, w);
+        for s in five {
+            assert_eq!(l.effect(s), Some("ord_explosion"), "{w} {s:?}");
+        }
+        assert_eq!(l.effect(Surface::Water), Some("watersplash_ord"), "{w}");
+        assert_eq!((&l.trail, &l.explosion), (&None, &None), "{w}");
+    }
+    let l = ord(&bf2, "rep_weap_inf_rifle");
+    for s in &five[..4] {
+        assert_eq!(l.effect(*s), Some("com_sfx_ord_exp"), "{s:?}");
+    }
+    assert_eq!(l.effect(Surface::Shield), Some("com_sfx_shieldimpact_sm"));
+
+    let l = ord(&bf1, "cis_weap_hover_aat_cannon");
+    assert_eq!(l.effect(Surface::Soldier), None);
+    assert_eq!(l.effect(Surface::Terrain), Some("dirtspray"), "the ctor's");
+    assert_eq!(l.effect(Surface::Water), Some("watersplash_ord_lg"));
+    let x = l.explosion.expect("cis_weap_hover_aat_cannon_exp");
+    assert_eq!(x.effects, ["com_sfx_weap_redbolt_exp_md"]);
+    assert_eq!(x.water_effect.as_deref(), Some("watersplash_md"));
+
+    let l = ord(&bf1, "rep_weap_inf_thermaldetonator");
+    assert!(five.iter().all(|s| l.effect(*s).is_none()), "{l:?}");
+    assert_eq!(l.trail.as_deref(), Some("com_sfx_weap_grenade_red"));
+    // Its fuse's blast is `ExplosionExpire` (0x2e51_081f), the thrown
+    // round's own key — card GREN's, not the impact's `ExplosionName`.
+    assert_eq!(l.explosion, None);
+}
+
+/// One row of the disc census (`tests/data/weapon_slots_bf{1,2}.txt`,
+/// written by `lead_tmp/gren/slots.py` straight from the SIDE LVLs, not from
+/// the bake): `class [base]: 1:weapon xAMMO chN; 2:…`. `xNone` = no
+/// `WeaponAmmo` on the slot.
+fn census_rows(text: &str) -> Vec<(String, Vec<game::classdb::WeaponSlot>)> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let (head, slots) = l.split_once("]: ").expect("census row");
+            let class = head.split_whitespace().next().unwrap().to_ascii_lowercase();
+            let slots = slots
+                .split("; ")
+                .map(|s| {
+                    let mut it = s.split_whitespace();
+                    let (n, weapon) = it.next().unwrap().split_once(':').unwrap();
+                    let ammo = it.next().unwrap().strip_prefix('x').unwrap();
+                    let chan = it.next().unwrap().strip_prefix("ch").unwrap();
+                    game::classdb::WeaponSlot {
+                        slot: n.parse::<u8>().unwrap() - 1,
+                        weapon: weapon.to_ascii_lowercase(),
+                        ammo: ammo.parse().ok(),
+                        channel: chan.parse().unwrap(),
+                    }
+                })
+                .collect();
+            (class, slots)
+        })
+        .collect()
+}
+
+/// Card GREN step 1: the slot model against the disc census. Every census
+/// class the four-side db holds resolves the disc's slot list (weapon, ammo,
+/// channel per slot), and every class a mission RON fields is among them.
+#[test]
+fn weapon_slots_match_the_disc_census() {
+    let Some(dir) = classes_dir() else { return };
+    let lower = |mut s: Vec<game::classdb::WeaponSlot>| {
+        for x in &mut s {
+            x.weapon = x.weapon.to_ascii_lowercase();
+        }
+        s
+    };
+    let mut fielded = 0;
+    for (game, text) in [
+        ("bf1", include_str!("../data/weapon_slots_bf1.txt")),
+        ("bf2", include_str!("../data/weapon_slots_bf2.txt")),
+    ] {
+        let db = load_classdb_all(&dir, game);
+        let rows = census_rows(text);
+        let mut checked = 0;
+        for (class, want) in &rows {
+            let Some(name) = db.resolve(class) else {
+                continue; // a local side's class (gun, gar, ewk, wok, tat …)
+            };
+            assert_eq!(&lower(db.weapon_slots(name)), want, "{game} {class}");
+            checked += 1;
+        }
+        println!(
+            "{game}: {checked} of {} census classes in the db match",
+            rows.len()
+        );
+        assert!(
+            checked >= if game == "bf1" { 40 } else { 120 },
+            "{game}: {checked}"
+        );
+
+        let mut seen: Vec<String> = Vec::new();
+        for e in std::fs::read_dir(missions_dir()).expect("missions dir") {
+            let path = e.expect("dir entry").path();
+            if path.extension().is_none_or(|x| x != "ron") {
+                continue;
+            }
+            let m = MissionDef::load(&path).expect("mission");
+            if m.source_game != game {
+                continue;
+            }
+            for (class, _, _) in m.teams.iter().flat_map(|t| &t.classes) {
+                let class = class.to_ascii_lowercase();
+                if seen.contains(&class) {
+                    continue;
+                }
+                let want = &rows
+                    .iter()
+                    .find(|(c, _)| *c == class)
+                    .unwrap_or_else(|| panic!("{game} {class}: fielded, not in the census"))
+                    .1;
+                let name = db
+                    .resolve(&class)
+                    .unwrap_or_else(|| panic!("{game} {class}: fielded, not in the db"));
+                assert_eq!(&lower(db.weapon_slots(name)), want, "{game} {class}");
+                seen.push(class);
+            }
+        }
+        seen.sort();
+        println!("{game}: {} fielded classes resolve their slots", seen.len());
+        // The classes written with numbered keys, where the old whole-list
+        // read saw slot 1 only (BF2: the heroes).
+        let h1 = game::classdb::fnv1a_lowercase("WeaponName1");
+        for (c, _) in rows.iter().filter(|_| game == "bf2") {
+            let Some(def) = db.resolve(c).and_then(|n| db.get(n)) else {
+                continue;
+            };
+            if def.props.iter().any(|p| p.0 == h1) {
+                let row: Vec<String> = db
+                    .weapon_slots(&def.name)
+                    .iter()
+                    .map(|s| format!("{}:{} x{:?} ch{}", s.slot + 1, s.weapon, s.ammo, s.channel))
+                    .collect();
+                println!("  numbered: {c}: {}", row.join("; "));
+            }
+        }
+        fielded += seen.len();
+    }
+    assert!(fielded >= 40, "{fielded} fielded classes");
+}
+
+/// Card GREN: the thermal detonator out of the baked class db is the PS2's
+/// (`analysis/re-grenades.md` §3.1, §4.2, §9 — the RAM rows): the cycle, the
+/// throw, the `Stick*` mask, the gravity, the fuse and the explosion; BF1's
+/// crack grenade sticks to vehicles and buildings. A BF1 class keeps its own
+/// cycle, speed, gravity and blast and is THROWN as BF2 throws (card GRNP,
+/// `Thrown::BF1_THROWS_AS_BF2`): the hand, BF2's wind-up, rest rule, fuse and
+/// stick mask.
+#[test]
+fn thrown_weapons_come_out_of_the_class_db_as_the_ps2_holds_them() {
+    let Some(dir) = classes_dir() else { return };
+    use core::sticky::stick;
+    for (game, weapon, delay, windup, fuse, mask, damage) in [
+        (
+            "bf1",
+            "imp_weap_inf_thermaldetonator",
+            1.4,
+            0.51,
+            0.6,
+            0x7fff_ffd8u32,
+            320.0,
+        ),
+        (
+            "bf2",
+            "imp_weap_inf_thermaldetonator",
+            1.3,
+            0.51,
+            0.6,
+            0x7fff_ffd8,
+            450.0,
+        ),
+    ] {
+        let db = load_classdb_all(&dir, game);
+        let w = game::roster::thrown_weapon_from_db(&db, weapon)
+            .expect("builds")
+            .expect("a thrown weapon");
+        assert_eq!(w.shot_delay, [delay; 2], "{game} ShotDelay");
+        assert_eq!(w.initial_salvo_delay, windup, "{game} InitialSalvoDelay");
+        assert!(w.trigger_single, "{game}: the class default");
+        assert_eq!((w.rounds_per_clip, w.reload_time), (1, 0.01), "{game}");
+        let t = w.thrown.expect("grenade keys");
+        assert_eq!((t.shot_elevate, t.hide_on_fire), (0.21, true), "{game}");
+        assert_eq!(t.hand, Some(core::weapon::Thrown::BF2_HAND), "{game}");
+        let o = &w.ordnance;
+        assert_eq!((o.velocity, o.life_span), (25.0, fuse), "{game}");
+        let s = o.sticky.as_ref().expect("sticky");
+        assert_eq!(s.gravity, -12.25, "{game}");
+        assert_eq!(s.stick_mask, mask, "{game}: mask {:#x}", s.stick_mask);
+        assert!(s.bf2, "{game}: BF2's rest rule");
+        let x = s.explosion.as_ref().expect("ExplosionExpire");
+        assert_eq!(
+            (x.damage, x.damage_inner, x.damage_outer),
+            (damage, 4.5, 6.5),
+            "{game}"
+        );
+    }
+    let db = load_classdb_all(&dir, "bf1");
+    let crack = game::roster::thrown_weapon_from_db(&db, "imp_weap_inf_crackgrenade")
+        .unwrap()
+        .unwrap();
+    let mask = crack.ordnance.sticky.unwrap().stick_mask;
+    assert_eq!(
+        mask & 0x8000_007f,
+        stick::VEHICLE | stick::BUILDING | stick::BUILDING_DEAD | stick::BUILDING_UNBUILT,
+        "the crack grenade (its own mask and BF2's thermal's): {mask:#x}"
+    );
+    // A rifle is not thrown; a dispenser is not this card's.
+    for w in ["imp_weap_inf_rifle", "imp_weap_inf_mine_dispenser"] {
+        assert!(game::roster::thrown_weapon_from_db(&db, w)
+            .unwrap()
+            .is_none());
+    }
+}
+
+/// Card GREN: what each fielded class holds besides its primary — the
+/// channel-0 sidearm and the channel-1 grenades — over every mission RON.
+#[test]
+fn fielded_classes_hold_their_sidearm_and_grenades() {
+    let Some(dir) = classes_dir() else { return };
+    for (game, f) in [
+        ("bf1", ["all", "imp"]),
+        ("bf1", ["rep", "cis"]),
+        ("bf2", ["all", "imp"]),
+        ("bf2", ["rep", "cis"]),
+    ] {
+        let ([a, b], _) = FactionRoster::pair(&dir, game, f, None).expect("rosters");
+        for r in [&a, &b] {
+            let mut thrown = 0;
+            for c in &r.classes {
+                let row: Vec<String> = c
+                    .held
+                    .iter()
+                    .map(|h| {
+                        format!(
+                            "{}:{} x{} ch{}",
+                            h.slot + 1,
+                            h.weapon.name,
+                            h.clips,
+                            h.channel
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{game} {}: [{}] {}",
+                    c.class,
+                    c.weapon_slot + 1,
+                    row.join("; ")
+                );
+                for h in &c.held {
+                    assert_ne!(h.slot, c.weapon_slot);
+                    assert_eq!(
+                        h.channel == 1,
+                        h.weapon.ordnance.sticky.is_some(),
+                        "{}",
+                        c.class
+                    );
+                    assert!(
+                        !h.weapon.name.contains("award"),
+                        "{}: {}",
+                        c.class,
+                        h.weapon.name
+                    );
+                }
+                thrown += c.held.iter().filter(|h| h.channel == 1).count();
+            }
+            // The plain trooper throws a thermal detonator on every side but
+            // BF1's CIS (the super battle droid: a wrist rocket) and REP
+            // (the haywire detonator, also a sticky).
+            let fill = r.fill_class();
+            let has = fill.held.iter().any(|h| h.channel == 1);
+            assert_eq!(
+                has,
+                !(game == "bf1" && r.faction == "cis") && !(game == "bf2" && r.faction == "cis"),
+                "{game} {}: {}",
+                r.faction,
+                fill.class
+            );
+            assert!(thrown >= 2, "{game} {}: {thrown} thrown slots", r.faction);
+        }
+    }
+}
+
+/// A class's drop table as one line: `item prob, ...` with the common
+/// prefix of the item names cut.
+fn drop_line(db: &game::classdb::ClassDb, class: &str) -> String {
+    db.drop_table(class)
+        .iter()
+        .map(|(item, p)| format!("{} {p}", item.trim_start_matches("com_item_powerup_")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Card PWUP (`analysis/re-powerups.md` §2.1, §3.1): every soldier class's
+/// drop table resolved the PS2's way, counted per table, and every item
+/// class's numbers — from the baked classes of both discs.
+#[test]
+fn drop_tables_are_the_discs() {
+    let Some(dir) = classes_dir() else { return };
+    use std::collections::BTreeMap;
+    let census = |game: &str| -> BTreeMap<String, Vec<String>> {
+        let db = load_classdb_all(&dir, game);
+        let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut names: Vec<&str> = db.names().collect();
+        names.sort_unstable();
+        for n in names {
+            if game::roster::is_soldier_chain(&db, n) {
+                by.entry(drop_line(&db, n)).or_default().push(n.to_owned());
+            }
+        }
+        for (t, c) in &by {
+            println!("{game} [{t}] {}: {}", c.len(), c.join(" "));
+        }
+        by
+    };
+    let bf1 = census("bf1");
+    let a = &bf1["ammo 0.4, health100 0.3, dual 0.1"];
+    let b = &bf1["ammo 0.05, health25 0.1, health100 0.1"];
+    // Table B: the 11 Imperial classes and two of the Alliance's (§3.1).
+    assert_eq!(b.iter().filter(|c| c.starts_with("imp_")).count(), 11);
+    assert!(b.contains(&"all_inf_marksman".to_owned()));
+    assert!(b.contains(&"all_inf_vanguardsnow".to_owned()));
+    assert_eq!(b.len(), 13);
+    // Table A: 21 classes, every one ALL / REP / CIS, no Imperial.
+    assert_eq!(a.len(), 21, "{a:?}");
+    assert!(a.iter().all(|c| !c.starts_with("imp_")));
+    let bf2 = census("bf2");
+    let regular = &bf2[
+        "ammo 0.25, health25 0.15, offense 0.02, defense 0.02, health100 0.08, dual 0.08, energy 0.1"
+    ];
+    assert!(regular.contains(&"rep_inf_ep3_rifleman".to_owned()));
+    assert!(regular.contains(&"com_inf_default".to_owned()));
+    let hero = &bf2["ammo 0.05, health100 0.05, dual 0.2, energy 0.1, offense 0.15, defense 0.15"];
+    assert!(hero.contains(&"com_jedi_default".to_owned()));
+    // Of the disc's 121 / 33 (§3.1), the four sides and INGAME hold these;
+    // the rest are the locals' side LVLs.
+    assert_eq!((regular.len(), hero.len()), (107, 23));
+    // BF1's other tables: the heroes' and the battle droids' (§3.1 C, D).
+    assert_eq!(bf1["ammo 0.2, health25 0.05, health100 0"].len(), 5);
+    assert_eq!(bf1["ammo 0.07, health25 0.08, health100 0"].len(), 4);
+
+    // The item classes (§2.1): amounts per game, the life span, the boxes.
+    for (game, want) in [
+        (
+            "bf1",
+            &[
+                ("com_item_powerup_ammo", 0.0, 1, 0.1255),
+                ("com_item_powerup_health25", 50.0, 0, 0.0965),
+                ("com_item_powerup_health100", 75.0, 0, 0.1206),
+                ("com_item_powerup_dual", 100.0, 2, 0.1565),
+            ][..],
+        ),
+        (
+            "bf2",
+            &[
+                ("com_item_powerup_ammo", 0.0, 1, 0.1255),
+                ("com_item_powerup_health25", 100.0, 0, 0.0965),
+                ("com_item_powerup_health100", 200.0, 0, 0.0965),
+                ("com_item_powerup_dual", 200.0, 2, 0.1565),
+                ("com_item_powerup_energy", 0.0, 0, 0.0965),
+                ("com_item_powerup_offense", 0.0, 0, 0.0965),
+                ("com_item_powerup_defense", 0.0, 0, 0.0965),
+            ][..],
+        ),
+    ] {
+        let db = load_classdb_all(&dir, game);
+        for (name, health, ammo, half_x) in want {
+            let c = game::roster::item_class_from_db(&db, name).expect(name);
+            println!("{game} {c:?}");
+            assert_eq!(
+                (c.health, c.ammo, c.life_span),
+                (*health, *ammo, 30.0),
+                "{name}"
+            );
+            assert_eq!(c.half.x, *half_x, "{game} {name}");
+        }
+        if game == "bf2" {
+            let item = |n: &str| game::roster::item_class_from_db(&db, n).unwrap();
+            assert_eq!(item("com_item_powerup_energy").energy, 150.0);
+            assert_eq!(item("com_item_powerup_offense").offense, (12.0, 1.5));
+            assert_eq!(item("com_item_powerup_defense").defense, (20.0, 0.5));
+        }
+        // A soldier is not an item.
+        assert!(game::roster::item_class_from_db(&db, "com_inf_default").is_none());
+    }
+    // A fielded class registers its table with the sim.
+    let db = load_classdb_all(&dir, "bf1");
+    let c = ClassRoster::build(&db, "rep_inf_clone_trooper", 1, None).unwrap();
+    let mut sim = core::sim::Sim::empty(1);
+    let uc = c.register(&mut sim, &mut Vec::new());
+    assert_eq!(uc.drops.count, 3);
+    assert_eq!(uc.drops.prob[..3], [0.4, 0.3, 0.1]);
+    let names: Vec<&str> = sim.item_classes.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "com_item_powerup_ammo",
+            "com_item_powerup_health100",
+            "com_item_powerup_dual"
+        ]
+    );
+    assert_eq!(game::roster::item_pool("bf1", "naboo1"), 40);
+    assert_eq!(game::roster::item_pool("bf1", "tat1"), 60);
+    assert_eq!(game::roster::item_pool("bf1", "kamino1"), 25);
+    assert_eq!(game::roster::item_pool("bf2", "tat1"), 25);
+}
+
+/// Card CLSE2 (`analysis/re-soldier-ai.md` 18.4): BF2's weapon classes carry
+/// the disc's AIBubble keys, a side's own class by its BASE; BF1 authors none.
+#[test]
+fn bf2_weapon_classes_carry_the_ai_bubble_keys() {
+    let Some(dir) = classes_dir() else { return };
+    let db = load_classdb_all(&dir, "bf2");
+    let keys = |name: &str| {
+        let w = game::roster::weapon_from_db(&db, name).expect(name);
+        (w.ai_bubble_size, w.ai_bubble_dist, w.ai_bubble_clamp)
+    };
+    for side in ["all", "imp", "rep", "cis"] {
+        assert_eq!(
+            keys(&format!("{side}_weap_inf_shotgun")),
+            (1.25, 20.0, 10.0)
+        );
+        assert_eq!(
+            keys(&format!("{side}_weap_inf_sniper_rifle")),
+            (0.6, 20.0, 10.0)
+        );
+        assert_eq!(keys(&format!("{side}_weap_inf_rifle")), (1.0, 20.0, 10.0));
+    }
+    let db1 = load_classdb_all(&dir, "bf1");
+    let w = game::roster::weapon_from_db(&db1, "rep_weap_inf_sniperrifle").expect("bf1 sniper");
+    assert_eq!(
+        (w.ai_bubble_size, w.ai_bubble_dist, w.ai_bubble_clamp),
+        (1.0, 20.0, 10.0)
+    );
+}
+
+/// Card CLSE2 (18.3): the size term of the aim error is half the horizontal
+/// diagonal of the model's bind-pose box - `AIM_SIZE` row by row against the
+/// baked models' POSITION bounds, every baked BF2 soldier model in it, and a
+/// class takes its model's. A cloth segment (`extras.cloth`, card CLOTH) is
+/// not the model's: the PS2 draws it as its own object.
+#[test]
+fn aim_sizes_are_the_baked_models_boxes() {
+    let Some(dir) = classes_dir() else { return };
+    let soldiers = game::assets::baked_root().join("side_bf2/soldiers");
+    if !soldiers.is_dir() {
+        eprintln!("SKIP: no side bake under {}", soldiers.display());
+        return;
+    }
+    let size = |model: &str| {
+        let (doc, _, _) = gltf::import(soldiers.join(format!("{model}.glb"))).expect(model);
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        let cloth = |prim: &gltf::Primitive<'_>| {
+            prim.material().extras().as_ref().is_some_and(|raw| {
+                serde_json::from_str::<serde_json::Value>(raw.get())
+                    .is_ok_and(|v| v["cloth"] == true)
+            })
+        };
+        for prim in doc.meshes().flat_map(|m| m.primitives()) {
+            if cloth(&prim) {
+                continue;
+            }
+            let b = prim.bounding_box();
+            for i in 0..3 {
+                lo[i] = lo[i].min(b.min[i]);
+                hi[i] = hi[i].max(b.max[i]);
+            }
+        }
+        0.5 * (hi[0] - lo[0]).hypot(hi[2] - lo[2])
+    };
+    for (model, v) in game::roster::AIM_SIZE {
+        let s = size(model);
+        assert!(
+            (s - v).abs() < 1e-4,
+            "{model}: the table's {v}, the model's {s}"
+        );
+    }
+    let mut baked = 0;
+    for e in std::fs::read_dir(&soldiers).expect("soldiers dir") {
+        let name = e.expect("entry").file_name().to_string_lossy().into_owned();
+        if let Some(model) = name.strip_suffix(".glb") {
+            baked += 1;
+            assert!(
+                game::roster::AIM_SIZE.iter().any(|(m, _)| *m == model),
+                "{model} has no AIM_SIZE row"
+            );
+        }
+    }
+    assert_eq!(baked, game::roster::AIM_SIZE.len());
+    let db = load_classdb_all(&dir, "bf2");
+    let class = |name: &str| ClassRoster::build(&db, name, 0, None).expect(name);
+    let droid = class("cis_inf_rifleman");
+    assert_eq!(droid.geometry.as_deref(), Some("cis_inf_sbdroid"));
+    assert!(
+        (droid.consts.aim_size - 0.4806).abs() < 1e-3,
+        "{}",
+        droid.consts.aim_size
+    );
+    let clone = class("rep_inf_ep3_rifleman");
+    assert!(
+        (clone.consts.aim_size - 0.9550).abs() < 1e-3,
+        "{}",
+        clone.consts.aim_size
+    );
+    let rebel = class("all_inf_rifleman");
+    assert!(
+        (rebel.consts.aim_size - 0.692).abs() < 1e-3,
+        "{}",
+        rebel.consts.aim_size
+    );
+}
+
+/// Card CLSE4 (`analysis/re-soldier-ai.md` 20.3), data-gated: the burst keys
+/// reach the sim's weapon classes from the BAKED class db. BF2 stores them by
+/// hash; its flyer weapons (here a child of `com_weap_veh_fly_chaingun`) and
+/// the defence turret write them, every infantry weapon keeps the
+/// constructor's 3 / 6 / 2.0 s, and no BF1 class writes one.
+#[test]
+fn the_baked_weapons_carry_their_barrage_keys() {
+    use game::classdb::fnv1a_lowercase;
+    assert_eq!(fnv1a_lowercase("BarrageMin"), 0x1aa5_ec35);
+    assert_eq!(fnv1a_lowercase("BarrageMax"), 0x04ba_e44b);
+    assert_eq!(fnv1a_lowercase("BarrageDelay"), 0xffcc_84b2);
+    let Some(dir) = classes_dir() else { return };
+    let bf1 = game::roster::load_classdb(&dir, "bf1", &FOUR).expect("bf1 db");
+    let bf2 = game::roster::load_classdb(&dir, "bf2", &FOUR).expect("bf2 db");
+    for (db, weapon, want) in [
+        (&bf2, "rep_weap_fly_vwing_cannon", ([10, 20], 0.5)),
+        (&bf2, "com_weap_inf_defenseturret", ([4, 8], 0.5)),
+        (&bf2, "rep_weap_inf_rifle", ([3, 6], 2.0)),
+        (&bf2, "rep_weap_inf_pistol", ([3, 6], 2.0)),
+        (&bf1, "all_weap_inf_rifle", ([3, 6], 2.0)),
+    ] {
+        let w = game::roster::weapon_from_db(db, weapon).expect(weapon);
+        assert_eq!((w.barrage, w.barrage_delay), want, "{weapon}");
+    }
+}
+
+/// Card HVYW (`analysis/re-soldier-ai.md` 22), data-gated: what the weapon
+/// choice's vehicle and crowd rules read reaches the sim's classes from the
+/// BAKED db - the ordnance chain's engine base (`OrdKind`), the AI mask's
+/// person and vehicle bits, the range triple. The launchers of both games
+/// are missiles whose mask refuses a person and takes a vehicle; the wrist
+/// rocket is a missile for persons only, and not the droid's first weapon;
+/// BF1's jet trooper "rocket launcher" is a bullet weapon and BF2's bulldog
+/// a missile in the first slot - neither is a heavy weapon of the port's.
+#[test]
+fn the_baked_launchers_are_missiles_for_vehicles() {
+    use core::weapon::OrdKind;
+    let Some(dir) = classes_dir() else { return };
+    let bf1 = game::roster::load_classdb(&dir, "bf1", &FOUR).expect("bf1 db");
+    let bf2 = game::roster::load_classdb(&dir, "bf2", &FOUR).expect("bf2 db");
+    // (weapon, kind, the mask takes a person, a vehicle, the range triple)
+    for (db, weapon, kind, person, vehicle, range) in [
+        (
+            &bf2,
+            "rep_weap_inf_rocket_launcher",
+            OrdKind::Missile,
+            false,
+            true,
+            [15.0, 75.0, 300.0],
+        ),
+        (
+            &bf2,
+            "imp_weap_inf_rocket_launcher",
+            OrdKind::Missile,
+            false,
+            true,
+            [15.0, 75.0, 300.0],
+        ),
+        (
+            &bf2,
+            "cis_weap_inf_wrist_rocket",
+            OrdKind::Missile,
+            true,
+            false,
+            [0.0, 16.0, 48.0],
+        ),
+        (
+            &bf2,
+            "cis_weap_inf_bulldog",
+            OrdKind::Missile,
+            true,
+            false,
+            [0.0, 24.0, 40.0],
+        ),
+        (
+            &bf2,
+            "rep_weap_inf_rifle",
+            OrdKind::Other,
+            true,
+            false,
+            [0.0, 24.0, 64.0],
+        ),
+        (
+            &bf1,
+            "all_weap_inf_torpedo_launcher",
+            OrdKind::Missile,
+            false,
+            true,
+            [6.0, 75.0, 150.0],
+        ),
+        (
+            &bf1,
+            "cis_weap_inf_torpedo_launcher",
+            OrdKind::Missile,
+            false,
+            true,
+            [10.0, 75.0, 150.0],
+        ),
+        (
+            &bf1,
+            "cis_weap_inf_wrist_rocket",
+            OrdKind::Missile,
+            true,
+            false,
+            [0.0, 16.0, 48.0],
+        ),
+        (
+            &bf1,
+            "rep_weap_inf_rocket_launcher",
+            OrdKind::Other,
+            true,
+            false,
+            [0.0, 30.0, 60.0],
+        ),
+    ] {
+        let w = game::roster::weapon_from_db(db, weapon).expect(weapon);
+        assert_eq!(w.ordnance.kind, kind, "{weapon}");
+        assert_eq!(w.ai_target_kind & 1 != 0, person, "{weapon}: person");
+        assert_eq!(w.ai_target_kind & 8 != 0, vehicle, "{weapon}: vehicle");
+        assert_eq!(w.ai_range, range, "{weapon}");
+    }
+    // The super battle droid's class: BF1's `cis_inf_battledroid`, BF2's
+    // CIS rifleman.
+    for (db, droid) in [
+        (&bf1, "cis_inf_battledroid"),
+        (&bf2, "cis_inf_default_rifleman"),
+    ] {
+        let th = game::roster::thrown_weapon_from_db(db, "rep_weap_inf_thermaldetonator")
+            .expect("thermal")
+            .expect("a thrown weapon");
+        assert_eq!(th.ordnance.kind, OrdKind::Lobbed);
+        // It holds its wrist rocket behind its blaster.
+        let slots = db.weapon_slots(droid);
+        let slot = |name: &str| {
+            slots
+                .iter()
+                .find(|s| s.weapon.eq_ignore_ascii_case(name))
+                .map(|s| s.slot)
+        };
+        let (blaster, rocket) = (
+            slot("cis_weap_inf_wrist_blaster").expect("the blaster"),
+            slot("cis_weap_inf_wrist_rocket").expect("the wrist rocket"),
+        );
+        assert!(blaster < rocket, "{blaster} {rocket}");
+    }
+}

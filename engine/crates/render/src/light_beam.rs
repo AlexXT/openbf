@@ -1,0 +1,320 @@
+//! The PS2's "lightbeam" renderer (card CPHOL, `analysis/re-point-lights.md`
+//! §10 and §15 [O]; BF2 `FUN_00469628`, its tables `FUN_004691f0`; BF1's twin
+//! `FUN_00386170`): the column of a command post's hologram.
+//!
+//! A beam with a length is NOT a cone in space: it is one flat fan of 22
+//! vertices in the plane through its axis that faces the eye — x along
+//! `side = normalize((base − eye) × axis)`, y along the axis — so it turns
+//! about its axis with the viewer:
+//! - 3 vertices at y 0, x −0.6 / 0 / +0.6 of the base radius, alpha 0;
+//! - 6 at y 0.2·r0, x from −r0 to +r0, alpha A·f·√(1 − (x/r0)²);
+//! - 7 at y L, x from −r1 to +r1, alpha A·f·0.25·√(1 − (x/r1)²);
+//! - 6 on a round cap over the top, `cap` high, alpha 0.
+//!
+//! `f` is the view's own factor: 1 − g² (g = the axial fraction of the
+//! eye's offset: looked at from the side the beam is full, along its axis it
+//! is gone), times a fade as the eye comes inside the cone's radius, times
+//! the far fade over the last 19 % of the visible distance squared.
+//!
+//! **Near the eye** ([`crosses_near`], PROVISIONAL [D]): the PS2 hands the fan
+//! to its packed-strip draw with a box — the fan's own extent and ±1 m along
+//! its normal (`FUN_00469628` 529237–529238) — and its frames show NO beam
+//! where that box reaches the near plane: at the 12 stored poses with the
+//! eye within 1.11 m of a post's axis the PS2 draws none (a beam there would
+//! wash the whole frame, 5 to 21 levels), at 1.79 m and beyond it does.
+//!
+//! GS state: ALPHA 0x48 (Cs·As + Cd), TEST 0x51001 (depth tested, never
+//! written), Gouraud, no fog — the particles' additive pipeline. The vertex
+//! colour is the beam's bytes halved (`(b + 1) >> 1`) and [`Beam::gs_rgb`]
+//! is what a halved byte of 128 shows as: 1.0 in BF2, which binds
+//! `white.tga` and modulates (128 = ×1.0); 0.5 in BF1, which binds no sheet
+//! (`FUN_00386170`: `FUN_0049e300(0, 0, 0)`), so the colour goes out as it
+//! is. Seen in the PS2's frames: BF2 Death Star cp3's column adds 86 / 42 /
+//! 40 levels of (200, 100, 100); BF1 Kashyyyk Docks cp3's adds 42 / 82 / 35
+//! of (100, 200, 100).
+
+use crate::grass::GrassVertex;
+use crate::Camera;
+use glam::Vec3;
+
+/// The top row's alpha against the bottom row's (beam +0x18c).
+pub const TOP_ALPHA: f32 = 0.25;
+
+/// One beam in the world.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Beam {
+    pub base: Vec3,
+    /// Unit, the beam's own +Y.
+    pub axis: Vec3,
+    pub length: f32,
+    /// The radius at the base and at `length`.
+    pub r0: f32,
+    pub r1: f32,
+    /// The soft end's height over `length` seen from the side.
+    pub soft: f32,
+    /// The visible distance, metres (0 = no limit of its own).
+    pub visible: f32,
+    /// The displayed value of a colour byte of 128 (module doc).
+    pub gs_rgb: f32,
+}
+
+/// The fan's strip as the PS2 indexes it (`FUN_004691f0`): `true` = this
+/// vertex ends no triangle.
+const STRIP: [(u8, bool); 34] = [
+    (8, true),
+    (7, true),
+    (2, false),
+    (6, false),
+    (1, false),
+    (5, false),
+    (0, false),
+    (4, false),
+    (3, false),
+    (9, true),
+    (3, true),
+    (10, false),
+    (4, false),
+    (11, false),
+    (5, false),
+    (12, false),
+    (6, false),
+    (13, false),
+    (7, false),
+    (14, false),
+    (8, false),
+    (15, false),
+    (21, true),
+    (14, false),
+    (20, false),
+    (13, false),
+    (19, false),
+    (12, false),
+    (18, false),
+    (11, false),
+    (17, false),
+    (10, false),
+    (16, false),
+    (9, false),
+];
+
+/// The view's factor `f` and the axial fraction `g` for an eye at `eye`
+/// (`near` = the view's near plane), or `None` where the beam is not drawn.
+pub fn view_factor(b: &Beam, eye: Vec3, near: f32) -> Option<(f32, f32)> {
+    let v = b.base - eye;
+    let d2 = v.length_squared();
+    let vis2 = b.visible * b.visible;
+    if b.visible > 0.0 && d2 >= vis2 {
+        return None;
+    }
+    let ax = v.dot(b.axis);
+    // The cone's radius at the eye's height (an eye over the base).
+    let r_eye = if ax < 0.0 {
+        b.r0 - (b.r1 - b.r0) * ax / b.length
+    } else {
+        b.r0
+    };
+    let off_axis = (v - b.axis * ax).length() - near;
+    let g = ax / if b.r0 * b.r0 < d2 { d2.sqrt() } else { b.r0 };
+    let mut f = 1.0 - g * g;
+    if off_axis < 0.0 {
+        f = 0.0;
+    } else if off_axis < r_eye {
+        f *= off_axis / r_eye;
+    }
+    if b.visible > 0.0 && d2 > 0.81 * vis2 {
+        f *= (vis2 - d2) / (vis2 - 0.81 * vis2);
+    }
+    Some((f.max(0.0), g))
+}
+
+/// The fan's 22 points as (x, y, alpha factor) — alpha = A·f·factor.
+pub fn fan(b: &Beam, g: f32) -> [(f32, f32, f32); 22] {
+    let mut out = [(0.0, 0.0, 0.0); 22];
+    for (i, p) in out.iter_mut().take(3).enumerate() {
+        *p = ((i as f32 * 0.6 - 0.6) * b.r0, 0.0, 0.0);
+    }
+    for i in 0..6 {
+        let x = i as f32 * 0.4 - 1.0;
+        out[3 + i] = (x * b.r0, 0.2 * b.r0, (1.0 - x * x).max(0.0).sqrt());
+    }
+    for i in 0..7 {
+        let x = i as f32 / 3.0 - 1.0;
+        out[9 + i] = (
+            x * b.r1,
+            b.length,
+            TOP_ALPHA * (1.0 - x * x).max(0.0).sqrt(),
+        );
+    }
+    // The cap: `soft` high from the side, the top's own radius along the axis.
+    let cap = b.soft + g.abs() * (b.r1 - b.soft);
+    for i in 0..6 {
+        let c = (i as f32 + 0.5) / 3.0 - 1.0;
+        let c = c + (1.0 / 18.0_f32).copysign(c);
+        out[16 + i] = (c * b.r1, b.length + cap * (1.0 - c * c).sqrt(), 0.0);
+    }
+    out
+}
+
+/// Does the fan's box — its extent in its plane (×1.01) and ±1 m along its
+/// normal — reach the view's near plane (module doc)?
+pub fn crosses_near(b: &Beam, side: Vec3, g: f32, camera: &Camera) -> bool {
+    let (fwd, normal) = (camera.forward(), side.cross(b.axis));
+    let x = 1.01 * b.r0.max(b.r1);
+    let cap = b.soft + g.abs() * (b.r1 - b.soft);
+    let depth = |x: f32, y: f32, z: f32| {
+        (b.base + side * x + b.axis * y + normal * z - camera.position).dot(fwd)
+    };
+    [-x, x].iter().any(|&x| {
+        [-0.01, 1.01 * (b.length + cap)]
+            .iter()
+            .any(|&y| [-1.0, 1.0].iter().any(|&z| depth(x, y, z) < camera.near))
+    })
+}
+
+/// The beam's triangles for this view, coloured `rgba` (its bytes before the
+/// GS halving; alpha 255 = ×1.0).
+pub fn vertices(b: &Beam, rgba: [u8; 4], camera: &Camera) -> Vec<GrassVertex> {
+    let eye = camera.position;
+    let Some((f, g)) = view_factor(b, eye, camera.near) else {
+        return Vec::new();
+    };
+    let side = (b.base - eye).cross(b.axis);
+    if f <= 0.0 || side.length_squared() < 1e-12 {
+        return Vec::new();
+    }
+    let side = side.normalize();
+    if crosses_near(b, side, g, camera) {
+        return Vec::new();
+    }
+    let half = |v: u8| f32::from((u16::from(v) + 1) >> 1);
+    let rgb = [rgba[0], rgba[1], rgba[2]].map(|c| half(c) / 128.0 * b.gs_rgb);
+    let a = f32::from(rgba[3]);
+    let points = fan(b, g).map(|(x, y, k)| {
+        // The alpha byte is truncated before the GS halves it.
+        let alpha = half((a * f * k) as u8) / 128.0;
+        GrassVertex {
+            position: (b.base + side * x + b.axis * y).to_array(),
+            uv: [0.0, 0.0],
+            color: [rgb[0], rgb[1], rgb[2], alpha],
+            up: 0.0,
+        }
+    });
+    let mut out = Vec::with_capacity(29 * 3);
+    for w in STRIP.windows(3) {
+        if !w[2].1 {
+            out.extend(w.iter().map(|k| points[usize::from(k.0)]));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn post() -> Beam {
+        Beam {
+            base: Vec3::new(0.0, 0.0, -10.0),
+            axis: Vec3::Y,
+            length: 3.5,
+            r0: 0.5,
+            r1: 1.0,
+            soft: 0.7,
+            visible: 200.0,
+            gs_rgb: 1.0,
+        }
+    }
+
+    /// The fan of a post's beam: base 0.5, top 1.0 at 3.5 m, brightest on the
+    /// axis, a quarter of it at the top, nothing at the rim or the cap.
+    #[test]
+    fn the_fan_is_the_ps2s_22_points() {
+        let p = fan(&post(), 0.0);
+        assert_eq!((p[0].0, p[2].0, p[1]), (-0.3, 0.3, (0.0, 0.0, 0.0)));
+        assert_eq!((p[3].0, p[3].1, p[3].2), (-0.5, 0.1, 0.0));
+        assert!((p[5].2 - 0.979_796).abs() < 1e-5, "{}", p[5].2);
+        assert_eq!((p[9].0, p[12], p[15].0), (-1.0, (0.0, 3.5, 0.25), 1.0));
+        assert!(p[9].2 == 0.0 && p[15].2.abs() < 1e-3);
+        assert!((p[16].0 + 0.888_889).abs() < 1e-5 && p[16].2 == 0.0);
+        assert!((p[18].1 - (3.5 + 0.7 * (1.0f32 - 0.222_222 * 0.222_222).sqrt())).abs() < 1e-4);
+        // Along the axis the cap is the top's radius high.
+        assert!(
+            (fan(&post(), 1.0)[18].1 - (3.5 + (1.0f32 - 0.222_222 * 0.222_222).sqrt())).abs()
+                < 1e-4
+        );
+    }
+
+    /// 29 triangles in the plane that faces the eye, each vertex's colour
+    /// the bytes halved; the same beam from another side is the same fan
+    /// turned about its axis.
+    #[test]
+    fn the_fan_faces_the_eye() {
+        let cam = Camera::default();
+        let v = vertices(&post(), [200, 100, 100, 255], &cam);
+        assert_eq!(v.len(), 29 * 3);
+        assert!(v.iter().all(|p| (p.position[2] + 10.0).abs() < 1e-5));
+        assert!(v
+            .iter()
+            .all(|p| p.color[..3] == [100.0 / 128.0, 50.0 / 128.0, 50.0 / 128.0]));
+        let top = v.iter().map(|p| p.color[3]).fold(0.0, f32::max);
+        // f = 1 − g² with g = 0 (the eye level with the base): 250 → 125.
+        assert!((top - 125.0 / 128.0).abs() < 1e-6, "{top}");
+        let cam2 = Camera {
+            position: Vec3::new(10.0, 0.0, -10.0),
+            yaw: std::f32::consts::FRAC_PI_2,
+            ..Camera::default()
+        };
+        let w = vertices(&post(), [200, 100, 100, 255], &cam2);
+        assert!(w.iter().all(|p| p.position[0].abs() < 1e-5));
+        assert_eq!(w.len(), v.len());
+    }
+
+    /// The view's factor: full from the side, gone along the axis, fading as
+    /// the eye enters the cone and over the last 19 % of the distance squared.
+    #[test]
+    fn the_beam_fades_with_the_view() {
+        let b = post();
+        let side = view_factor(&b, Vec3::ZERO, 0.1).unwrap();
+        assert!((side.0 - 1.0).abs() < 1e-6 && side.1 == 0.0);
+        // 45° over the base: g² = 0.5.
+        let over = view_factor(&b, Vec3::new(0.0, 10.0, 0.0), 0.1).unwrap();
+        assert!((over.0 - 0.5).abs() < 1e-5 && over.1 < 0.0, "{over:?}");
+        // Inside the cone at its base height: 0.35 m off the axis, near 0.1.
+        let inside = view_factor(&b, Vec3::new(0.35, 0.0, -10.0), 0.1).unwrap();
+        assert!((inside.0 - 0.25 / 0.5).abs() < 1e-5, "{inside:?}");
+        assert_eq!(
+            view_factor(&b, Vec3::new(0.05, 0.0, -10.0), 0.1).unwrap().0,
+            0.0
+        );
+        // 190 m off: (200² − 190²) / (0.19 · 200²).
+        let far = view_factor(&b, Vec3::new(0.0, 0.0, 180.0), 0.1).unwrap();
+        assert!((far.0 - 3900.0 / 7600.0).abs() < 1e-4, "{far:?}");
+        assert!(view_factor(&b, Vec3::new(0.0, 0.0, 190.0), 0.1).is_none());
+    }
+
+    /// The PS2 draws no beam where the fan's box reaches the near plane:
+    /// none at the stored pose of BF2 Tantive cp3 (the eye 1.11 m from the
+    /// axis, looking at it), one at BF2 Mos Eisley cp2's (1.79 m).
+    #[test]
+    fn no_beam_where_its_box_reaches_the_near_plane() {
+        let pose = |eye: [f32; 3], yaw: f32, base: [f32; 3]| {
+            let cam = Camera {
+                position: Vec3::from(eye),
+                yaw: yaw.to_radians(),
+                pitch: (-0.64f32).to_radians(),
+                ..Camera::default()
+            };
+            let b = Beam {
+                base: Vec3::from(base),
+                ..post()
+            };
+            vertices(&b, [200, 100, 100, 255], &cam).len()
+        };
+        let tan1 = pose([-277.024, 2.887, 75.037], 179.46, [-277.0, 1.32, 76.15]);
+        assert_eq!(tan1, 0);
+        let level = |d: f32| pose([0.0, 1.5, d], 0.0, [0.0, 0.0, 0.0]);
+        assert_eq!((level(1.0), level(1.79)), (0, 29 * 3));
+        // Looking away from it the box is behind the eye: none either.
+        assert_eq!(pose([0.0, 1.5, 3.0], 180.0, [0.0, 0.0, 0.0]), 0);
+    }
+}

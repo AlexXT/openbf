@@ -1,0 +1,1740 @@
+//! The windowed game (winit + gilrs): one `App` state machine for the
+//! BF2-style shell, the BF1 loading screen and the battle's per-frame loop —
+//! [`run_windowed`] for `--map`, [`run_shell`] for the shell — and the glue
+//! only a window uses: event sounds, the pause menu's actions and cheat words,
+//! the profile autosave and the title-bar line.
+
+use super::battle::{
+    hud_model, load_and_upload, load_hud_view, make_walk, spawn_model, squad_icons, walk_draws,
+};
+use super::{BattleSetup, ViewerArgs};
+use anyhow::Result;
+use core::sim::PadState;
+use game::viewer::{camera_from, upload_unit_cube, SceneGpu, CLEAR, GOLDEN_CAM};
+use game::walk::WalkSim;
+use render::{Camera, DrawCmd, MeshHandle, Renderer};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Start take `take` of Music `music` from the disc, silent-safe: a take
+/// the indexes do not hold, or an LVL that is not there, plays nothing.
+fn start_take(
+    audio: &mut audio::Audio,
+    m: &game::music::BattleMusic,
+    music: usize,
+    take: usize,
+    volume_db: f32,
+) -> Option<audio::MusicVoice> {
+    let track = m.track(music)?;
+    let t = track.takes.get(take)?.clone();
+    audio
+        .play_stream(t, volume_db, track.def.looping)
+        .map_err(|e| eprintln!("music: {e:#}"))
+        .ok()
+}
+/// Start the sounds of the tick the sim just stepped (`game::event_sounds`).
+fn play_event_sounds(
+    audio: &mut audio::Audio,
+    sl: &mut game::sounds::SoundLib,
+    foley: Option<&mut game::foley::Foley>,
+    engines: &mut game::engine_sound::EngineSounds,
+    effects: &[(String, glam::Vec3)],
+    aspect: f32,
+    walk: &WalkSim,
+) {
+    let listener = game::event_sounds::listener(walk);
+    game::event_sounds::each(walk, listener.pos, |name, pos| {
+        sl.play(audio, name, pos, &listener);
+    });
+    // The hurt and death cries, one voice per unit (card UCRY).
+    let mut asks = Vec::new();
+    game::event_sounds::cries(walk, |c| {
+        let hash = c.name.map_or(0, game::classdb::fnv1a_lowercase);
+        asks.push((c.unit, hash, c.pos));
+    });
+    sl.play_cries(audio, &asks, &listener);
+    // The sounds of the explosions' effects (`Fx::take_sounds`).
+    for (name, pos) in effects {
+        sl.play(audio, name, *pos, &listener);
+    }
+    // The layers whose delay ends this tick (card WSND).
+    sl.update(audio, core::TICK_DT, &listener);
+    // The vehicles' engine layers (card VSND).
+    let mut voices = Vec::new();
+    engines.tick(walk, |h, l| sl.engine(h, l), &mut voices);
+    sl.loop_voices(audio, &voices, &listener);
+    // The soldiers' steps and stance sounds (card FOLY).
+    if let Some(foley) = foley {
+        let view = game::foley::View::of(&walk.camera(), aspect);
+        foley.tick(walk, &view, |s| {
+            sl.play_by_hash(audio, s.hash, s.pos, &listener);
+        });
+    }
+}
+
+/// The world's ambience streams and loops for the tick the sim just
+/// stepped (card AMBS); the battle's end stops every sound
+/// (re-ambience-music 0.4).
+fn play_ambience(
+    audio: &mut audio::Audio,
+    sl: &mut game::sounds::SoundLib,
+    ambience: &game::ambience::Ambience,
+    walk: &WalkSim,
+) {
+    let listener = game::event_sounds::listener(walk);
+    if walk.sim.outcome.is_some() {
+        sl.stop_ambient();
+    } else {
+        sl.ambient_voices(audio, ambience, &listener);
+        if game::dev::on() && walk.sim.tick.is_multiple_of(10 * core::TICK_HZ as u64) {
+            eprintln!(
+                "ambience: {} of {} emitters sounding",
+                sl.ambient_playing(),
+                ambience.emitters.len()
+            );
+        }
+    }
+}
+
+/// The playtest black box for the battle about to start — dev mode only
+/// (`game::blackbox`, card BLKB); `None` in normal play.
+fn start_blackbox(
+    scene: &game::assets::Scene,
+    walk: &WalkSim,
+    mode: &str,
+    setup: &BattleSetup,
+    sounds: Option<&mut game::sounds::SoundLib>,
+) -> Option<game::blackbox::BlackBox> {
+    use game::blackbox::{BlackBox, Meta};
+    if !game::blackbox::on() {
+        return None;
+    }
+    // The baked directory's name (`bf2_kam1`): what the sweep calls the map.
+    let map = scene.dir.file_name().map_or_else(
+        || scene.manifest.map.clone(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let mut meta = Meta::for_run(
+        &map,
+        mode,
+        &scene.manifest.source_game,
+        setup.seed,
+        setup.difficulty.label(),
+    );
+    meta.mission = setup.mission_file.clone().unwrap_or_default();
+    meta.player_team = setup.player_team;
+    let dir = game::blackbox::default_dir();
+    println!("blackbox: on, F9 writes {}/last.json", dir.display());
+    let mut bb = BlackBox::start(true, meta, walk, scene.collision_body_labels(), dir)?;
+    bb.install_panic_hook();
+    // Its sound rows (card SNDB): the mixer's starts, by property name.
+    if let Some(sl) = sounds {
+        sl.handed = Some(Vec::new());
+        let root = scene.dir.parent().unwrap_or(&scene.dir).to_path_buf();
+        bb.sound_names(game::event_sounds::sound_names(&scene.dir, walk), root);
+    }
+    Some(bb)
+}
+
+/// Hand the black box the one-shots the mixer was given since the last call.
+fn note_sounds(
+    bb: &mut game::blackbox::BlackBox,
+    sounds: Option<&mut game::sounds::SoundLib>,
+    tick: u64,
+) {
+    if let Some(sl) = sounds {
+        let loops = sl.loops_playing();
+        if let Some(handed) = sl.handed.as_mut() {
+            bb.sounds(tick, handed, loops);
+        }
+    }
+}
+
+/// Autosave the settings a menu action changed.
+fn persist_setting(profile: &mut game::profile::Profile, a: ui::menu::MenuAction, walk: &WalkSim) {
+    use ui::menu::MenuAction;
+    match a {
+        MenuAction::SetAssist(_) => profile.settings.assist_intensity = walk.sim.assist_intensity,
+        MenuAction::SetAiCap(_) => profile.settings.ai_alive_cap = Some(walk.sim.ai_alive_cap),
+        MenuAction::SetFov(_) => profile.settings.fov_scale = walk.fov_scale,
+        MenuAction::SetMusic(v) => profile.settings.music_volume = v,
+        _ => return,
+    }
+    if let Err(e) = profile.save() {
+        eprintln!("profile autosave failed: {e:#}");
+    }
+}
+
+/// The weather's own random stream starts here (never the sim's).
+const WEATHER_SEED: u32 = 0x7ea7_4e12;
+
+/// The velocity of what the player's camera tracks — the soldier, or the
+/// vehicle ridden: what tilts a rain streak (re-weather.md §3.1).
+fn tracked_velocity(walk: &WalkSim) -> glam::Vec3 {
+    let Some(me) = walk.sim.unit(walk.player) else {
+        return glam::Vec3::ZERO;
+    };
+    match me.mount.and_then(|m| walk.sim.vehicle(m.vehicle)) {
+        Some(v) => v.vel,
+        None => me.soldier.vel,
+    }
+}
+
+/// This frame's rain splashes (re-weather.md §5): each point dropped by a
+/// ray from 50 m over the camera, 100 m down, onto terrain or buildings —
+/// the ordnance ray's mask — and the map's `GroundEffect` started there.
+fn rain_splashes(
+    w: &mut game::weather::Weather,
+    fx: &mut game::fx::Fx,
+    walk: &WalkSim,
+    aspect: f32,
+    dt: f32,
+) {
+    let Some(name) = w.precip.ground_effect.clone() else {
+        return;
+    };
+    let view = game::weather::View::from_camera(&walk.camera(), aspect);
+    let sim = &walk.sim;
+    let down = glam::Vec3::NEG_Y;
+    let hits = w.splashes(dt, &view, 1, &mut |top| {
+        let body = sim
+            .collision
+            .ray(top, down, 100.0, core::collision::Layers::ORDNANCE)
+            .map(|(t, _)| t);
+        let ground = sim.terrain_ray(top, down, 100.0, 0.5);
+        let t = match (body, ground) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b)?,
+        };
+        Some(top + down * t)
+    });
+    for hit in hits {
+        fx.spawn(&name, game::fx::emitter::Frame::at(hit));
+    }
+}
+
+/// Fold the player's round into the career and autosave.
+fn record_round(profile: &mut game::profile::Profile, walk: &WalkSim) {
+    let me = &walk.sim.units[walk.player.index as usize];
+    // A time-limit tie is `MissionVictory({1,2})`: both teams win.
+    let won = walk
+        .sim
+        .outcome
+        .map(|w| w == me.team || w == core::sim::OUTCOME_DRAW);
+    profile.record_round(won, me.kills, me.deaths, me.weapon.shots_fired, 0);
+    if let Err(e) = profile.save() {
+        eprintln!("profile autosave failed: {e:#}");
+    } else {
+        println!(
+            "career: {} rounds, {} wins, {} kills / {} deaths",
+            profile.career.rounds, profile.career.wins, profile.career.kills, profile.career.deaths
+        );
+    }
+}
+
+/// PS2 BF2 pause-menu cheat words → openbf effects (analysis/re-cheat-codes.md
+/// §6). Every word toggles. The returned line is the confirmation shown in the
+/// HUD feed (the PS2 plays `shell_menu_accept`; that property is not in the
+/// extracted BF2 SOUND/SHELL.LVL — open).
+fn apply_cheat_word(
+    word: &str,
+    walk: &mut WalkSim,
+    hud_hidden: &mut bool,
+    sfx_slow: &mut bool,
+    sounds: Option<&mut game::sounds::SoundLib>,
+) -> String {
+    let on = |b: bool| if b { "on" } else { "off" };
+    match word {
+        "sos" => {
+            walk.sim.cheats.toggle("invincible");
+            format!(
+                "cheat sos: invincibility {}",
+                on(walk.sim.cheats.invincible)
+            )
+        }
+        "ammo" => {
+            walk.sim.cheats.toggle("ammo");
+            format!(
+                "cheat ammo: infinite ammo {}",
+                on(walk.sim.cheats.infinite_ammo)
+            )
+        }
+        "hud" => {
+            *hud_hidden = !*hud_hidden;
+            format!(
+                "cheat hud: HUD {}",
+                if *hud_hidden { "hidden" } else { "shown" }
+            )
+        }
+        "slow" => {
+            *sfx_slow = !*sfx_slow;
+            let rate = if *sfx_slow { 0.3 } else { 1.0 };
+            if let Some(sl) = sounds {
+                sl.rate_mul = rate;
+            }
+            format!("cheat slow: positional SFX pitch x{rate}")
+        }
+        "80s" => "cheat 80s: low-res soldiers (no soldier LOD models yet: no-op)".into(),
+        "at" => "cheat at: comic hit effects (no melee AddHitEffect yet: no-op)".into(),
+        "alias" => "cheat alias: PS2 GS post-filter toggle (no-op on PC)".into(),
+        other => format!("cheat {other}: unknown"),
+    }
+}
+
+/// Apply a pause-menu action to the battle/session.
+fn apply_menu_action(
+    walk: &mut WalkSim,
+    a: ui::menu::MenuAction,
+    paused: &mut bool,
+    event_loop: &winit::event_loop::ActiveEventLoop,
+) {
+    use ui::menu::MenuAction;
+    match a {
+        MenuAction::Resume => *paused = false,
+        MenuAction::ToggleCheat(i) => {
+            let id = walk.sim.cheats.entries()[i].0;
+            walk.sim.cheats.toggle(id);
+            println!("cheat {id}: {}", walk.sim.cheats.entries()[i].2);
+        }
+        MenuAction::SetAssist(v) => walk.sim.assist_intensity = v.clamp(0.0, 1.5),
+        MenuAction::SetAiCap(c) => walk.sim.ai_alive_cap = c,
+        MenuAction::SetMusic(v) => {
+            if let Some(m) = walk.music.as_mut() {
+                m.volume = v.clamp(game::music::VOLUME_RANGE.0, game::music::VOLUME_RANGE.1);
+            }
+        }
+        MenuAction::SetFov(k) => {
+            walk.fov_scale = k.clamp(game::walk::FOV_SCALE_RANGE.0, game::walk::FOV_SCALE_RANGE.1)
+        }
+        // Quit: --map launches exit, shell launches return to the shell —
+        // decided by the caller (needs App state).
+        MenuAction::Quit => {
+            let _ = event_loop;
+        }
+    }
+}
+
+/// Battle state as one line — the window title and the round-over stdout line
+/// (the on-screen HUD is `ui::hud::draw_hud`).
+fn hud_title(walk: &WalkSim) -> String {
+    let b = &walk.sim.battle;
+    let posts = |t: u8| walk.sim.cps.iter().filter(|c| c.owner == Some(t)).count();
+    let me = &walk.sim.units[walk.player.index as usize];
+    let status = match walk.sim.outcome {
+        Some(core::sim::OUTCOME_DRAW) => "TIME UP — both teams win".to_string(),
+        Some(w) => format!("ROUND OVER — team {} wins", w + 1),
+        None if !me.alive => "respawning...".to_string(),
+        None => format!(
+            "HP {:.0} | ammo {}/{}",
+            me.health.cur, me.weapon.clip, me.weapon.spare
+        ),
+    };
+    format!(
+        "openbf — tickets {}/{} | posts {}/{} | {}",
+        b.teams[0].tickets(),
+        b.teams[1].tickets(),
+        posts(0),
+        posts(1),
+        status
+    )
+}
+
+// ── Windowed viewer (winit 0.30 ApplicationHandler + gilrs) ──────────────────
+
+enum Screen {
+    Shell,
+    Loading,
+    Battle,
+}
+
+/// BF1 load-screen playback state (Screen::Loading).
+struct Loading {
+    map_name: String,
+    map_dir: PathBuf,
+    started: std::time::Instant,
+    /// egui textures of the sequence (empty = no load screen baked).
+    textures: Vec<ui::egui::TextureHandle>,
+    /// The final image has been presented; load the map next frame.
+    load_pending: bool,
+    beep: Option<audio::LoopHandle>,
+}
+
+/// Seconds per load-screen image (the PS2 zoom sequence paces about 1 s/step).
+const LOAD_STEP_SECS: f32 = 1.0;
+
+struct App {
+    /// Direct launch target (--map); None = started in the shell.
+    map: Option<PathBuf>,
+    screen: Screen,
+    shell: ui::shell::ShellModel,
+    shell_last_map: usize,
+    assets_dir: PathBuf,
+    missions_dir: PathBuf,
+    loading: Option<Loading>,
+    audio: Option<audio::Audio>,
+    sounds: Option<game::sounds::SoundLib>,
+    /// The playing take of the battle's music (card AMBM); dropping it
+    /// stops it.
+    music_voice: Option<audio::MusicVoice>,
+    /// The battle's soldier foley (card FOLY), when the map has a table.
+    foley: Option<game::foley::Foley>,
+    /// The battle's vehicle engines (card VSND).
+    engines: game::engine_sound::EngineSounds,
+    /// The world's fixed sound emitters (card AMBS).
+    ambience: game::ambience::Ambience,
+    cam: Camera,
+    walk_requested: bool,
+    setup: BattleSetup,
+    mode: String,
+    frames: u64,
+    outcome_reported: bool,
+    overlay: Option<ui::overlay::EguiOverlay>,
+    /// The message box's lines (kills, posts, the player's orders).
+    feed: game::event_feed::EventFeed,
+    paused: bool,
+    menu_cursor: usize,
+    /// Spawn-screen cursor while the player is dead (UI only — `ui::spawn`).
+    spawn_cursor: usize,
+    /// Placeholder muzzle/impact effects (visual only — `game::fx`).
+    fx: game::fx::Fx,
+    /// The map's precipitation and wind (visual only — `game::weather`).
+    weather: Option<game::weather::Weather>,
+    /// The posts' holograms (visual only — `game::holo`).
+    holos: game::holo::Holos,
+    /// The laser bolts' ribbons (card FXB — `game::bolt_vis`).
+    bolts: game::bolt_vis::BoltVis,
+    fx_quad: Option<MeshHandle>,
+    fx_sprite: Option<render::TextureHandle>,
+    /// D11's two icons: `squad_cmd_highlight` over a commanded bot,
+    /// `squad_cmd_cross` on a Hold's anchor.
+    squad_icons: (Option<render::TextureHandle>, Option<render::TextureHandle>),
+    /// BF2's HUD for the battle in play (a fresh one per battle: its fades
+    /// start over).
+    hud_view: Option<game::hud_feed::HudView>,
+    /// The playtest black box (dev mode; `None` in normal play) and an F9
+    /// press waiting for the frame to write it.
+    blackbox: Option<game::blackbox::BlackBox>,
+    snapshot_requested: bool,
+    /// Quit chosen in the pause menu; handled after the frame.
+    quit_clicked: bool,
+    profile: game::profile::Profile,
+    round_recorded: bool,
+    /// Previous frame's menu-relevant buttons (edge detection).
+    prev_menu_buttons: u32,
+    /// One click of L3 sprints (`input::SprintLatch`).
+    sprint_latch: input::SprintLatch,
+    /// PS2 BF2 Morse cheat recogniser — process lifetime, never reset (authentic).
+    morse: ui::menu::MorseCheats,
+    /// `hud` cheat: HUD hidden.
+    hud_hidden: bool,
+    /// `slow` cheat: positional SFX at 0.3× pitch.
+    sfx_slow: bool,
+    window: Option<Arc<winit::window::Window>>,
+    renderer: Option<Renderer>,
+    gpu: Option<SceneGpu>,
+    walk: Option<(WalkSim, MeshHandle)>,
+    /// Animated soldier models (per team) — `None` before a battle starts.
+    soldier_vis: Option<game::soldier_vis::SoldierVisuals>,
+    /// The battle's vehicle models (card VDRAW) — empty before a battle.
+    vehicle_vis: game::viewer::VehicleVisuals,
+    gilrs: Option<gilrs::Gilrs>,
+    /// A connected pad's dead camera stick / FIRE (`input::log_pads`), shown
+    /// on every screen until a pad that resolves replaces it (card PADM).
+    pad_warning: Option<String>,
+    last: std::time::Instant,
+}
+
+/// Open gilrs through `input::open_gilrs` and log how each pad resolved.
+fn open_pads() -> (Option<gilrs::Gilrs>, Option<String>) {
+    match input::open_gilrs() {
+        Ok(g) => {
+            let w = input::log_pads(&g);
+            (Some(g), w)
+        }
+        Err(e) => {
+            eprintln!("gilrs unavailable ({e}); no controller input");
+            (None, None)
+        }
+    }
+}
+
+pub(super) fn run_windowed(v: ViewerArgs) -> Result<()> {
+    let event_loop = winit::event_loop::EventLoop::new()?;
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    let (gilrs, pad_warning) = open_pads();
+    let setup = BattleSetup::from_args(&v, v.seed)?;
+    let mut app = App {
+        map: Some(v.map.clone()),
+        screen: Screen::Battle,
+        shell: ui::shell::ShellModel::default(),
+        shell_last_map: usize::MAX,
+        loading: None,
+        audio: audio::Audio::new(),
+        sounds: None,
+        music_voice: None,
+        foley: None,
+        engines: Default::default(),
+        ambience: Default::default(),
+        assets_dir: v
+            .map
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".")),
+        missions_dir: PathBuf::from("missions"),
+        cam: camera_from(v.cam),
+        walk_requested: v.walk,
+        setup,
+        mode: v.mode.clone(),
+        frames: 0,
+        outcome_reported: false,
+        overlay: None,
+        feed: game::event_feed::EventFeed::default(),
+        paused: false,
+        menu_cursor: 0,
+        quit_clicked: false,
+        profile: game::profile::Profile::load_or_default(),
+        round_recorded: false,
+        spawn_cursor: 0,
+        fx: game::fx::Fx::default(),
+        weather: None,
+        holos: game::holo::Holos::default(),
+        bolts: game::bolt_vis::BoltVis::default(),
+        fx_quad: None,
+        fx_sprite: None,
+        squad_icons: (None, None),
+        hud_view: None,
+        blackbox: None,
+        snapshot_requested: false,
+        prev_menu_buttons: 0,
+        sprint_latch: input::SprintLatch::default(),
+        morse: ui::menu::MorseCheats::new(),
+        hud_hidden: false,
+        sfx_slow: false,
+        window: None,
+        renderer: None,
+        gpu: None,
+        walk: None,
+        soldier_vis: None,
+        vehicle_vis: Default::default(),
+        gilrs,
+        pad_warning,
+        last: std::time::Instant::now(),
+    };
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
+
+impl App {
+    /// Fly-cam: left stick moves (yaw-relative), right stick looks, triggers
+    /// fly down/up, south button = speed boost.
+    fn drive_fly_camera(&mut self, dt: f32) {
+        let Some(g) = &mut self.gilrs else { return };
+        if input::pump(g) {
+            self.pad_warning = input::log_pads(g);
+        }
+        let Some((_, pad)) = g.gamepads().next() else {
+            return;
+        };
+        let dead = |v: f32| if v.abs() < 0.15 { 0.0 } else { v };
+        let lx = dead(pad.value(gilrs::Axis::LeftStickX));
+        let ly = dead(pad.value(gilrs::Axis::LeftStickY));
+        let rx = dead(pad.value(gilrs::Axis::RightStickX));
+        let ry = dead(pad.value(gilrs::Axis::RightStickY));
+        let up = pad
+            .button_data(gilrs::Button::RightTrigger2)
+            .map_or(0.0, |b| b.value());
+        let down = pad
+            .button_data(gilrs::Button::LeftTrigger2)
+            .map_or(0.0, |b| b.value());
+        let boost = if pad.is_pressed(gilrs::Button::South) {
+            4.0
+        } else {
+            1.0
+        };
+
+        const LOOK_SPEED: f32 = 2.2;
+        const MOVE_SPEED: f32 = 60.0;
+        self.cam.yaw -= rx * LOOK_SPEED * dt;
+        self.cam.pitch = (self.cam.pitch + ry * LOOK_SPEED * dt).clamp(-1.55, 1.55);
+        let fwd = self.cam.forward();
+        let right = self.cam.right();
+        self.cam.position +=
+            (fwd * ly + right * lx + glam::Vec3::Y * (up - down)) * (MOVE_SPEED * boost * dt);
+    }
+
+    /// Populate the shell from the baked maps + profile.
+    fn init_shell(&mut self) {
+        let maps = game::assets::discover_maps(&self.assets_dir);
+        self.shell = ui::shell::ShellModel {
+            maps: maps
+                .iter()
+                .map(|(n, g, _)| (n.clone(), g.clone()))
+                .collect(),
+            mode: "con".into(),
+            teams: [0, 1],
+            ai_per_team: 8,
+            base_tickets: [250, 250],
+            ticket_pct: 100,
+            time_limit: 0,
+            cursor: 0,
+            career_line: format!(
+                "{} — {} rounds, {} wins, {} kills / {} deaths",
+                self.profile.name,
+                self.profile.career.rounds,
+                self.profile.career.wins,
+                self.profile.career.kills,
+                self.profile.career.deaths
+            ),
+            mission_found: false,
+            ..Default::default()
+        };
+        if let Some(last) = &self.profile.settings.last_map {
+            if let Some(i) = maps.iter().position(|(n, _, _)| n == last) {
+                self.shell.map_idx = i;
+            }
+        }
+        self.screen = Screen::Shell;
+        self.shell_last_map = usize::MAX;
+        self.seed_shell_from_map();
+    }
+
+    /// When the selected map changes: defaults from its mission file (or the
+    /// source game's default matchup).
+    fn seed_shell_from_map(&mut self) {
+        if self.shell.map_idx == self.shell_last_map {
+            return;
+        }
+        self.shell_last_map = self.shell.map_idx;
+        let Some((name, game)) = self.shell.maps.get(self.shell.map_idx).cloned() else {
+            return;
+        };
+        let fidx = |f: &str| {
+            ui::shell::FACTIONS
+                .iter()
+                .position(|x| *x == f)
+                .unwrap_or(0)
+        };
+        let path = self
+            .missions_dir
+            .join(format!("{name}_{}.ron", self.shell.mode));
+        match game::mission::MissionDef::load(&path) {
+            Ok(m) => {
+                let f = m.factions();
+                self.shell.teams = [fidx(&f[0]), fidx(&f[1])];
+                self.shell.base_tickets = m.tickets();
+                self.shell.ai_per_team = m.initial_ai(1, false).min(32);
+                self.shell.mission_found = true;
+            }
+            Err(_) => {
+                let d = game::roster::default_factions(&game);
+                self.shell.teams = [fidx(d[0]), fidx(d[1])];
+                self.shell.base_tickets = [250, 250];
+                self.shell.ai_per_team = 8;
+                self.shell.mission_found = false;
+            }
+        }
+    }
+
+    /// Shell → loading screen (BF1 sequence + beep), then the battle.
+    fn begin_loading(&mut self) {
+        let maps = game::assets::discover_maps(&self.assets_dir);
+        let Some((name, source_game, dir)) = maps.get(self.shell.map_idx).cloned() else {
+            eprintln!("no baked map selected");
+            return;
+        };
+        let mut textures = Vec::new();
+        // A map's own screen, else the game's generic one (BF2 LOAD/COMMON.LVL
+        // `loadscreen`, baked into common_bf2/load).
+        let screen = game::assets::load_loadscreen(&dir).or_else(|| {
+            game::assets::load_loadscreen(&self.assets_dir.join(format!("common_{source_game}")))
+        });
+        if let (Some(overlay), Some(ls)) = (&self.overlay, screen) {
+            // BF2 stills: one image per load (pick rotates with the clock).
+            let sequence: Vec<(String, game::assets::CpuTexture)> = if ls.pool {
+                let n = ls.sequence.len();
+                let pick = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as usize)
+                    % n.max(1);
+                ls.sequence.into_iter().skip(pick).take(1).collect()
+            } else {
+                ls.sequence
+            };
+            for (tex_name, t) in sequence {
+                let img = ui::egui::ColorImage::from_rgba_unmultiplied(
+                    [t.width as usize, t.height as usize],
+                    &t.rgba,
+                );
+                textures.push(overlay.ctx().load_texture(
+                    tex_name,
+                    img,
+                    ui::egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+        // BF1 loading beep (load_xtracking = the 440 Hz ui_load_lp at pitch
+        // 2.1, baked by `bake beep`).
+        let beep = self.audio.as_mut().and_then(|a| {
+            a.play_loop(&self.assets_dir.join("audio/load_xtracking.ogg"), 1.0, -8.0)
+                .ok()
+        });
+        self.loading = Some(Loading {
+            map_name: name,
+            map_dir: dir,
+            started: std::time::Instant::now(),
+            textures,
+            load_pending: false,
+            beep,
+        });
+        self.screen = Screen::Loading;
+    }
+
+    /// Loading frame: paint the current step; after the last step is shown,
+    /// perform the (synchronous) map load on the following frame.
+    fn redraw_loading(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let Some(l) = self.loading.as_mut() else {
+            self.screen = Screen::Shell;
+            return;
+        };
+        if l.load_pending {
+            if let (Some(a), Some(b)) = (self.audio.as_mut(), l.beep.as_mut()) {
+                a.stop(b);
+            }
+            let (name, dir) = (l.map_name.clone(), l.map_dir.clone());
+            self.loading = None;
+            self.start_battle(name, dir);
+            return;
+        }
+        let steps = l.textures.len().max(1);
+        let elapsed = l.started.elapsed().as_secs_f32();
+        let step = ((elapsed / LOAD_STEP_SECS) as usize).min(steps - 1);
+        let last_shown = step + 1 >= steps && elapsed >= LOAD_STEP_SECS * steps as f32;
+        let image = l.textures.get(step).map(|t| t.id());
+        let caption = l.map_name.to_uppercase();
+        if let (Some(r), Some(overlay), Some(window)) =
+            (&mut self.renderer, &mut self.overlay, &self.window)
+        {
+            let paint = overlay.begin(window, |ctx| {
+                ui::loading::draw_loading(ctx, image, &caption, step, steps);
+            });
+            if let Err(e) = r.render_with_overlay(
+                &Camera::default(),
+                &[],
+                [0.0, 0.0, 0.0, 1.0],
+                Some(&mut |dev, q, enc, view, size| overlay.paint(&paint, dev, q, enc, view, size)),
+            ) {
+                eprintln!("render: {e}");
+                event_loop.exit();
+            }
+        }
+        if last_shown {
+            if let Some(l) = self.loading.as_mut() {
+                l.load_pending = true;
+            }
+        }
+    }
+
+    /// Load the map + build the battle with the shell's settings.
+    fn start_battle(&mut self, name: String, dir: PathBuf) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let (gpu, scene) = match load_and_upload(renderer, &dir, &self.mode) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("failed to load map {name}: {e:#}");
+                return;
+            }
+        };
+        self.sounds = game::sounds::SoundLib::load(&dir);
+        self.music_voice = None;
+        // The mission whose pair was picked (Republic against CIS runs the
+        // map's Clone Wars script), the player's army on its own team there;
+        // a cross-era pair runs the map's default mission (card ERAM).
+        let armies = self.shell.teams.map(|t| ui::shell::FACTIONS[t]);
+        let pick = game::mission::pick(&self.missions_dir, &name, &self.shell.mode, armies);
+        let player_team = pick.as_ref().map_or(0, |p| p.player_team);
+        let mut teams = armies.map(str::to_string);
+        if player_team == 1 {
+            teams.swap(0, 1);
+        }
+        let mission_file = pick.as_ref().and_then(|p| super::file_name(&p.path));
+        match &pick {
+            Some(p) => println!(
+                "mission: {} for {} against {} ({}), the player on team {}",
+                p.path.display(),
+                armies[0],
+                armies[1],
+                if p.own {
+                    "its own pair"
+                } else {
+                    "a cross-era pair"
+                },
+                player_team + 1
+            ),
+            None => println!("mission: none for {name} {}", self.shell.mode),
+        }
+        let mission = pick.map(|p| p.mission);
+        let setup = BattleSetup {
+            seed: 42u32.wrapping_add(self.profile.career.rounds),
+            // The shell round takes the PROFILE's tier (no CLI flag here).
+            difficulty: self.profile.settings.difficulty,
+            spawn: (0.0, 0.0),
+            spawn_set: false,
+            targets: false,
+            ai: Some(self.shell.ai_per_team),
+            // The shell has its own alive-AI slider (MenuAction::SetAiCap).
+            ai_cap: None,
+            // The mission's counts (else 250) scaled by the shell's %.
+            tickets: 250,
+            tickets_set: false,
+            ticket_pct: self.shell.ticket_pct,
+            time_limit: self.shell.time_limit,
+            cheats: core::sim::Cheats::default(),
+            teams: Some(teams.clone()),
+            classes_dir: self.assets_dir.join("classes"),
+            mission,
+            mission_file,
+            player_team,
+        };
+        let cube = upload_unit_cube(renderer).expect("cube");
+        self.fx_quad = game::viewer::upload_billboard_quad(renderer).ok();
+        self.fx_sprite = game::viewer::upload_fx_sprite(renderer).ok();
+        let dir = self.assets_dir.clone();
+        self.squad_icons = squad_icons(renderer, &dir);
+        self.hud_view = load_hud_view(&dir, renderer);
+        self.bolts = game::bolt_vis::BoltVis::new(&self.assets_dir, &scene.manifest.source_game);
+        let mut walk = make_walk(&scene, &setup);
+        self.foley = game::foley::Foley::load(&scene.dir, &walk);
+        self.engines = game::engine_sound::EngineSounds::new(&scene.dir, &walk);
+        self.ambience =
+            game::ambience::Ambience::load(&scene.manifest, &scene.dir, &setup.classes_dir);
+        if let Some(sl) = self.sounds.as_mut() {
+            sl.for_walk(&scene.dir, &walk);
+        }
+        self.blackbox = start_blackbox(&scene, &walk, &self.mode, &setup, self.sounds.as_mut());
+        self.feed = game::event_feed::EventFeed::for_walk(
+            &self.assets_dir,
+            &scene.manifest.source_game,
+            &walk,
+        );
+        self.fx = game::fx::Fx::for_walk(
+            &self.assets_dir,
+            &scene.dir,
+            &scene.manifest.source_game,
+            &walk,
+        );
+        self.weather = game::weather::Weather::load(
+            &scene.manifest,
+            &self.assets_dir,
+            &scene.dir,
+            WEATHER_SEED,
+        );
+        self.soldier_vis = Some({
+            let mut vis = game::soldier_vis::SoldierVisuals::load(
+                renderer,
+                &self.assets_dir,
+                &scene.manifest.source_game,
+                &walk.teams,
+            );
+            vis.set_turrets(game::viewer::turret_pose::rigged_turrets(&scene));
+            vis.set_walker_rigs(game::viewer::walker_rigs(
+                &scene.manifest,
+                &self.assets_dir,
+                &walk.vehicle_geometry,
+            ));
+            vis
+        });
+        self.vehicle_vis = game::viewer::VehicleVisuals::load(
+            renderer,
+            &scene,
+            &self.assets_dir,
+            &walk.vehicle_geometry,
+        );
+        walk.sim.assist_intensity = self.profile.settings.assist_intensity;
+        walk.fov_scale = self.profile.settings.fov_scale;
+        if let Some(m) = walk.music.as_mut() {
+            m.volume = game::music::volume_from_env(self.profile.settings.music_volume);
+        }
+        // THE MAINTAINER'S RULE: the aim assist is the PLAYER'S switch — no difficulty
+        // tier reads it (the PS2 BF2's Elite clears it, RE §9.3; not ours).
+        walk.sim.assist_armed = self.profile.settings.aim_assist;
+        walk.sim.human_damage_on = self.profile.settings.human_damage_on;
+        walk.sim.team_handicap_on = self.profile.settings.team_handicap_on;
+        if let Some(cap) = self.profile.settings.ai_alive_cap {
+            walk.sim.ai_alive_cap = cap;
+        }
+        self.profile.settings.last_map = Some(name);
+        self.profile.settings.last_mode = Some(self.mode.clone());
+        self.profile.settings.last_teams = Some(teams);
+        if let Err(e) = self.profile.save() {
+            eprintln!("profile autosave failed: {e:#}");
+        }
+        self.walk = Some((walk, cube));
+        self.gpu = Some(gpu);
+        self.setup = setup;
+        self.paused = false;
+        self.outcome_reported = false;
+        self.round_recorded = false;
+        self.screen = Screen::Battle;
+    }
+
+    /// The black box's `exit` snapshot, written before the battle goes.
+    fn blackbox_exit(&mut self) {
+        if let (Some(bb), Some((walk, _))) = (self.blackbox.as_mut(), self.walk.as_ref()) {
+            bb.write("exit", Some(walk), true);
+        }
+        self.blackbox = None;
+    }
+
+    /// Battle → shell (records the round).
+    fn leave_battle(&mut self) {
+        self.blackbox_exit();
+        if let Some((walk, _)) = self.walk.as_mut() {
+            if !self.round_recorded {
+                self.round_recorded = true;
+                record_round(&mut self.profile, walk);
+            }
+        }
+        self.walk = None;
+        self.music_voice = None;
+        self.gpu = None;
+        self.hud_view = None;
+        self.paused = false;
+        if let Some(sl) = self.sounds.as_mut() {
+            sl.stop_loops();
+        }
+        self.init_shell();
+    }
+
+    /// Raw menu buttons this frame as edge bits: 1 up, 2 down, 4 left,
+    /// 8 right, 16 confirm (Cross), 32 back (Circle), 64 Start.
+    fn menu_edges(&mut self) -> u32 {
+        let mut now = 0u32;
+        if let Some(g) = &mut self.gilrs {
+            if input::pump(g) {
+                self.pad_warning = input::log_pads(g);
+            }
+            if let Some((_, pad)) = g.gamepads().next() {
+                use gilrs::Button;
+                let bits = [
+                    (Button::DPadUp, 1),
+                    (Button::DPadDown, 2),
+                    (Button::DPadLeft, 4),
+                    (Button::DPadRight, 8),
+                    (Button::South, 16),
+                    (Button::East, 32),
+                    (Button::Start, 64),
+                ];
+                for (b, bit) in bits {
+                    if pad.is_pressed(b) {
+                        now |= bit;
+                    }
+                }
+            }
+        }
+        let edges = now & !self.prev_menu_buttons;
+        self.prev_menu_buttons = now;
+        edges
+    }
+
+    /// Sample the first gamepad into a sim PadState (walk mode).
+    fn sample_pad(&mut self) -> PadState {
+        let Some(g) = &mut self.gilrs else {
+            return PadState::default();
+        };
+        if input::pump(g) {
+            self.pad_warning = input::log_pads(g);
+        }
+        match g.gamepads().next() {
+            Some((_, pad)) => input::pad_from_gamepad(&pad),
+            None => PadState::default(),
+        }
+    }
+}
+
+impl App {
+    /// Shell frame: navigate, maybe start, draw.
+    fn redraw_shell(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let edges = self.menu_edges();
+        let input = ui::menu::MenuInput {
+            up: edges & 1 != 0,
+            down: edges & 2 != 0,
+            left: edges & 4 != 0,
+            right: edges & 8 != 0,
+            confirm: edges & 16 != 0,
+            back: false,
+        };
+        let mut actions = ui::shell::navigate(&mut self.shell, input);
+        self.seed_shell_from_map();
+        let model = self.shell.clone();
+        let mut clicked = Vec::new();
+        if let (Some(r), Some(overlay), Some(window)) =
+            (&mut self.renderer, &mut self.overlay, &self.window)
+        {
+            let warning = self.pad_warning.as_deref();
+            let paint = overlay.begin(window, |ctx| {
+                clicked = ui::shell::draw_shell(ctx, &model);
+                if let Some(w) = warning {
+                    ui::hud::draw_pad_warning(ctx, w);
+                }
+            });
+            if let Err(e) = r.render_with_overlay(
+                &Camera::default(),
+                &[],
+                [0.05, 0.06, 0.10, 1.0],
+                Some(&mut |dev, q, enc, view, size| overlay.paint(&paint, dev, q, enc, view, size)),
+            ) {
+                eprintln!("render: {e}");
+                event_loop.exit();
+            }
+        }
+        actions.extend(clicked);
+        for a in actions {
+            match a {
+                ui::shell::ShellAction::Start => self.begin_loading(),
+                ui::shell::ShellAction::Quit => event_loop.exit(),
+            }
+        }
+    }
+}
+
+/// Shell entry: window + shell screen; battles start from the menu.
+pub(super) fn run_shell(assets_dir: PathBuf, missions_dir: PathBuf) -> Result<()> {
+    let event_loop = winit::event_loop::EventLoop::new()?;
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    let (gilrs, pad_warning) = open_pads();
+    let mut app = App {
+        map: None,
+        spawn_cursor: 0,
+        fx: game::fx::Fx::default(),
+        weather: None,
+        holos: game::holo::Holos::default(),
+        bolts: game::bolt_vis::BoltVis::default(),
+        fx_quad: None,
+        fx_sprite: None,
+        squad_icons: (None, None),
+        hud_view: None,
+        blackbox: None,
+        snapshot_requested: false,
+        screen: Screen::Shell,
+        shell: ui::shell::ShellModel::default(),
+        shell_last_map: usize::MAX,
+        assets_dir: assets_dir.clone(),
+        missions_dir,
+        loading: None,
+        audio: audio::Audio::new(),
+        sounds: None,
+        music_voice: None,
+        foley: None,
+        engines: Default::default(),
+        ambience: Default::default(),
+        cam: camera_from(GOLDEN_CAM),
+        walk_requested: true,
+        setup: BattleSetup {
+            seed: 42,
+            difficulty: core::skill::Difficulty::default(),
+            spawn: (0.0, 0.0),
+            spawn_set: false,
+            targets: false,
+            ai: None,
+            ai_cap: None,
+            tickets: 250,
+            tickets_set: false,
+            ticket_pct: 100,
+            time_limit: 0,
+            cheats: core::sim::Cheats::default(),
+            teams: None,
+            classes_dir: assets_dir.join("classes"),
+            mission: None,
+            mission_file: None,
+            player_team: 0,
+        },
+        mode: "con".to_string(),
+        frames: 0,
+        outcome_reported: false,
+        overlay: None,
+        feed: game::event_feed::EventFeed::default(),
+        paused: false,
+        menu_cursor: 0,
+        prev_menu_buttons: 0,
+        sprint_latch: input::SprintLatch::default(),
+        morse: ui::menu::MorseCheats::new(),
+        hud_hidden: false,
+        sfx_slow: false,
+        quit_clicked: false,
+        profile: game::profile::Profile::load_or_default(),
+        round_recorded: false,
+        window: None,
+        renderer: None,
+        gpu: None,
+        walk: None,
+        soldier_vis: None,
+        vehicle_vis: Default::default(),
+        gilrs,
+        pad_warning,
+        last: std::time::Instant::now(),
+    };
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
+
+impl winit::application::ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    winit::window::Window::default_attributes()
+                        .with_title("openbf")
+                        .with_inner_size(winit::dpi::LogicalSize::new(1280, 720)),
+                )
+                .expect("create window"),
+        );
+        let mut renderer = Renderer::new_windowed(window.clone()).expect("renderer");
+        self.overlay = Some(ui::overlay::EguiOverlay::new(
+            &window,
+            renderer.device(),
+            renderer.surface_format(),
+        ));
+        let Some(map) = self.map.clone() else {
+            // Shell start: no map yet.
+            self.init_shell();
+            self.window = Some(window);
+            self.renderer = Some(renderer);
+            self.last = std::time::Instant::now();
+            return;
+        };
+        self.sounds = game::sounds::SoundLib::load(&map);
+        self.music_voice = None;
+        if let Some(sl) = &self.sounds {
+            println!(
+                "sound library loaded ({})",
+                if sl.has("all_weap_inf_rifle_fire") || sl.has("rep_weap_inf_rifle_fire") {
+                    "weapon set present"
+                } else {
+                    "weapon set partial"
+                }
+            );
+        }
+        match load_and_upload(&mut renderer, &map, &self.mode) {
+            Ok((gpu, scene)) => {
+                if self.walk_requested {
+                    let cube = upload_unit_cube(&mut renderer).expect("cube");
+                    self.fx_quad = game::viewer::upload_billboard_quad(&mut renderer).ok();
+                    self.fx_sprite = game::viewer::upload_fx_sprite(&mut renderer).ok();
+                    let dir = self.assets_dir.clone();
+                    self.squad_icons = squad_icons(&mut renderer, &dir);
+                    self.hud_view = load_hud_view(&dir, &renderer);
+                    self.bolts =
+                        game::bolt_vis::BoltVis::new(&self.assets_dir, &scene.manifest.source_game);
+                    let mut walk = make_walk(&scene, &self.setup);
+                    self.foley = game::foley::Foley::load(&scene.dir, &walk);
+                    self.engines = game::engine_sound::EngineSounds::new(&scene.dir, &walk);
+                    self.ambience = game::ambience::Ambience::load(
+                        &scene.manifest,
+                        &scene.dir,
+                        &self.setup.classes_dir,
+                    );
+                    if let Some(sl) = self.sounds.as_mut() {
+                        sl.for_walk(&scene.dir, &walk);
+                    }
+                    self.blackbox = start_blackbox(
+                        &scene,
+                        &walk,
+                        &self.mode,
+                        &self.setup,
+                        self.sounds.as_mut(),
+                    );
+                    self.feed = game::event_feed::EventFeed::for_walk(
+                        &self.assets_dir,
+                        &scene.manifest.source_game,
+                        &walk,
+                    );
+                    self.fx = game::fx::Fx::for_walk(
+                        &self.assets_dir,
+                        &scene.dir,
+                        &scene.manifest.source_game,
+                        &walk,
+                    );
+                    self.weather = game::weather::Weather::load(
+                        &scene.manifest,
+                        &self.assets_dir,
+                        &scene.dir,
+                        WEATHER_SEED,
+                    );
+                    self.soldier_vis = Some({
+                        let mut vis = game::soldier_vis::SoldierVisuals::load(
+                            &mut renderer,
+                            &self.assets_dir,
+                            &scene.manifest.source_game,
+                            &walk.teams,
+                        );
+                        vis.set_turrets(game::viewer::turret_pose::rigged_turrets(&scene));
+                        vis.set_walker_rigs(game::viewer::walker_rigs(
+                            &scene.manifest,
+                            &self.assets_dir,
+                            &walk.vehicle_geometry,
+                        ));
+                        vis
+                    });
+                    self.vehicle_vis = game::viewer::VehicleVisuals::load(
+                        &mut renderer,
+                        &scene,
+                        &self.assets_dir,
+                        &walk.vehicle_geometry,
+                    );
+                    // Profile settings + remember the session for next time.
+                    walk.sim.assist_intensity = self.profile.settings.assist_intensity;
+                    walk.fov_scale = self.profile.settings.fov_scale;
+                    if let Some(m) = walk.music.as_mut() {
+                        m.volume = game::music::volume_from_env(self.profile.settings.music_volume);
+                    }
+                    // THE MAINTAINER'S RULE: the aim assist is the PLAYER'S switch — no difficulty
+                    // tier reads it (the PS2 BF2's Elite clears it, RE §9.3; not ours).
+                    walk.sim.assist_armed = self.profile.settings.aim_assist;
+                    walk.sim.human_damage_on = self.profile.settings.human_damage_on;
+                    walk.sim.team_handicap_on = self.profile.settings.team_handicap_on;
+                    if let Some(cap) = self.profile.settings.ai_alive_cap {
+                        walk.sim.ai_alive_cap = cap;
+                    }
+                    self.profile.settings.last_map = Some(scene.manifest.map.clone());
+                    self.profile.settings.last_mode = Some(self.mode.clone());
+                    self.profile.settings.last_teams =
+                        Some([walk.teams[0].faction.clone(), walk.teams[1].faction.clone()]);
+                    if let Err(e) = self.profile.save() {
+                        eprintln!("profile autosave failed: {e:#}");
+                    }
+                    println!(
+                        "profile '{}': {} rounds, {} kills / {} deaths",
+                        self.profile.name,
+                        self.profile.career.rounds,
+                        self.profile.career.kills,
+                        self.profile.career.deaths
+                    );
+                    self.walk = Some((walk, cube));
+                }
+                self.gpu = Some(gpu);
+            }
+            Err(e) => {
+                eprintln!("failed to load map: {e:#}");
+                event_loop.exit();
+                return;
+            }
+        }
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        self.last = std::time::Instant::now();
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        _id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
+    ) {
+        use winit::event::WindowEvent;
+        if let (Some(o), Some(w)) = (&mut self.overlay, &self.window) {
+            let _ = o.on_window_event(w, &event);
+        }
+        match event {
+            WindowEvent::CloseRequested => {
+                if let Some((walk, _)) = self.walk.as_mut() {
+                    if !self.round_recorded {
+                        self.round_recorded = true;
+                        record_round(&mut self.profile, walk);
+                    }
+                }
+                self.blackbox_exit();
+                event_loop.exit()
+            }
+            // F9: the playtest black box writes its snapshot (dev mode).
+            WindowEvent::KeyboardInput {
+                event:
+                    winit::event::KeyEvent {
+                        physical_key:
+                            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::F9),
+                        state: winit::event::ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => self.snapshot_requested = self.blackbox.is_some(),
+            WindowEvent::Resized(size) => {
+                if let Some(r) = &mut self.renderer {
+                    r.resize(size.width, size.height);
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                let dt = self.last.elapsed().as_secs_f32().min(0.1);
+                self.last = std::time::Instant::now();
+                // The renderer's animation clock, for UV-scrolling materials
+                // (a map's water). Wrapped so `uv + velocity * time` keeps
+                // its f32 precision in a long session — see Renderer::time.
+                if let Some(r) = self.renderer.as_mut() {
+                    r.time = (r.time + dt) % render::TIME_WRAP;
+                }
+
+                if matches!(self.screen, Screen::Shell) {
+                    self.redraw_shell(event_loop);
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
+                if matches!(self.screen, Screen::Loading) {
+                    self.redraw_loading(event_loop);
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
+
+                let mut extra: Vec<DrawCmd> = Vec::new();
+                let mut skinned: Vec<render::SkinnedDrawCmd> = Vec::new();
+                // The loaded map's own clear colour (its fog, where it authors
+                // fog); the shell and the pre-map screens keep the default.
+                let clear = self.gpu.as_ref().map_or(CLEAR, |g| g.clear);
+                let mut hud: Option<ui::hud::HudModel> = None;
+                let mut spawn: Option<ui::spawn::SpawnModel> = None;
+                let mut menu: Option<ui::menu::MenuModel> = None;
+                let edges = if self.walk.is_some() {
+                    self.menu_edges()
+                } else {
+                    0
+                };
+                if self.walk.is_some() && edges & 64 != 0 {
+                    self.paused = !self.paused;
+                }
+                let camera = if self.walk.is_some() {
+                    let pad = if self.paused {
+                        PadState::default()
+                    } else {
+                        let (on_foot, sprinting) =
+                            self.walk.as_ref().map_or((false, false), |(w, _)| {
+                                (
+                                    w.player_on_foot(),
+                                    w.soldier().stance == core::soldier::Stance::Sprint,
+                                )
+                            });
+                        let pad = self.sample_pad();
+                        self.sprint_latch.apply(pad, on_foot, sprinting)
+                    };
+                    let paused = self.paused;
+                    let (walk, cube) = self.walk.as_mut().unwrap();
+                    let mut stuck_alarm = false;
+                    if paused {
+                        // The engines fall silent with the sim.
+                        if let Some(sl) = self.sounds.as_mut() {
+                            sl.stop_loops();
+                        }
+                        let model = ui::menu::MenuModel {
+                            cheats: walk.sim.cheats.entries().to_vec(),
+                            assist_intensity: walk.sim.assist_intensity,
+                            ai_alive_cap: walk.sim.ai_alive_cap,
+                            fov_scale: walk.fov_scale,
+                            fov_deg: walk.fov_y().to_degrees(),
+                            music_volume: walk
+                                .music
+                                .as_ref()
+                                .map_or(self.profile.settings.music_volume, |m| m.volume),
+                            cursor: self.menu_cursor,
+                            outcome_line: walk.sim.outcome.map(|w| match w {
+                                core::sim::OUTCOME_DRAW => "Time up — both teams win".to_string(),
+                                _ => format!(
+                                    "Round over — {} wins",
+                                    walk.teams[usize::from(w.min(1))].faction
+                                ),
+                            }),
+                        };
+                        let input = ui::menu::MenuInput {
+                            up: edges & 1 != 0,
+                            down: edges & 2 != 0,
+                            left: edges & 4 != 0,
+                            right: edges & 8 != 0,
+                            confirm: edges & 16 != 0,
+                            back: edges & 32 != 0,
+                        };
+                        let (cursor, actions) = ui::menu::navigate(&model, input);
+                        // The PS2 matcher runs beside the menu on the same
+                        // edges (the cursor wiggle while typing is authentic).
+                        if let Some(word) = self.morse.feed(input) {
+                            let line = apply_cheat_word(
+                                word,
+                                walk,
+                                &mut self.hud_hidden,
+                                &mut self.sfx_slow,
+                                self.sounds.as_mut(),
+                            );
+                            eprintln!("{line}");
+                            self.feed
+                                .say(line, ui::hud::message_color::YELLOW, walk.sim.tick);
+                        }
+                        self.menu_cursor = cursor;
+                        let mut quit = false;
+                        for a in actions {
+                            apply_menu_action(walk, a, &mut self.paused, event_loop);
+                            persist_setting(&mut self.profile, a, walk);
+                            quit |= a == ui::menu::MenuAction::Quit;
+                            // The music follows its slider while paused.
+                            if let (ui::menu::MenuAction::SetMusic(_), Some(m), Some(v)) =
+                                (a, walk.music.as_ref(), self.music_voice.as_mut())
+                            {
+                                let level = m.level().map_or(0.0, |(_, l)| l);
+                                v.set_volume(game::sounds::level_db(level), 0.1);
+                            }
+                        }
+                        if quit {
+                            self.quit_clicked = true;
+                        }
+                        menu = Some(ui::menu::MenuModel {
+                            cursor: self.menu_cursor,
+                            cheats: walk.sim.cheats.entries().to_vec(),
+                            assist_intensity: walk.sim.assist_intensity,
+                            ai_alive_cap: walk.sim.ai_alive_cap,
+                            fov_scale: walk.fov_scale,
+                            fov_deg: walk.fov_y().to_degrees(),
+                            music_volume: walk
+                                .music
+                                .as_ref()
+                                .map_or(self.profile.settings.music_volume, |m| m.volume),
+                            ..model
+                        });
+                    } else {
+                        // Each stepped tick's events are read in the hook,
+                        // once: a frame steps no tick (every other one at
+                        // 60 Hz), one or several, and `Sim::events` keeps
+                        // only the last tick's (card EVTK).
+                        self.bolts.age(walk, dt);
+                        let aspect = self.renderer.as_ref().map_or(16.0 / 9.0, |r| {
+                            let (w, h) = r.size();
+                            w as f32 / h.max(1) as f32
+                        });
+                        walk.advance_with(dt, std::slice::from_ref(&pad), |walk| {
+                            self.fx.ingest(walk);
+                            let effect_sounds = self.fx.take_sounds();
+                            if let Some(vis) = self.soldier_vis.as_mut() {
+                                vis.note_shots(walk);
+                                self.bolts.set_fire_points(vis.fire_points(walk));
+                            }
+                            self.bolts.track(walk);
+                            if let (Some(audio), Some(sl)) =
+                                (self.audio.as_mut(), self.sounds.as_mut())
+                            {
+                                play_event_sounds(
+                                    audio,
+                                    sl,
+                                    self.foley.as_mut(),
+                                    &mut self.engines,
+                                    &effect_sounds,
+                                    aspect,
+                                    walk,
+                                );
+                                play_ambience(audio, sl, &self.ambience, walk);
+                            }
+                            self.feed.tick(&walk.sim, walk.player);
+                            if let Some(bb) = self.blackbox.as_mut() {
+                                stuck_alarm |= bb.tick(walk, Some(pad));
+                                note_sounds(bb, self.sounds.as_mut(), walk.sim.tick);
+                            }
+                        });
+                        self.fx.update(dt);
+                        if let Some(w) = self.weather.as_mut() {
+                            w.update(dt);
+                            rain_splashes(w, &mut self.fx, walk, aspect, dt);
+                        }
+                        if let Some(vis) = self.soldier_vis.as_mut() {
+                            vis.update(walk, dt);
+                        }
+                        if let (Some(audio), Some(sl)) = (self.audio.as_mut(), self.sounds.as_mut())
+                        {
+                            // The commander: this frame's requests join the
+                            // voice queue, and an idle voice starts its head.
+                            // A squad answer plays the take drawn for it,
+                            // at its unit.
+                            let ears = game::event_sounds::listener(walk);
+                            if let Some(v) = walk.voice.as_mut() {
+                                let tick = walk.sim.tick;
+                                // The units' combat calls through the
+                                // bank's gates join the queue first.
+                                v.gate_calls(sl, ears.pos);
+                                v.frame(&walk.sim, walk.player, dt, |line| {
+                                    if let Some(bb) = self.blackbox.as_mut() {
+                                        bb.voice(tick, &line.name);
+                                    }
+                                    match (line.take, line.at) {
+                                        (Some(take), Some(at)) => sl.play_take(
+                                            audio,
+                                            &line.name,
+                                            usize::from(take),
+                                            at,
+                                            &ears,
+                                        ),
+                                        _ => sl.play_voice(audio, &line.name),
+                                    }
+                                });
+                            }
+                            if let Some(bb) = self.blackbox.as_mut() {
+                                note_sounds(bb, Some(sl), walk.sim.tick);
+                            }
+                        }
+                        // The music: the script's Musics by the
+                        // reinforcements, one streamed take at a time. The
+                        // frame runs with or without a sound device (card
+                        // MUSV: the dev log is the window's referee); only
+                        // the voice needs one.
+                        if let (Some(m), Some(sl)) = (walk.music.as_mut(), self.sounds.as_ref()) {
+                            if !m.bound() {
+                                let missing = m.bind(sl);
+                                if !missing.is_empty() {
+                                    eprintln!("music: not in the bank: {missing:?}");
+                                }
+                            }
+                            let db = game::sounds::level_db;
+                            let tickets = [0, 1].map(|t| walk.sim.battle.teams[t].tickets());
+                            for c in m.frame(&walk.sim, walk.player, dt) {
+                                if game::dev::on() {
+                                    eprintln!("{}", m.log_line(&c, tickets));
+                                }
+                                self.music_voice = match (c, self.audio.as_mut()) {
+                                    (core::music::Change::Started { music, take }, Some(audio)) => {
+                                        start_take(audio, m, music, take, db(0.0))
+                                    }
+                                    _ => None,
+                                };
+                            }
+                            if let (Some(v), Some((_, level))) =
+                                (self.music_voice.as_mut(), m.level())
+                            {
+                                v.set_volume(db(level), dt);
+                            }
+                        }
+                    }
+                    // The black box: this frame's time, and a snapshot when
+                    // F9 was pressed or the stuck alarm fired — written on its
+                    // own thread, with a line in the message box.
+                    if let Some(bb) = self.blackbox.as_mut() {
+                        let size = self.renderer.as_ref().map_or((0, 0), |r| r.size());
+                        bb.frame(dt, [size.0, size.1]);
+                        let reason = if std::mem::take(&mut self.snapshot_requested) {
+                            Some("hotkey")
+                        } else {
+                            stuck_alarm.then_some("stuck")
+                        };
+                        if let Some(reason) = reason {
+                            bb.write(reason, Some(walk), false);
+                            self.feed.say(
+                                format!(
+                                    "snapshot saved ({reason}, {:.1} s)",
+                                    walk.sim.tick as f32 * core::TICK_DT
+                                ),
+                                ui::hud::message_color::YELLOW,
+                                walk.sim.tick,
+                            );
+                        }
+                    }
+                    let models = self
+                        .soldier_vis
+                        .as_ref()
+                        .map_or([false; 2], |v| [v.has_model(0), v.has_model(1)]);
+                    walk_draws(*cube, walk, &mut extra, models);
+                    if let Some(r) = self.renderer.as_mut() {
+                        extra.extend(self.vehicle_vis.draws(r, &walk.sim));
+                    }
+                    if let Some(vis) = self.soldier_vis.as_ref() {
+                        skinned = vis.draws(walk);
+                        extra.extend(vis.weapon_draws(walk));
+                    }
+                    self.frames += 1;
+                    if self.frames.is_multiple_of(10) {
+                        if let Some(w) = &self.window {
+                            w.set_title(&hud_title(walk));
+                        }
+                    }
+                    if walk.sim.outcome.is_some() && !self.outcome_reported {
+                        self.outcome_reported = true;
+                        println!("{}", hud_title(walk));
+                    }
+                    if walk.sim.outcome.is_some() && !self.round_recorded {
+                        self.round_recorded = true;
+                        record_round(&mut self.profile, walk);
+                    }
+                    // The tick hook above has read the events; the model
+                    // carries the new lines to the HUD's message box.
+                    hud = Some(hud_model(walk, &mut self.feed));
+                    // The capture icon is off under the pause menu, as the
+                    // PS2's (card CPBAR, re-capture-display 3.4).
+                    if let Some(m) = hud.as_mut().filter(|_| paused) {
+                        m.capture = None;
+                    }
+                    // Spawn screen while dead: the d-pad moves the cursor (UI
+                    // only — the sim still picks the node, see ui::spawn).
+                    spawn = spawn_model(walk, self.spawn_cursor);
+                    match &spawn {
+                        Some(m) if !m.posts.is_empty() && !paused => {
+                            let n = m.posts.len();
+                            if edges & 1 != 0 {
+                                self.spawn_cursor = (self.spawn_cursor + n - 1) % n;
+                            }
+                            if edges & 2 != 0 {
+                                self.spawn_cursor = (self.spawn_cursor + 1) % n;
+                            }
+                            spawn = spawn_model(walk, self.spawn_cursor);
+                        }
+                        // Alive again (or no posts): the cursor starts over.
+                        _ => self.spawn_cursor = 0,
+                    }
+                    walk.camera()
+                } else {
+                    self.drive_fly_camera(dt);
+                    self.cam
+                };
+                if let Some(quad) = self.fx_quad {
+                    extra.extend(self.fx.draws(quad, self.fx_sprite, &camera));
+                    if let Some((walk, _)) = &self.walk {
+                        extra.extend(game::squad_vis::squad_draws(
+                            &walk.sim,
+                            0,
+                            quad,
+                            self.squad_icons.0,
+                            self.squad_icons.1,
+                            &camera,
+                        ));
+                    }
+                }
+
+                if let (Some(r), Some(gpu)) = (&mut self.renderer, &mut self.gpu) {
+                    // The water moves on the renderer's clock (queue OC).
+                    let clock = game::water_anim::clock(r.time);
+                    if let Err(e) = gpu.animate_water(r, clock, camera.position) {
+                        eprintln!("water: {e:#}");
+                    }
+                    // The drawn doors ride the sim's (queue DRV), the bolts
+                    // the sim's bolts (card FXB).
+                    match &self.walk {
+                        Some((walk, _)) => {
+                            gpu.pose_doors(&walk.sim.doors);
+                            gpu.pose_turrets(&walk.sim, &walk.vehicle_seats);
+                            self.holos.advance(walk);
+                            game::point_light::submit(
+                                r,
+                                gpu,
+                                walk,
+                                &mut self.bolts,
+                                camera.position,
+                                &self.holos,
+                            );
+                            let flashes = self
+                                .soldier_vis
+                                .as_ref()
+                                .map(|v| v.flash_draws(walk))
+                                .unwrap_or_default();
+                            let mut particles = flashes;
+                            particles.extend(self.holos.draws(&gpu.holo, walk, &camera));
+                            if let Some(w) = self.weather.as_mut() {
+                                particles.extend(w.frame_draws(r, &camera, tracked_velocity(walk)));
+                            }
+                            self.fx.submit_with(r, &camera, particles);
+                        }
+                        None => {
+                            r.set_bolts(Vec::new());
+                            r.set_particles(Vec::new());
+                            r.set_terrain_lights(Default::default());
+                        }
+                    }
+                    // The player's own view: a zoomed turret gunner's
+                    // building is left out of it (card VTURZ).
+                    let mut draws: Vec<DrawCmd> = match &self.walk {
+                        Some((walk, _)) => gpu.view_draws(&walk.sim, walk.player),
+                        None => gpu.draws.clone(),
+                    };
+                    draws.append(&mut extra);
+                    let hud_hidden = self.hud_hidden;
+                    let pad_warning = self.pad_warning.clone();
+                    // BF2's own HUD under the egui lines and the spawn
+                    // screen (dead, it is the counts and the message box:
+                    // the line that says who killed you); the `hud` cheat
+                    // hides it. It is fed either way — a model's event
+                    // lines are handed over once. Paused, its fades hold.
+                    let (w, h) = r.size();
+                    let hud_dt = if self.paused { 0.0 } else { dt };
+                    let mut hud_view = match (&mut self.hud_view, &hud) {
+                        (Some(hv), Some(model)) => {
+                            hv.update(model, hud_dt, [w, h]);
+                            (!hud_hidden).then_some(hv)
+                        }
+                        _ => None,
+                    };
+                    let result = match (&mut self.overlay, &self.window, hud) {
+                        (Some(overlay), Some(window), Some(model)) => {
+                            let mut clicked: Vec<ui::menu::MenuAction> = Vec::new();
+                            let paint = overlay.begin(window, |ctx| {
+                                if !hud_hidden {
+                                    // The spawn screen owns the death message.
+                                    let m = match &spawn {
+                                        Some(_) => ui::hud::HudModel {
+                                            dead: false,
+                                            ..model.clone()
+                                        },
+                                        None => model.clone(),
+                                    };
+                                    ui::hud::draw_hud(ctx, &m);
+                                    if let Some(s) = &spawn {
+                                        ui::spawn::draw_spawn(ctx, s);
+                                    }
+                                }
+                                if let Some(m) = &menu {
+                                    clicked = ui::menu::draw_menu(ctx, m);
+                                }
+                                if let Some(w) = &pad_warning {
+                                    ui::hud::draw_pad_warning(ctx, w);
+                                }
+                            });
+                            if let Some((walk, _)) = self.walk.as_mut() {
+                                for a in clicked {
+                                    apply_menu_action(walk, a, &mut self.paused, event_loop);
+                                    persist_setting(&mut self.profile, a, walk);
+                                    if a == ui::menu::MenuAction::Quit {
+                                        self.quit_clicked = true;
+                                    }
+                                }
+                            }
+                            r.render_frame(
+                                &camera,
+                                &draws,
+                                &skinned,
+                                clear,
+                                Some(&mut |dev, q, enc, view, size| {
+                                    if let Some(hv) = hud_view.as_mut() {
+                                        hv.paint(dev, q, enc, view, size);
+                                    }
+                                    overlay.paint(&paint, dev, q, enc, view, size)
+                                }),
+                            )
+                        }
+                        _ => r.render_frame(&camera, &draws, &skinned, clear, None),
+                    };
+                    if let Err(e) = result {
+                        eprintln!("render: {e}");
+                        event_loop.exit();
+                    }
+                }
+                if self.quit_clicked {
+                    self.quit_clicked = false;
+                    if self.map.is_some() {
+                        self.blackbox_exit();
+                        event_loop.exit();
+                    } else {
+                        self.leave_battle();
+                    }
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+}
