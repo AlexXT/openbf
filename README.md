@@ -71,8 +71,8 @@ That scaffolding is published too:
 No code from the original games is included; the decompilation is used only as a reference for
 behaviour.
 
-This repository is updated in batches. Each commit lists the cards (units of work, see
-`docs/loop/cards/`) that landed since the last one.
+This repository is updated in batches; the work is tracked as cards (units of work) in
+`docs/loop/cards/`.
 
 ## Join in
 

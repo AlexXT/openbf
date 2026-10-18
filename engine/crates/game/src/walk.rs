@@ -34,9 +34,6 @@ pub const TEAM_COLORS: [[f32; 3]; 3] = [[0.95, 0.35, 0.15], [0.3, 0.9, 0.3], [0.
 
 /// How far the chase camera keeps from the terrain sheet, either side.
 const CAMERA_TERRAIN_GAP: f32 = 0.3;
-/// A camera target this far under the sheet is under it (in a cave or a
-/// hangar), not a soldier on a slope whose look point dips into the ground.
-const CAMERA_SHEET_MARGIN: f32 = 1.0;
 
 pub fn team_color(team: Option<u8>) -> [f32; 3] {
     match team {
@@ -922,11 +919,12 @@ impl WalkSim {
     }
 
     /// Pull a camera at `position` looking at `target` in out of the world
-    /// boxes, then keep it on the target's side of the terrain sheet: above
-    /// it as a floor, or under it as a ceiling when the target is under the
-    /// sheet (BF2 GEO1's hangar post is 31 m under uncut terrain; the floor
-    /// alone lifted the camera onto the surface). Where a cutter punches the
-    /// sheet out there is no terrain to keep to.
+    /// boxes, then in short of the terrain sheet where the track crosses it
+    /// (the sheet is a surface, met from above or below; a cutter's hole is
+    /// none), then keep it [`CAMERA_TERRAIN_GAP`] off the sheet on the side
+    /// it is on. It never moves through the sheet: BF2 GEO1's hangar is 31 m
+    /// under uncut terrain, and its entrance deck lies in a cutter's hole
+    /// beside the hill, where a floor alone lifted the camera onto the hill.
     fn settle_camera(&self, target: Vec3, mut position: Vec3) -> Vec3 {
         // Buildings: pull the camera in along the track line before flooring,
         // so a wall behind the player shortens the track instead of putting
@@ -935,16 +933,27 @@ impl WalkSim {
             position = self.camera_blockers.pull_in(target, position);
         }
         if let Some(h) = &self.sim.heightfield {
-            let sheet = |p: Vec3| {
-                let y = h.height_at(p.x, p.z);
-                (!self.sim.collision.is_cut(Vec3::new(p.x, y, p.z))).then_some(y)
-            };
-            let under = sheet(target).is_some_and(|y| target.y < y - CAMERA_SHEET_MARGIN);
-            if let Some(y) = sheet(position) {
-                position.y = if under {
-                    position.y.min(y - CAMERA_TERRAIN_GAP)
-                } else {
+            let track = position - target;
+            let len = track.length();
+            if len > 1e-3 {
+                let dir = track / len;
+                let cutters = &self.sim.collision.cutters;
+                if let Some(t) =
+                    core::collision::ray_heightfield(h, cutters, target, dir, len, 0.25)
+                {
+                    position = target + dir * (t - CAMERA_TERRAIN_GAP).max(0.0);
+                }
+            }
+            let y = h.height_at(position.x, position.z);
+            if !self
+                .sim
+                .collision
+                .is_cut(Vec3::new(position.x, y, position.z))
+            {
+                position.y = if position.y >= y {
                     position.y.max(y + CAMERA_TERRAIN_GAP)
+                } else {
+                    position.y.min(y - CAMERA_TERRAIN_GAP)
                 };
             }
         }
@@ -1244,12 +1253,24 @@ mod tests {
     #[test]
     fn camera_stays_on_the_soldiers_side_of_the_terrain() {
         let w = WalkSim::new(1, Vec3::ZERO, Some(flat_ground()));
+        let open = w.settle_camera(Vec3::new(0.0, 1.5, 0.0), Vec3::new(0.0, 2.5, 4.0));
+        assert_eq!(
+            open,
+            Vec3::new(0.0, 2.5, 4.0),
+            "nothing in the way: untouched"
+        );
         let above = w.settle_camera(Vec3::new(0.0, 1.5, 0.0), Vec3::new(0.0, -2.0, 4.0));
-        assert_eq!(above.y, CAMERA_TERRAIN_GAP, "floored above the sheet");
+        assert!(
+            above.y >= CAMERA_TERRAIN_GAP && above.z < 4.0,
+            "pulled in and floored: {above}"
+        );
         let cave = w.settle_camera(Vec3::new(0.0, -30.0, 0.0), Vec3::new(0.0, -28.0, 4.0));
         assert_eq!(cave.y, -28.0, "under the sheet it stays where it was");
         let roof = w.settle_camera(Vec3::new(0.0, -2.0, 0.0), Vec3::new(0.0, 1.0, 4.0));
-        assert_eq!(roof.y, -CAMERA_TERRAIN_GAP, "and never rises through it");
+        assert!(
+            roof.y <= -CAMERA_TERRAIN_GAP,
+            "and never rises through it: {roof}"
+        );
     }
 
     #[test]
