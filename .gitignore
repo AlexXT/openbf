@@ -1,0 +1,9 @@
+# Game data never enters this repo
+iso/
+*.iso
+extracted/
+assets_baked/
+# Build outputs
+target/
+__pycache__/
+*.pyc
