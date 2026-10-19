@@ -4,13 +4,13 @@ title: Team sense: a unit grid for every 'who is near' question, roles with capa
 milestone: M3
 value: 5
 phase: build
-status: todo
+status: in-progress
 deps: BOTD,TPOS
-files: engine/crates/core/src/ai/team.rs,engine/crates/core/src/ai/behave.rs,engine/crates/core/src/perception.rs,engine/crates/core/src/sim/step.rs
+files: engine/crates/core/src/ai/team.rs, engine/crates/core/src/ai/behave.rs, engine/crates/core/src/perception.rs, engine/crates/core/src/sim/step.rs, engine/crates/core/src/ai/mover.rs, engine/crates/core/src/skill.rs, engine/crates/core/src/ai/gunner_foot.rs
 declares: sim; sweep; arena
 needs:
 effort: high
-branch:
+branch: team
 resume:
 created: 2026-10-03
 alpha: yes
@@ -43,3 +43,16 @@ The maintainer, 2026-10-02: bots "all standing next to each other", shooting eac
   it - 24 seeds: KAM1 6.5 -> 7.2 %, POL1 14.0 -> 14.8 %, DEA1 12.6 -> 12.3, KAS2 3.3 -> 3.2 (PS2 6.6 / 5.7 / 9.3 / 2.0).
   Bots that stand near each other no longer jitter apart; the reservation is this card's.
 - 2026-10-07 planner, from SPRD's report (`reports/20261006_2233_card_SPRD.md`): **a gap in FFLN's line-of-fire check** - a salvo already queued when a friend walks into the cone still fires (the PS2's fire cycle fires a started salvo whatever the trigger does). One such shot in 900 ticks of `a_bot_does_not_fire_through_a_friend`, which now does not count it. Not carded (it did not hit); this card's fire lanes are where it belongs: count team hits from queued salvos in the `teamfire` line before deciding whether a started salvo should be cut.
+- 2026-10-19 slice A (lane 1, branch `team` 194a57c; report `reports/20261019_1555_card_TEAM.md`). Re-measured on main
+  7752d00 first (8 seeds, `lead_tmp/team/base`): B3 KAM1 3.3 / POL1 8.4 / DEA1 11.2 / KAS2 2.2 % (PS2 6.6 / 5.7 / 9.3 /
+  2.0) - and the close pairs were mostly WALKING: same way, one behind the other, DEA1 5.9 of 14.3 % pooled, POL1 4.1 of
+  9.0 (`lead_tmp/team/tools/files.py`, `near_split.py`). Built: the unit grid (`ai/team.rs`, hash-neutral: seeds 1-2 x
+  32 maps identical) and the FOLLOW GAP (`team::follow_ease`: half stick a stride behind a mate walking ahead the same
+  way): B3 KAM1 2.0, POL1 4.8, DEA1 7.0, KAS2 1.4 (8 maps x 8 seeds, `lead_tmp/team/varB`). Contacts passed on
+  (`perception::tell`) BUILT AND HELD BACK (`Tier::tell` false on every tier): on, a told enemy keeps the bot in its fight
+  behaviour at its fight spot (COR1 20 s spells 11.7 -> 24.4 %, "fight, a target, a hold" 5.5 -> 17.9 %;
+  `tools/spells.py`); the first gate run refused it (idle20_pct, `lead_tmp/team/gates_run1`). Next slices: (1) a told
+  contact WALKED toward, not stood at (behave's fight entry wants a seen target; then flip `tell` per the design's
+  column, Easy off); (2) roles: Cover for a capturer (Hard and Elite only, the design's section 7) and Overwatch, with
+  role counts per map and a capacity test; (3) the cost at 33 units (`lead_tmp/obst2/tools/perf.sh`, JOBS=1, a null twin
+  of main); (4) move the Tactician's per-unit loops onto the grid (its reservations walk every unit).

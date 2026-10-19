@@ -230,6 +230,10 @@ impl Sim {
                 let entered = seat.is_some_and(|k| self.enter_vehicle(h, vh, k));
                 if entered {
                     self.nav_stats.ai_boards += 1;
+                    self.nav_stats.man_boards += u64::from(
+                        self.vehicle(vh)
+                            .is_some_and(|v| v.kind == VehicleKind::Turret),
+                    );
                     self.nav_stats.ai_gunners += u64::from(seat != Some(0));
                     let walker = self
                         .vehicle(vh)

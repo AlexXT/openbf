@@ -31,7 +31,12 @@
 //!   ±180°. The aimer chases the aim point in the turret's AIM FRAME (the
 //!   look's own basis) at `AimerYawRate` / `AimerPitchRate`, inside
 //!   `AimerYawLimits` / `AimerPitchLimits` ([`Aimer::chase`]); a class with
-//!   no `TurretNodeName` aims in the model frame.
+//!   no `TurretNodeName` aims in the model frame. It lays the BARREL's line
+//!   on the aim point (card TURR, PS2 RAM: Mygeeto's settled aim point
+//!   0.004 m off the barrels' line, 3.5 m off the pivot's), and the camera
+//!   ray that finds the point passes the turret's own building (B1
+//!   `FUN_00223850` B1:138064, BF2 `FUN_0026cea0` B2:189959): `Sim::seat_gun`.
+//!   The barrel hangs at its bind offset ([`GunSetup::muzzle`]).
 //!
 //! PROVISIONAL (ours; each untraced on the PS2): a VEHICLE's gunner seat
 //! (aimer chains, a weapon's own aimer and BF2's 0..360° yaw mode are not
@@ -39,7 +44,7 @@
 //! own yaw / pitch, which the stick moves at the aimer's rates inside the
 //! aimer's limits; the eye — `EyePointOffset` from the aimer's pivot,
 //! turned with the look; the pivot — the `TurretNodeName` node's bind
-//! origin, the fire point turning about it from its bind heading
+//! origin, a vehicle's fire point turning about it from its bind heading
 //! ([`GunSetup::bind_yaw`]) with the aimer; the vehicle's
 //! own turn is not taken out of the pilot's pitch (I10).
 
@@ -348,9 +353,18 @@ impl GunSetup {
     }
 
     /// The fire point (model space) with the aimer at `aim`: the bind-pose
-    /// barrel, turned back to rest along +z, then pitched and yawed.
+    /// barrel, turned back to rest along +z, then pitched and yawed. A
+    /// building turret's barrel rests along +z already, wherever it sits:
+    /// the PS2 hangs each barrel off the aimer node at its bind offset
+    /// (re-turret-draw 2.3, A3 of `lead_tmp/vturd/replay_aimer.py`), so its
+    /// fire point is turned as it is (card TURR: Mygeeto's barrel 1.28 m
+    /// to the side was moved onto the axis, 0.9 m off at 20 m).
     pub fn muzzle(&self, aim: (f32, f32)) -> Vec3 {
-        let rest = turned(self.fire_point, self.pivot, -self.bind_yaw(), 0.0);
+        let rest = if self.turn.is_some() {
+            self.fire_point
+        } else {
+            turned(self.fire_point, self.pivot, -self.bind_yaw(), 0.0)
+        };
         turned(rest, self.pivot, aim.0, aim.1)
     }
 }

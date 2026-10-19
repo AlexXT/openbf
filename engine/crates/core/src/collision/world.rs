@@ -416,6 +416,7 @@ impl CollisionWorld {
         };
         let mut moved = Body::with_layers(to_world, b.shape.clone(), b.layers);
         moved.owner = b.owner;
+        moved.instance = b.instance;
         let inside = self
             .envelopes
             .binary_search_by_key(&(i as u32), |(k, _)| *k)

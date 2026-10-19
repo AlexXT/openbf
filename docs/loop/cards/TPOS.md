@@ -4,14 +4,14 @@ title: Positions: a table of standable places with real cover built at map load 
 milestone: M3
 value: 5
 phase: build
-status: parked
+status: done
 deps: BOTD,FGHT,OBST
 files: engine/crates/core/src/ai/tactic.rs,engine/crates/core/src/ai/behave.rs,engine/crates/core/src/ai/mover.rs,engine/crates/core/src/ai/gunner_foot.rs,engine/crates/core/src/ai/state.rs,engine/crates/core/src/commander.rs,engine/crates/core/src/ai.rs,engine/crates/game/examples/round_to_outcome.rs
 declares: sim; sweep; arena
 needs:
 effort: high
 branch: tpos
-resume: BLOCKED ON THE MAINTAINER ONLY (planner 2026-10-16 17:00). Branch tpos 99071cd (WIP, ci green, rebased on main 2a60fd7). B12 is RULED (planner, below): the landing bar is the PS2-comparable cover share (walk to a covered position + time at one), at or over the PS2's own reading where the PS2 measured it - Kamino 47.1/46.7 vs 21.3, Polis Massa 68.9/65.4 vs 48.6: MET. Strict B12 is printed per map, not a landing bar; it is TCMP's Elite bar. Left: the maintainer's yes to land past fidelity still_pct / idle20_pct / offgraph_pct (CAUSED by design, gates7: 26.23->29.78 / 3.99->5.64 / 6.77->8.70; STATUS question 58). On his yes: [approvals.TPOS] fidelity = "still_pct@agg,idle20_pct@agg,offgraph_pct@agg" (+ still@mus1 / still@tan1 if the land run names them), set status=parked, a land job rebases (main has moved: TURR and others may touch behave.rs / ai.rs - resolve, ci, re-run the maintainer's Kamino scene: 0 over 6) and lands. Blocked, not parked, so its files (behave.rs, ai.rs, commander.rs, mover.rs) do not hold TURR and the other bot cards while it waits.
+resume: landed ce8975da 2026-10-19
 created: 2026-10-03
 alpha: yes
 ---
@@ -85,3 +85,5 @@ The maintainer, 2026-10-02: "no positional sense in a fight - bots hold in the o
   (Elite uses cover: strict B12 >= min(20, ceiling / 2) on the showcase maps at Elite; Mygeeto / Utapau's open-position 18-22 % and
   walk 16-17 % are where it is). Status `blocked` while the maintainer answers question 58 (fidelity), so its files do not hold TURR and the other
   bot cards (RULES: a card waiting on the maintainer is blocked, not parked). Reverse: put the 11:09 bar back in Acceptance and set `parked`.
+
+- 2026-10-19 13:30 land (lane 1): LANDED ce8975d after a hand rebase onto d1c9ae0 (CRATES.md, sim/step.rs); scene 0 over 6, worst 6; cover share (PS2 reading) Kamino 47.1 / 46.8, Polis Massa 68.9 / 65.3; report `reports/20261019_1330_land_TPOS.md`. Planner: remove [approvals.TPOS].

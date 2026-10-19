@@ -47,3 +47,24 @@ its own copy (B1 entity+0x628, B2 +0x66c), which takeoff and landing read: BF1's
 until the height is over LandedHeight + TakeoffHeight (B1:85668-85684; re-vehicles §4.2 said BF2 only), and the landing
 ends where the origin's height first drops under LandedHeight with the body upright (B1:85703-85793) - no snap. Those
 two readings are the lead's, not verifier-checked. Card VREST builds the parked height; this card starts from it.
+
+## Note (card BNDY, 2026-10-19): BF2's fly-height band and the boundary - `analysis/re-boundary.md` 4 (T3b, [O])
+FUN_00202d08 handles the fly-height band in each update (B2:116581, 118385-118395, 119056-119066):
+- It clears bit 7 of the flyer's +0x660, then sets it again when the height (+0x154) is below DAT_00697e50 or above
+  DAT_00697e54. The gate is `(+0x330 >= 0) || (+0x324 == 0)` [H: a human pilot, or no pilot].
+- It clamps the height to [min - 0.2, max + 0.2]: the PLAYER limits when +0x330 >= 0 (Lua Set{Min,Max}PlayerFlyHeight,
+  DAT_00697e50 / 54), else the AI's (Set{Min,Max}FlyHeight, DAT_00697e48 / 4c). Every default is -200 / +200
+  (FUN_002a4030).
+
+The boundary timer (FUN_00350660) counts a flyer with bit 7 set as OUTSIDE even inside the 2-D boundary. So a human at
+the ceiling gets "Leaving Battlefield" and dies after 6.5 s, on maps without a 2-D boundary too.
+
+Per conquest script, MaxPlayerFlyHeight is: COR1 25, DAG1 20, DEA1 72, END1 43, FEL1 53, GEO1 50, HOT1 70, KAM1 102,
+MUS1 90 / 84.16, MYG1 20, NAB2 25, POL1 55, TAT3 90, UTA1 29.5, YAV1 14 (`scripts/gen_missions.py`). KAS2 and TAT2 set
+only the AI's MaxFlyHeight (70, 40).
+
+Also in the flyer code: a class with key 0xc6e9c80b = 1 (the three steered guided-rocket ordnance classes) gets 2.17 s
+instead of 6.5 s. And FUN_002faf90 (from FUN_00202880) refuses a point 300 m ahead that is outside the boundary.
+
+Settle the [H] gate with a 2-minute live sample before building: a human flyer held above MaxPlayerFlyHeight, its
+record+0x184 read.

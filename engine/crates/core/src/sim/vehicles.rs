@@ -21,7 +21,8 @@ use crate::unit::{Controller, UnitHandle};
 use crate::vehicle::hover::{self, Contact, ContactSource, HullBody, HullShape};
 use crate::vehicle::walker::{self, WalkerState, WalkerWorld};
 use crate::vehicle::{
-    collision_desc, impact_damage, Mount, SeatKind, Vehicle, VehicleHandle, VehicleSpec,
+    collision_desc, impact_damage, Mount, SeatKind, Vehicle, VehicleHandle, VehicleKind,
+    VehicleSpec,
 };
 use crate::vehicle_pad::{PadDef, VehiclePad, IDLE_CLASS_CHANGED, IDLE_OUTSIDE, PLAYER_MARGIN};
 use crate::weapon::DamageDesc;
@@ -384,6 +385,7 @@ impl Sim {
         team: Option<u8>,
     ) -> f32 {
         let ff = self.friendly_fire_scale;
+        let tick = self.tick;
         let Some(v) = self.vehicle_mut(h) else {
             return 0.0;
         };
@@ -395,6 +397,10 @@ impl Sim {
         }
         let friendly = team.is_some() && v.team == team;
         let damage = v.health.take_damage(desc, multiplier, friendly, ff);
+        // Card TURR: a turret's gunner reads who hit it (`ai::man`).
+        if let (Some(u), VehicleKind::Turret) = (shooter, v.kind) {
+            v.last_hit = Some((u, tick));
+        }
         let killed = !v.health.alive();
         self.events.push(Event::VehicleHit {
             shooter,

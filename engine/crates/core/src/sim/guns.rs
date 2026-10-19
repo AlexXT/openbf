@@ -246,16 +246,24 @@ impl Sim {
     }
 
     /// The first surface or soldier along the camera ray, else its end —
-    /// past the seat's own vehicle's hull (card VHULL).
+    /// past the seat's own vehicle's hull (card VHULL) and a building
+    /// turret's own building (card TURR).
     fn aim_point(&self, eye: Vec3, dir: Vec3, riders: &[UnitHandle], own: VehicleHandle) -> Vec3 {
         let mut t = AIM_RAY;
         if let Some(h) = self.terrain_ray(eye, dir, t, 0.5) {
             t = t.min(h);
         }
-        if let Some(h) =
-            self.collision
-                .ray_with(eye, dir, t, Layers::ORDNANCE, HullFilter::except(Some(own)))
-        {
+        // A building turret's ray passes its own building (the PS2's
+        // excludes the owner entity, `ray_past`).
+        let building = self.vehicle(own).and_then(|v| v.instance);
+        if let Some(h) = self.collision.ray_past(
+            eye,
+            dir,
+            t,
+            Layers::ORDNANCE,
+            HullFilter::except(Some(own)),
+            [building, None],
+        ) {
             t = t.min(h.t);
         }
         for (h, u) in self.alive_units() {
@@ -320,18 +328,40 @@ impl Sim {
             st.look.1 = (st.look.1 + ry * a.pitch_rate * dt).clamp(a.pitch[0], a.pitch[1]);
         }
 
-        // The camera ray and the aimer (zoomed, from the zoomed eye).
-        let eye = pos + rot * g.ray_eye(st.look, st.zoom.is_some());
-        let target = self.aim_point(
-            eye,
-            rot * gun::dir(st.look.0, st.look.1),
-            &riders,
-            m.vehicle,
-        );
+        // The camera ray and the aimer (zoomed, from the zoomed eye). A bot
+        // in a building turret hands its aimer its own aim point instead
+        // (`ai::ManState::aim`, the PS2's AI seat).
+        let bot_aim = (ai && g.turn.is_some())
+            .then(|| {
+                self.units[i]
+                    .ai
+                    .ride
+                    .and_then(|r| r.man)
+                    .and_then(|m| m.aim)
+            })
+            .flatten();
+        let target = bot_aim.unwrap_or_else(|| {
+            let eye = pos + rot * g.ray_eye(st.look, st.zoom.is_some());
+            self.aim_point(
+                eye,
+                rot * gun::dir(st.look.0, st.look.1),
+                &riders,
+                m.vehicle,
+            )
+        });
         let pivot = pos + rot * g.pivot;
         if g.turn.is_some() {
-            // The PS2's aimer, in the turret's aim frame or the model's.
-            let w = (rot.inverse() * (target - pivot)).normalize_or_zero();
+            // The PS2's aimer, in the turret's aim frame or the model's. It
+            // lays the BARREL's line on the aim point, not the pivot's: in
+            // BF2 Mygeeto's recoilless turret (barrels 3.4 m over the
+            // pivot) the settled aim point is 0.004 m off the line through
+            // the two barrels' midpoint along the aimer's direction and 3.5 m
+            // off the pivot's (PS2 RAM, 342 rows, card TURR,
+            // `lead_tmp/turr/aim/ps2/barrel_line.py`). The port fires from
+            // one fire point, so it aims that one's line (half the barrel
+            // spacing, 0.36 m there, off the PS2's centre line).
+            let from = pos + rot * g.muzzle(st.aim);
+            let w = (rot.inverse() * (target - from)).normalize_or_zero();
             let w = if g.framed {
                 let [x, y, z] = gun::frame(st.look);
                 Vec3::new(w.dot(x), w.dot(y), w.dot(z))

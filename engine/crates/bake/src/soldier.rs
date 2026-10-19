@@ -1,6 +1,9 @@
 //! Bake a skinned soldier (skel + bone-space modl) from a SIDE LVL into a
 //! model-space skinned GLB (`skin_glb`) plus its textures as KTX2:
-//! `<outdir>/soldiers/<model>.glb`, `<outdir>/textures/<tex>.ktx2`.
+//! `<outdir>/soldiers/<model>.glb`, `<outdir>/textures/<tex>.ktx2`, with its
+//! clips' `<model>.anims.ron` and its animation sets' `<model>.sets.ron`
+//! (`crate::anim_sets`). A BF2 model's worn cloth is baked as extra segments
+//! (`crate::cloth`).
 //! Vertices are moved from bone bind space to model space at bake time
 //! (`mungefs::model::to_model_space`), so the runtime uses standard
 //! `joint_global × inverse_bind` skinning (analysis/re-softskin.md §5).
@@ -39,7 +42,8 @@ pub struct BakedSoldier {
     pub textures: Vec<String>,
     /// The cloths baked as extra segments (BF2, `crate::cloth`).
     pub cloths: Vec<String>,
-    /// Model-space AABB (should equal the modl vis box).
+    /// Model-space AABB over every baked segment, worn cloth included (so
+    /// wider than the modl vis box on a BF2 cloth wearer).
     pub aabb: ([f32; 3], [f32; 3]),
 }
 
@@ -390,10 +394,12 @@ pub fn bake_soldier_anims(
             if wanted.iter().any(|w| w.0 == c.name) {
                 continue;
             }
+            // The first bank of that name that holds the clip: the one the
+            // inventory took (two side LVLs may carry a bank of one name).
             let found = banks
                 .iter()
-                .find(|b| b.name == *bank)
-                .and_then(|b| Some((b, b.clip_index(&c.name)?)));
+                .filter(|b| b.name == *bank)
+                .find_map(|b| Some((b, b.clip_index(&c.name)?)));
             let (b, k) = found.ok_or_else(|| anyhow!("{}: not in bank {bank}", c.name))?;
             wanted.push((c.name.clone(), b, k));
         }

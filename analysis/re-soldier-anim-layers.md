@@ -543,7 +543,7 @@ crossfade, switches walk to run at 4.5 m/s, and plays shoot or reload only when 
    clip's frames, loop flag, root speed and blend time (BF1: the code's; BF2: the `sanm` chunk, a new `mungefs`
    reader). Referee: the baked table equals the PS2 memory tables the two scripts were checked against.
    **Built by card ANIMS (2026-10-05):** `bake/src/anim_sets.rs` (+ `anim_sets/bf1.rs`, `bf2.rs`), `mungefs/src/sanm.rs`;
-   each soldier's `soldiers/<model>.sets.ron`. Tests `bake/tests/anim_sets.rs`: BF1 979 of 979 slots, BF2 11,524 of
+   each soldier's `soldiers/<model>.sets.ron`. Tests `bake/tests/suite/anim_sets.rs`: BF1 979 of 979 slots, BF2 11,524 of
    11,524 for a UTA1, a MYG1 and a HOT1 state. What the build added to this note:
    - **Root speed is the POSITION at the half, not the distance from frame 0** [V] (`FUN_0022d4f0` B1 144119-144144:
      the pose at half the clip, `DummyRoot`'s model position over that time). A clip that starts off the origin and

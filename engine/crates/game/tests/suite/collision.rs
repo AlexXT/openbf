@@ -113,6 +113,10 @@ fn collision_world_follows_instance_order_and_uses_the_soldier_subset() {
         core::collision::Shape::Box { .. }
     ));
     // Instance order: instance 0 sits at the origin, instance 1 at x = 100.
+    // Each body knows its instance (card TURR: a turret's camera ray passes
+    // its own building's).
+    let of: Vec<Option<u32>> = w.bodies().iter().map(|b| b.instance).collect();
+    assert_eq!(of, [Some(0), Some(0), Some(1), Some(1)]);
     assert_eq!(w.bodies()[0].to_world.w_axis.truncate(), glam::Vec3::ZERO);
     assert_eq!(
         w.bodies()[2].to_world.w_axis.truncate(),

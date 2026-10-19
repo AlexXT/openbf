@@ -666,6 +666,11 @@ impl Scene {
                 doors.push(d);
             }
         }
+        // Each body knows its instance (card TURR: a building turret's
+        // camera ray passes its own building).
+        for (b, &ii) in bodies.iter_mut().zip(&of) {
+            b.instance = Some(ii);
+        }
         // `new`, not the struct literal: it builds the broad phase over the
         // bodies (`core::collision::world::BodyGrid`), which every soldier and
         // ordnance query on this world then reads instead of scanning all of

@@ -100,13 +100,54 @@ pub fn los(sim: &Sim, from: Vec3, to: Vec3) -> bool {
 /// [`los`] through the hulls `hulls` does not admit — a rider's own vehicle
 /// and its target's, whose centres sit inside them.
 pub fn los_past(sim: &Sim, from: Vec3, to: Vec3, hulls: HullFilter) -> bool {
-    los_terrain(sim, from, to) && los_world_past(sim, from, to, hulls)
+    los_seat(sim, from, to, hulls, [None; 2])
+}
+
+/// [`los_past`] that also passes the map bodies of the instances in
+/// `buildings` ([`past_buildings`]).
+pub fn los_seat(
+    sim: &Sim,
+    from: Vec3,
+    to: Vec3,
+    hulls: HullFilter,
+    buildings: [Option<u32>; 2],
+) -> bool {
+    los_terrain(sim, from, to)
+        && match ray(from, to) {
+            Some((dir, len)) => sim
+                .collision
+                .ray_past(
+                    from,
+                    dir,
+                    len,
+                    crate::collision::Layers::ORDNANCE,
+                    hulls,
+                    buildings,
+                )
+                .is_none(),
+            None => true,
+        }
 }
 
 /// Both vehicles `a` and `b` ride in, skipped ([`HullFilter::Except`]).
 pub fn past_mounts(sim: &Sim, a: UnitHandle, b: UnitHandle) -> HullFilter {
     let m = |h| sim.unit(h).and_then(|u| u.mount).map(|m| m.vehicle);
     HullFilter::Except([m(a), m(b)])
+}
+
+/// The buildings of the building turrets `a` and `b` ride in
+/// (`Vehicle::instance`), whose map bodies their sight passes (card TURR):
+/// a gunner's eye sits inside his building's mesh (BF1 Geonosis'
+/// geoturret, `EyePointOffset 0 0.5 0`, saw no enemy in 15 seated spells),
+/// as a seated target does. OURS: the PS2's camera ray passes the turret's
+/// owner entity (`CollisionWorld::ray_past`); its AI sight ray from a seat
+/// is not traced.
+pub fn past_buildings(sim: &Sim, a: UnitHandle, b: UnitHandle) -> [Option<u32>; 2] {
+    let m = |h| {
+        let vh = sim.unit(h)?.mount?.vehicle;
+        sim.vehicle(vh)?.instance
+    };
+    [m(a), m(b)]
 }
 
 /// The terrain half of [`los`] — `true` when the heightfield does not block.
@@ -191,10 +232,24 @@ pub fn scan(sim: &Sim, me: UnitHandle, st: &mut AiState, tier: Tier) -> (u8, u8)
     };
     let tick = sim.tick;
     // A bot in an armed seat looks from the seat's eye along its gun's look
-    // (card VTAI); any other seat, and on foot, the soldier's own.
-    let (eye, view) = sim
-        .seat_look(me)
-        .map_or_else(|| (u.muzzle(), u.aim_frame().0), |s| (s.eye, s.view));
+    // (card VTAI); any other seat, and on foot, the soldier's own. A building
+    // turret's gunner looks from its muzzle (card TURR, OURS: the PS2's sight
+    // origin for a seat is not traced): the camera's eye stands 8.3 m behind
+    // Kashyyyk's recoilless turret, over its tower, and saw 180 of 913
+    // enemies within 60 m where the muzzle saw 530.
+    let (eye, view) = sim.seat_look(me).map_or_else(
+        || (u.muzzle(), u.aim_frame().0),
+        |s| {
+            (
+                if s.gun.turn.is_some() {
+                    s.muzzle
+                } else {
+                    s.eye
+                },
+                s.view,
+            )
+        },
+    );
 
     // 1. Age the memory. Nothing is seen until this think proves it, a record
     //    older than MEMORY_TICKS is forgotten, and a dead or recycled handle
@@ -247,7 +302,13 @@ pub fn scan(sim: &Sim, me: UnitHandle, st: &mut AiState, tier: Tier) -> (u8, u8)
         if seen >= CONTACTS {
             break;
         }
-        if los_past(sim, eye, p, past_mounts(sim, me, h)) {
+        if los_seat(
+            sim,
+            eye,
+            p,
+            past_mounts(sim, me, h),
+            past_buildings(sim, me, h),
+        ) {
             see(st, h, tick, p);
             seen += 1;
         }
@@ -352,6 +413,20 @@ fn hear(st: &mut AiState, h: UnitHandle, tick: u64, pos: Vec3) -> bool {
 /// `AcquiredTargetSound` then, with no test that it differs from the last
 /// (`FUN_0024d6d0` 167335; card UCALL, re-unit-chatter.md 2.2).
 pub fn choose_target(sim: &Sim, me: UnitHandle, st: &mut AiState, tier: Tier) -> bool {
+    choose_target_with(sim, me, st, tier, |_| true)
+}
+
+/// [`choose_target`] among the contacts whose last known point `keep`
+/// admits: a held target it does not admit is dropped as one that left the
+/// memory is (card TURR: a building turret's gunner keeps to its arc,
+/// `ai::man::arc_holds`).
+pub fn choose_target_with(
+    sim: &Sim,
+    me: UnitHandle,
+    st: &mut AiState,
+    tier: Tier,
+    keep: impl Fn(Vec3) -> bool,
+) -> bool {
     let Some(u) = sim.unit(me) else {
         return false;
     };
@@ -372,13 +447,16 @@ pub fn choose_target(sim: &Sim, me: UnitHandle, st: &mut AiState, tier: Tier) ->
         }
     };
     let mut best: Option<(f32, UnitHandle)> = None;
-    for c in st.contacts.iter().flatten() {
+    for c in st.contacts.iter().flatten().filter(|c| keep(c.last_pos)) {
         let s = score(c);
         if best.is_none_or(|(bs, _)| s > bs) {
             best = Some((s, c.handle));
         }
     }
-    let held = st.target.and_then(|h| contact_of(st, h));
+    let held = st
+        .target
+        .and_then(|h| contact_of(st, h))
+        .filter(|c| keep(c.last_pos));
     match (held, best) {
         // A target that left the memory is dropped at once — no interval, no
         // hysteresis: the unit has nothing to aim at any more.

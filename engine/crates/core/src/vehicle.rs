@@ -198,6 +198,14 @@ pub struct Vehicle {
     /// claims it again until it is [`STUCK_MOVED`] from there (ours). Hashed
     /// only when set.
     pub stuck_at: Option<Vec3>,
+    /// Card TURR: a building turret's last hit by a unit, and its tick (a
+    /// gunner hit from outside every arc gets out, `ai::man`). Written for
+    /// [`VehicleKind::Turret`] only; hashed only when set.
+    pub last_hit: Option<(crate::unit::UnitHandle, u64)>,
+    /// A building turret's map instance (`collision::Body::instance`): its
+    /// building, which its camera ray passes (card TURR). SETUP data, set by
+    /// the game layer at the spawn; not hashed.
+    pub instance: Option<u32>,
 }
 
 /// Card VMESH (ours): how far (m, in XZ) a vehicle given up as stuck must
@@ -264,6 +272,12 @@ impl Vehicle {
             for v in [p.x, p.y, p.z] {
                 eat(&v.to_bits().to_le_bytes());
             }
+        }
+        if let Some((u, t)) = self.last_hit {
+            eat(&[0x5b]);
+            eat(&u.index.to_le_bytes());
+            eat(&u.gen.to_le_bytes());
+            eat(&t.to_le_bytes());
         }
     }
 }
@@ -388,6 +402,8 @@ impl VehicleSpec {
             health: Health::new(self.max_health, self.health_type),
             guns: Vec::new(),
             stuck_at: None,
+            last_hit: None,
+            instance: None,
         }
     }
 }

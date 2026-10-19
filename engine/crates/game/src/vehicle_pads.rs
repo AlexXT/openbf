@@ -151,6 +151,8 @@ pub struct PadBuild {
 #[derive(Clone, Debug)]
 pub struct TurretDef {
     pub name: String,
+    /// The instance's index in the manifest (its bodies' `Body::instance`).
+    pub instance: u32,
     pub spec: VehicleSpec,
     pub rot: glam::Quat,
 }
@@ -316,7 +318,7 @@ pub fn add_turrets(
     db: &ClassDb,
     unbuilt_zones: bool,
 ) {
-    for inst in instances {
+    for (ii, inst) in instances.iter().enumerate() {
         let Some(name) = db.resolve(&inst.class).map(str::to_owned) else {
             continue;
         };
@@ -347,6 +349,7 @@ pub fn add_turrets(
         spec.home_team = port_team(inst);
         out.turrets.push(TurretDef {
             name: inst.name.clone(),
+            instance: ii as u32,
             rot: instance_rot(&inst.rotation).unwrap_or(core::vehicle::hover::quat_y(-spec.yaw)),
             spec,
         });
@@ -414,6 +417,7 @@ pub fn install(
         let h = sim.spawn_vehicle(&t.spec);
         if let Some(v) = sim.vehicle_mut(h) {
             v.rot = t.rot;
+            v.instance = Some(t.instance);
         }
     }
     // The hover numbers per class (card HOVR): `Sim::tick_hovers` moves
@@ -992,6 +996,9 @@ mod tests {
         assert_eq!(t.spec.pos, Vec3::new(10.0, 2.0, -5.0));
         assert_eq!((t.spec.max_health, t.spec.home_team), (300.0, Some(1)));
         assert_eq!(out.turrets[1].spec.home_team, None);
+        // Each knows its instance in the manifest (its building's bodies).
+        let of: Vec<u32> = out.turrets.iter().map(|t| t.instance).collect();
+        assert_eq!(of, [0, 2]);
         assert!((t.spec.yaw + std::f32::consts::FRAC_PI_2).abs() < 1e-5);
         assert!((t.rot * Vec3::X).distance(Vec3::new(0.0, 0.0, -1.0)) < 1e-5);
         let v = t.spec.build(1);

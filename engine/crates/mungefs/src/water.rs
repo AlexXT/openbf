@@ -106,7 +106,7 @@
 //! ([`Water::has_patch`] is the disc's own answer). The triangles cover
 //! **13–96 % of the one cell the patch replaces**, which is 3.4–24.0 % of
 //! that box — the open water left after the buildings are cut out (measured
-//! on all 13 shipped patches, `bake/tests/water_patch_cells.rs`). Every
+//! on all 13 shipped patches, `bake/tests/suite/water_patch_cells.rs`). Every
 //! vertex is at the water height.
 //!
 //! **A patch REPLACES its cell's flat quad — VERIFIED** (2026-09-09,

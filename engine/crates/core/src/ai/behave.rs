@@ -7,10 +7,16 @@
 //! ([`super::mover`]). Card SPL11, `analysis/bot-design.md` 3: this file
 //! writes no stick and no button.
 //!
-//! The gunner runs BETWEEN the two requests, because today's position rules
-//! (the strafe on a new burst, the step out of a friend's line, the close
-//! hold) read its report ([`super::gunner_foot::GunReport`]); they go with
-//! card TPOS, and the order is then free.
+//! The gunner runs BETWEEN the two requests: the close hold, the fight and
+//! the step out of a friend's line read its report
+//! ([`super::gunner_foot::GunReport`]). Card TPOS deleted the strafe on a
+//! new burst, and the step goes for a bot on a Tactician's position.
+//!
+//! Card TPOS: a fighter's position is the Tactician's when the map's table
+//! has one for the fight (`super::tactic::fight`: walked to as a ring point,
+//! `FightState::TAKE`, then its hide / fire cycle, `FightState::COVER`); a
+//! hit there counts against it (`super::tactic::hit`) instead of card
+//! REACT's row. FGHT's own style below is the fight when nothing passes.
 //!
 //! Card MOVR: the mover answers each request with an outcome
 //! ([`super::Walk`]); a failed walk climbs [`recover`]'s ladder, and the
@@ -30,14 +36,16 @@
 //! of the graph (`in_hub`).
 //!
 //! Here too, until their own cards replace them: the held position (card
-//! HOLD: `hold_at_hub`, `start_hold`, `spot_free`, `stand_ok`, `roll_clear`),
+//! HOLD: `spot_free`, `stand_ok`, `roll_clear`, the expired hold settled at a
+//! hub, `hub_reached`; its shuffle and its hold at a hub went with card
+//! TPOS),
 //! the run from a grenade (`hazard_flee`) and the lost bot's jump
 //! (`lost_jump`). The position, fight, reaction, grenade, lost-bot and dodge
 //! tests live here.
 
 use super::draw::{
     stance_hold, unit_unit, SALT_CIRCLE, SALT_DODGE, SALT_GRENADE, SALT_HOLD, SALT_REACT,
-    SALT_SHUFFLE, SALT_STRAFE, SALT_STYLE,
+    SALT_STYLE,
 };
 use super::gunner_foot::{self, AimRequest};
 use super::mover::{self, MoveRequest};
@@ -48,13 +56,11 @@ use super::state::{
 };
 use super::{
     CIRCLE_PAUSE, CIRCLE_STOP, CORNER_ARRIVE, DODGE_COOLDOWN, FIGHT_BEYOND, FIGHT_SPACING,
-    FIGHT_STEP, GIVE_UP_AFTER, HOLD_ARRIVE, HOLD_CLOSE, HOLD_COMMIT, HOLD_DWELL_MAX,
-    HOLD_DWELL_MIN, HOLD_ENDGAME, HOLD_FIGHT, HOLD_HINT_RADIUS, HOLD_MOVE_PERIOD, HOLD_NEAR,
-    HOLD_QUIET, HOLD_RANGE, HOLD_SHUFFLE, HOLD_SKIP_HUBS, HOLD_SPACING, HOLD_SPOT_RADIUS,
-    HOLD_STRAFE, HUB_LEVEL_TOL, LOST_JUMP_AGAIN, LOST_JUMP_CLEAR, LOST_RECYCLE, PROBE_DIST,
-    REACT_COOLDOWN, REACT_STEP, RETURN_ARRIVE, RETURN_ARRIVE_DY, RETURN_PLANS, RING_ARRIVE,
-    RING_BACK, RING_SNAP, ROLL_LANE, ROLL_LEAD, ROLL_PAST, ROLL_REACH, SHUT_PROBE_UP, SHUT_RECYCLE,
-    SIDESTEP_TICKS, STAND_CROUCH, STAND_SHARE, THINK_PERIOD,
+    FIGHT_STEP, GIVE_UP_AFTER, HOLD_ARRIVE, HOLD_CLOSE, HOLD_COMMIT, HOLD_MOVE_PERIOD, HOLD_QUIET,
+    HOLD_RANGE, HOLD_SPACING, HOLD_SPOT_RADIUS, HOLD_STRAFE, LOST_JUMP_AGAIN, LOST_JUMP_CLEAR,
+    LOST_RECYCLE, PROBE_DIST, REACT_COOLDOWN, REACT_STEP, RETURN_ARRIVE, RETURN_ARRIVE_DY,
+    RETURN_PLANS, RING_ARRIVE, RING_BACK, RING_SNAP, ROLL_LANE, ROLL_LEAD, ROLL_PAST, ROLL_REACH,
+    SHUT_PROBE_UP, SHUT_RECYCLE, SIDESTEP_TICKS, STAND_CROUCH, STAND_SHARE, THINK_PERIOD,
 };
 use crate::fmath;
 use crate::nav;
@@ -104,7 +110,10 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
         // out of what this unit actually perceives — never out of the sim's
         // omniscient unit list, which is what `ENGAGE_RANGE` + `visible` did.
         let (held, heard) = perception::scan(sim, me, st, tier);
-        nt.acquired = u8::from(perception::choose_target(sim, me, st, tier));
+        nt.acquired = u8::from(match super::man::arc_of(sim, u) {
+            Some(holds) => perception::choose_target_with(sim, me, st, tier, holds),
+            None => perception::choose_target(sim, me, st, tier),
+        });
         nt.contacts = held;
         nt.heard = heard;
         // Card UCALL: hearing that made a record while no enemy is in sight
@@ -153,8 +162,10 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
         if u.mount.is_none() && u.command.is_none_or(|c| c.in_pool()) {
             let had = super::ride::board_point(sim, st).is_some();
             super::ride::claim(sim, me, u, st);
-            // Card WAI2: a new claim routes to its vehicle at once.
-            if let Some(at) = super::ride::board_point(sim, st).filter(|_| !had) {
+            // Card WAI2: a new claim routes to its vehicle at once - card
+            // TURR: one the offer pass made this tick too.
+            let fresh = st.ride.is_some_and(|r| r.since == sim.tick);
+            if let Some(at) = super::ride::board_point(sim, st).filter(|_| !had || fresh) {
                 nt.claim = NavTick::CLAIM_NEW;
                 super::route::retarget_board(sim, me, st, at, &mut nt);
             }
@@ -223,23 +234,9 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
             if sim.tick.saturating_sub(h.last_contact) >= HOLD_QUIET {
                 h.until = sim.tick;
             } else {
+                // (Card TPOS: no shuffle - a fighter's cycle and its next
+                // position are the Tactician's, `tactic::fight`.)
                 st.want_stance = stance_hold(st.want_stance, h.stance_mask, me, sim.tick);
-                // (Card FGHT: not on the way to a ring point.)
-                if sim.tick >= h.shuffle_at && !st.fight.walks() {
-                    h.shuffle_at = sim.tick + HOLD_MOVE_PERIOD;
-                    // Card JITR: not inside the last step's commit time.
-                    if sim.tick >= h.commit_until
-                        && unit_unit(me.index, sim.tick, me.gen, SALT_SHUFFLE) < tier.shuffle
-                    {
-                        let a = unit_unit(me.index, sim.tick, me.gen, SALT_SHUFFLE ^ 1);
-                        let r = unit_unit(me.index, sim.tick, me.gen, SALT_SHUFFLE ^ 2);
-                        let (sa, ca) = fmath::sin_cos(a * std::f32::consts::TAU);
-                        let p = h.spot + Vec3::new(ca, 0.0, sa) * (HOLD_SHUFFLE * (0.4 + 0.6 * r));
-                        if react_ok(sim, u, p) && spot_free(sim, me, p) {
-                            h.step_to(p, sim.tick, false);
-                        }
-                    }
-                }
             }
             st.hold = Some(h);
         }
@@ -250,7 +247,7 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
         st.stall = None; // a rider is not on the walker's watch (card RCYC)
         st.mv = MoverState::default();
         st.behaviour = Behaviour::Ride;
-        return super::ride::drive(sim, me, m, st, nt);
+        return super::ride::drive(sim, me, m, st, nt, thinking);
     }
 
     let mut pad = PadState::default();
@@ -280,9 +277,9 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
 
     let leg_hub = st.route.filter(|r| !r.is_last()).map(|r| r.next_hub);
     advance_route(sim, me, st, pos, 0.0, &mut nt);
-    // Card HOLD: a hub just reached with the enemy about is a place to hold.
-    if let Some(hub) = leg_hub.filter(|h| st.route.map(|r| r.next_hub) != Some(*h)) {
-        hold_at_hub(sim, me, u, st, hub);
+    // Card HOLD: a hub just reached settles a hold that has run out.
+    if leg_hub.is_some_and(|h| st.route.map(|r| r.next_hub) != Some(h)) {
+        hub_reached(sim, st);
     }
     // ...and a grenade on the ground near by is a thing to run from.
     let flee = hazard_flee(sim, me, u, &tier);
@@ -302,7 +299,10 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
         .is_some_and(|(_, t)| sim.tick > 0 && t == sim.tick - 1)
         && sim.tick >= st.dodge_until
     {
-        if let Some(h) = st.hold.filter(|h| sim.tick < h.until) {
+        if st.fight.tactician() {
+            // Card TPOS: a hit counts against the position (`tactic::hit`).
+            super::tactic::hit(sim, &tk, st);
+        } else if let Some(h) = st.hold.filter(|h| sim.tick < h.until) {
             roll = react(sim, &tk, st, h, enemy, &mut nt);
         } else if unit_unit(me.index, sim.tick, me.gen, SALT_DODGE) < skill.dodge_chance {
             let side: i8 = if st.slide > 0 { -1 } else { 1 };
@@ -454,6 +454,10 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
     // order's (`squad::STAND_ARRIVE`, above).
     let arrive = match walk_kind {
         WalkAsk::HOLD => holding.map(|h| (h.goal, HOLD_ARRIVE)),
+        // (Card TPOS: a position is walked onto, as a held one is.)
+        WalkAsk::LEG if ring.is_some() && st.fight.mode == FightState::TAKE => {
+            at_ring.map(|p| (p, HOLD_ARRIVE))
+        }
         WalkAsk::LEG if ring.is_some() => at_ring.map(|p| (p, RING_ARRIVE)),
         WalkAsk::LEG if spot.is_some() => at_spot.map(|p| (p, RING_ARRIVE)),
         WalkAsk::LEG => match (st.route, st.cmd) {
@@ -516,31 +520,15 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
         st.behaviour = Behaviour::None;
         return (pad, nt);
     };
-    // Card HOLD: a new burst at a seen enemy is an opportunity to STRAFE
-    // while firing it — a step sideways off the line of fire, the other way
-    // from the last one.
-    // Card JITR: ...when the last step's commit time is over (a burst is a
-    // second long; a strafe on each one, the other way each time, was a run
-    // back and forth).
-    if let (Some(mut h), true) = (holding, gun.new_burst && enemy.is_some()) {
-        if sim.tick >= h.commit_until
-            && unit_unit(me.index, sim.tick, me.gen, SALT_STRAFE) < tier.strafe
-        {
-            let side = if h.strafe_side > 0 { -1 } else { 1 };
-            let (sy, cy) = fmath::sin_cos(u.soldier.yaw);
-            let p = pos + Vec3::new(cy, 0.0, -sy) * (f32::from(side) * HOLD_STRAFE);
-            if react_ok(sim, u, p) && spot_free(sim, me, p) && h.step_to(p, sim.tick, false) {
-                h.strafe_side = side;
-                st.hold = Some(h);
-            }
-        }
-    }
     // Card FFLN: a friend in the line of fire. The shot waits (the gunner), and a
     // holder whose last step's commit time is over steps aside, away from the
     // friend, through its goal's one writer. A bot walking its leg walks on:
-    // the line clears by itself.
-    let line = gun.line;
-    if let (Some(side), Some(mut h)) = (line, holding) {
+    // the line clears by itself. Card TPOS: not a bot on a Tactician's
+    // position - those are chosen out of the friends' lines - but still the
+    // fallback's stander (without it, BF2 Hoth's fighters with a teammate
+    // within 1.5 m went 3.6 -> 5.8 % over 8 seeds; with it 3.6 %). No strafe
+    // on a new burst any more.
+    if let (Some(side), Some(mut h), false) = (gun.line, holding, st.fight.tactician()) {
         let (sy, cy) = fmath::sin_cos(u.soldier.yaw);
         let p = pos + Vec3::new(cy, 0.0, -sy) * (f32::from(side) * HOLD_STRAFE);
         if sim.tick >= h.commit_until
@@ -552,8 +540,8 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
             st.hold = Some(h);
         }
     }
-    // The holder as it is now (the dodge, the strafe and the step out of a
-    // friend's line above may have moved its goal this tick).
+    // The holder as it is now (the dodge and the step out of a friend's line
+    // above may have moved its goal this tick).
     let holding = holding.and(st.hold);
     // A seen enemy inside [`HOLD_RANGE`]: stand and fight (a remembered one
     // never holds the bot: the design's "the unit may move toward it").
@@ -577,9 +565,29 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
     // past the last tick the target was in reach — the 2 s a fight lasts at
     // least, and the 2 s after which it is given up.
     let free = ret.is_none() && flee.is_none() && boarding.is_none() && st.cmd.is_none();
+    // Card TPOS: hidden at its position a bot does not see its target - the
+    // hide phase's point - and it keeps the position while it remembers it
+    // (without this the fight lapsed 2 s into the hide and the bot walked
+    // off, then back: the maintainer's Kamino scene).
+    if st.fight.mode == FightState::COVER && memory.is_some() && free {
+        if let Some(h) = st.hold.as_mut() {
+            h.until = h.until.max(sim.tick + HOLD_CLOSE);
+        }
+    }
+    let manning = boarding.is_some()
+        && st
+            .ride
+            .and_then(|r| r.board)
+            .is_some_and(|vh| super::man::is_turret(sim, vh));
     match fight.filter(|_| free) {
         Some((e, r)) => fight_position(sim, &tk, st, e, r, thinking, &mut nt),
-        None if !free || st.hold.is_none_or(|h| sim.tick >= h.until) => st.fight.mode = 0,
+        None if !free || st.hold.is_none_or(|h| sim.tick >= h.until) => {
+            if st.fight.mode == FightState::TAKE {
+                nt.tpos_ev |= super::tactic::EV_WALK_DROPPED;
+            }
+            super::tactic::release(st, sim.tick);
+            st.fight.mode = 0;
+        }
         None => {}
     }
     // Card RCYC: who the last resort (the mover's progress watch) never
@@ -608,8 +616,12 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
         defending,
         // The stand of a boarder or a commanded bot with an enemy inside
         // 25 m — and of a free bot on the tick it takes its fight position
-        // (from the next it is `holding`, or walks to its ring point).
-        in_range: (hold && !free) || (fight.is_some() && free && ring_walk(sim, st).is_none()),
+        // (from the next it is `holding`, or walks to its ring point). Card
+        // TURR: not of a bot walking to a turret, whose gun is the fight (it
+        // stood 0.4 m out of reach shooting the enemy it was sent to man
+        // the turret against).
+        in_range: (hold && !free && !manning)
+            || (fight.is_some() && free && ring_walk(sim, st).is_none()),
         ret,
         hold: holding,
         flee: flee.is_some(),
@@ -635,7 +647,33 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
     match moved.walk {
         // Card FGHT: at the ring point, or where the way to it is shut: the
         // circle's pause, where the bot stands.
-        Walk::Arrived | Walk::Failed if ring.is_some() => {
+        // Card TPOS: at the Tactician's position its cycle starts; a way
+        // there that is shut leaves it (the next think asks again).
+        Walk::Arrived if ring.is_some() && st.fight.mode == FightState::TAKE => {
+            if let Some(mut h) = st.hold {
+                if super::tactic::walk_arrived(sim, &tk, st, &mut h) {
+                    nt.tpos_ev |= super::tactic::EV_WALK_ARRIVED;
+                    st.hold = Some(h);
+                }
+            }
+        }
+        // (Given up near enough, it is there where it stopped.)
+        Walk::Failed if ring.is_some() && st.fight.mode == FightState::TAKE => {
+            let mut h = st.hold.unwrap_or_default();
+            if super::tactic::cut_short(sim, &tk, st, &mut h) {
+                nt.tpos_ev |= super::tactic::EV_WALK_NEAR;
+                st.hold = st.hold.map(|_| h);
+            } else {
+                nt.tpos_ev |= super::tactic::EV_WALK_GIVEN_UP;
+                if let Some(h) = st.hold.as_mut() {
+                    h.settle(pos);
+                }
+                st.fight.mode = FightState::STAND;
+            }
+        }
+        // (Not a bot already at its Tactician's position: `tactic::fight`
+        // ended the walk there this tick.)
+        Walk::Arrived | Walk::Failed if ring.is_some() && !st.fight.tactician() => {
             if let Some(h) = st.hold.as_mut() {
                 h.settle(pos);
             }
@@ -729,141 +767,21 @@ fn recover(sim: &Sim, st: &mut AiState, nt: &mut NavTick) {
     }
 }
 
-/// Card HOLD: hub `hub` has just been reached. A bot that owes hubs after its
-/// last hold pays one; a free bot that PERCEIVES an enemy (a contact in its
-/// memory) takes a position here — a Cover or Snipe hint within
-/// [`HOLD_HINT_RADIUS`], else a point in the hub — and holds it for a dwell.
-/// Not a commanded bot, not one off the level, not one boarding.
-fn hold_at_hub(sim: &Sim, me: UnitHandle, u: &Unit, st: &mut AiState, hub: u16) {
+/// Card HOLD: hub `hub` has just been reached: a hold that has run out is
+/// dropped, or pays one of the hubs it owes. Card TPOS: no bot takes a hold
+/// at a hub any more because an enemy is about (card HOLD's 10-24 s dwell at
+/// a hint or a drawn hub point) - a fight's position is the Tactician's.
+/// Those holders were 11-24 % of Yavin 2's, Utapau's and Polis Massa's fight
+/// time with no position, standing on a target they did not see; without
+/// them B12 rose on 7 of 8 maps and kills a minute x1.06 (8 seeds).
+fn hub_reached(sim: &Sim, st: &mut AiState) {
     if let Some(mut h) = st.hold {
         if sim.tick < h.until {
             return;
         }
         h.skip = h.skip.saturating_sub(1);
         st.hold = (h.skip > 0).then_some(h);
-        return;
     }
-    let pos = u.soldier.pos;
-    // "Near the enemy": one it PERCEIVES within [`HOLD_FIGHT`] — then any
-    // hub is a place to fight from. A DEFENDER also stops for any living
-    // enemy within [`HOLD_NEAR`] (like the hunt, not bounded by what it can
-    // see), at a hub with an authored Cover / Snipe position. An ATTACKER
-    // does not: stopping at hubs in reach of an unseen enemy stalled the
-    // advance, and BF2 Kamino's rounds — decided by who takes the posts, at
-    // the port's 3-5 kills a minute there — stood still (8 seeds at 60,000
-    // ticks: the loser still had 74 of its 150 tickets, against 31 with
-    // the rule as it is).
-    let sees = st
-        .contacts
-        .iter()
-        .flatten()
-        .any(|c| (c.last_pos - pos).length_squared() <= HOLD_FIGHT * HOLD_FIGHT);
-    let defending = matches!(
-        sim.commander[usize::from(u.team).min(1)].of(me.index),
-        Some(crate::commander::Objective::Defend(_))
-    );
-    let engaged = sees
-        || (defending
-            && sim.alive_units().any(|(_, o)| {
-                o.team != u.team && (o.soldier.pos - pos).length_squared() <= HOLD_NEAR * HOLD_NEAR
-            }));
-    // The endgame: a side down to its last few reinforcements. Its bleed is
-    // clamped at its alive count and only kills end the round
-    // (re-round-stalls.md C7), so nobody waits in a position any more —
-    // with holds on, 8 seeds x 32 maps left nine more rounds standing at
-    // 4 v 2, 1 v 59, 3 v 63.
-    let endgame = sim.battle.teams.iter().any(|t| t.tickets() <= HOLD_ENDGAME);
-    let busy = endgame
-        || st.lost.is_some()
-        || st.cmd.is_some()
-        || u.command.is_some_and(|c| !c.in_pool())
-        || st.ride.is_some_and(|r| r.board.is_some());
-    if !engaged || busy {
-        return;
-    }
-    let Some(hb) = sim.nav.as_ref().and_then(|g| g.hub(hub)) else {
-        return;
-    };
-    let y = sim.nav_floor(hub).unwrap_or(u.soldier.pos.y);
-    // No position is taken standing in water: the bot wades on to the next
-    // dry hub (BF1 KAS2's lagoon hubs; the PS2's bots hold the docks).
-    if sim.water_level.is_some_and(|w| y < w - 0.2) {
-        return;
-    }
-    let centre = Vec3::new(hb.pos.x, y, hb.pos.z);
-    start_hold(
-        sim,
-        me,
-        u,
-        st,
-        centre,
-        hb.radius.min(HOLD_SPOT_RADIUS),
-        HOLD_HINT_RADIUS,
-    );
-    if !sees && st.hold.is_some_and(|h| h.stance_mask == 0) {
-        st.hold = None; // no authored position here and nobody in sight: on
-    }
-}
-
-/// Card HOLD: take a position about `centre` and hold it for a drawn dwell —
-/// the nearest authored Cover / Snipe hint within `hint_r` (a Snipe hint for
-/// a scoped weapon only; its stance comes with it), else a drawn point
-/// within `spot_r` that can be stood on, else `centre` itself.
-fn start_hold(
-    sim: &Sim,
-    me: UnitHandle,
-    u: &Unit,
-    st: &mut AiState,
-    centre: Vec3,
-    spot_r: f32,
-    hint_r: f32,
-) {
-    let draw = |k: u32| unit_unit(me.index, sim.tick, me.gen, SALT_HOLD ^ k);
-    let scoped = sim.weapon_classes[u.weapon_class].ai_distance_table();
-    // Card JITR: ...and nobody else's — a hint another holder has, or a
-    // point within [`HOLD_SPACING`] of one, is passed over (the maintainer: "all
-    // standing next to each other").
-    let hint = crate::commander::hint_spot(sim, centre, hint_r, u.soldier.pos, scoped)
-        .filter(|(p, _)| (p.y - centre.y).abs() <= HUB_LEVEL_TOL && spot_free(sim, me, *p));
-    let (spot, mask) = match hint {
-        Some(found) => found,
-        None => {
-            // The first draw is card HOLD's; three more when it is taken.
-            let drawn = (0..4u32).find_map(|k| {
-                let (a, r) = match k {
-                    0 => (draw(1), draw(2)),
-                    _ => (draw(8 + 2 * k), draw(9 + 2 * k)),
-                };
-                let (sa, ca) = fmath::sin_cos(a * std::f32::consts::TAU);
-                let p = centre + Vec3::new(ca, 0.0, sa) * (spot_r * r.sqrt());
-                (stand_ok(sim, u, centre, p) && spot_free(sim, me, p)).then_some(p)
-            });
-            let here = u.soldier.pos;
-            (
-                match drawn {
-                    Some(p) => p,
-                    None if spot_free(sim, me, centre) => centre,
-                    None => here,
-                },
-                0,
-            )
-        }
-    };
-    let dwell = HOLD_DWELL_MIN + ((HOLD_DWELL_MAX - HOLD_DWELL_MIN) as f32 * draw(3)) as u64;
-    st.hold = Some(HoldState {
-        spot,
-        goal: spot,
-        until: sim.tick + dwell,
-        skip: HOLD_SKIP_HUBS,
-        shuffle_at: sim.tick + HOLD_MOVE_PERIOD,
-        strafe_side: if draw(4) < 0.5 { -1 } else { 1 },
-        stance_mask: mask,
-        look: Vec3::ZERO,
-        last_contact: sim.tick,
-        commit_until: 0,
-        blocked: 0,
-        roll_at: 0,
-    });
 }
 
 /// Card JITR: is `p` free to hold — not within [`HOLD_SPACING`] of the point
@@ -937,9 +855,23 @@ fn fight_position(
         ..HoldState::default()
     });
     if live.is_none() {
+        if st.fight.mode == FightState::TAKE {
+            nt.tpos_ev |= super::tactic::EV_WALK_DROPPED;
+        }
+        super::tactic::release(st, sim.tick);
         st.fight.mode = 0;
     }
     h.until = h.until.max(sim.tick + HOLD_CLOSE);
+    // Card TPOS: the Tactician's position, when the table has one for this
+    // fight; else the bot's own style below.
+    if super::tactic::fight(sim, tk, st, e, &mut h, thinking, nt) {
+        // (In the open, a croucher by style crouches.)
+        if !st.tpos.covered && crouches && h.stance_mask == 0 {
+            h.stance_mask = crate::commander::MASK_CROUCH;
+        }
+        st.hold = Some(h);
+        return;
+    }
     let ring = |h: &mut HoldState, st: &mut AiState, nt: &mut NavTick| match ring_point(
         sim,
         tk,
@@ -1445,7 +1377,7 @@ mod tests {
         assert_eq!(u.ai.behaviour, Behaviour::Fight);
         let held = u.soldier.pos;
         assert!(
-            nav::xz_dist(held, p0) < HOLD_SHUFFLE + HOLD_STRAFE + 1.0,
+            nav::xz_dist(held, p0) < crate::ai::HOLD_SHUFFLE + HOLD_STRAFE + 1.0,
             "it has not walked on: {held} from {p0}"
         );
         // The enemy goes; the position goes quiet; the bot advances to the post.
@@ -1623,7 +1555,8 @@ mod tests {
             longest = longest.max(still);
         }
         assert_eq!(again, 0, "a stander's spot moved inside the cooldown");
-        assert!(path > 40.0, "{path} m in 20 s of fire");
+        // (Card TPOS: 40 m with the shuffle; without it 39.3.)
+        assert!(path > 30.0, "{path} m in 20 s of fire");
         assert!(longest < 200, "{longest} ticks standing still under fire");
         assert!(walked > 0, "it never walked to a new position");
         // The fire stops: it ends its walk and stands to shoot.
@@ -1718,7 +1651,7 @@ mod tests {
         // (Its steps on the position are card HOLD's shuffle and strafe.)
         let (_, _, modes, strayed) = run(all_stand());
         assert!(
-            strayed <= HOLD_SHUFFLE + HOLD_STRAFE + 0.5,
+            strayed <= crate::ai::HOLD_SHUFFLE + HOLD_STRAFE + 0.5,
             "a stander keeps its place: {strayed} m from it"
         );
         assert!(modes[usize::from(FightState::STAND)] > 590, "{modes:?}");
@@ -2074,97 +2007,6 @@ mod tests {
         // from the target — every point of it is over 2 m farther back.
         let got = points(Vec3::new(0.0, 0.0, -20.0), Vec3::new(0.0, 0.0, -12.0));
         assert!(got.is_empty(), "a circle does not back away: {got:?}");
-    }
-
-    /// Card HOLD: the tiers differ in how lively a holder is. Over the same
-    /// half minute on the same position, with the same enemy in sight, an
-    /// Elite bot covers several times the ground an Easy one does — which
-    /// mostly stands there.
-    #[test]
-    fn a_harder_tier_moves_more_on_its_position() {
-        // Card FGHT: a shooter that keeps its place.
-        let _style = all_stand();
-        use crate::sim::PadState;
-        use crate::skill::Difficulty;
-        use crate::unit::UnitSpec;
-        let walked = |d: Difficulty| {
-            let (mut sim, h) = l_sim();
-            sim.difficulty = d;
-            // In sight of every tier (Easy sees 39 m) and outside HOLD_RANGE.
-            let e = sim
-                .spawn(&UnitSpec::trooper(1, Vec3::new(0.0, 0.0, -32.0)))
-                .expect("enemy");
-            // On a position at the start, for the whole run.
-            let u = sim.unit_mut(h).expect("alive");
-            u.skill = d.base_skill();
-            u.ai.hold = Some(HoldState {
-                until: u64::MAX,
-                shuffle_at: 30,
-                ..HoldState::default()
-            });
-            let (mut path, mut last) = (0.0f32, Vec3::ZERO);
-            for _ in 0..900 {
-                sim.step(&[PadState::default()]);
-                sim.unit_mut(e).expect("enemy").health.cur = 300.0;
-                let p = sim.unit(h).expect("alive").soldier.pos;
-                path += nav::xz_dist(p, last);
-                last = p;
-            }
-            path
-        };
-        let (easy, elite) = (walked(Difficulty::Easy), walked(Difficulty::Elite));
-        assert!(
-            elite > 2.0 * easy + 5.0,
-            "easy {easy:.1} m, elite {elite:.1} m"
-        );
-        assert!(easy < 15.0, "an Easy bot mostly stands there: {easy:.1} m");
-    }
-
-    /// Card JITR: a holder's goal has one writer and a commit time. An Elite
-    /// bot on a position with an enemy in sight shuffles and strafes (the
-    /// liveliest tier), and never takes a new goal inside [`HOLD_COMMIT`] of
-    /// the last — before the commit, a strafe on every burst, the other way
-    /// each time, ran it back and forth (the maintainer's KAM1 snapshot).
-    #[test]
-    fn a_holders_goal_is_kept_for_its_commit_time() {
-        // Card FGHT: a shooter that keeps its place.
-        let _style = all_stand();
-        use crate::ai::HOLD_COMMIT;
-        use crate::sim::PadState;
-        use crate::skill::Difficulty;
-        use crate::unit::UnitSpec;
-        let (mut sim, h) = l_sim();
-        sim.difficulty = Difficulty::Elite;
-        let e = sim
-            .spawn(&UnitSpec::trooper(1, Vec3::new(0.0, 0.0, -32.0)))
-            .expect("enemy");
-        let u = sim.unit_mut(h).expect("alive");
-        u.skill = Difficulty::Elite.base_skill();
-        let at = u.soldier.pos;
-        u.ai.hold = Some(HoldState {
-            spot: at,
-            goal: at,
-            until: u64::MAX,
-            shuffle_at: 30,
-            ..HoldState::default()
-        });
-        let (mut changes, mut goal) = (Vec::new(), at);
-        for _ in 0..1800 {
-            sim.step(&[PadState::default()]);
-            sim.unit_mut(e).expect("enemy").health.cur = 300.0;
-            let g = sim.unit(h).and_then(|u| u.ai.hold).expect("holding").goal;
-            if g != goal {
-                changes.push(sim.tick);
-                goal = g;
-            }
-        }
-        assert!(changes.len() >= 4, "it moves on its position: {changes:?}");
-        for w in changes.windows(2) {
-            assert!(
-                w[1] - w[0] >= HOLD_COMMIT,
-                "a new goal inside the commit: {changes:?}"
-            );
-        }
     }
 
     /// Card HOLD: a grenade on the ground sends an Elite bot inside its

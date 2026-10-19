@@ -257,8 +257,18 @@
 //! share is of all `N` alive-unit samples.
 //!
 //! and under it (card FGHT) `behave <key>: foot-s N | travel n fight n evade n
-//! capture n guard n board n follow n recover n none n`: the on-foot AI
-//! samples by what the bot was doing.
+//! capture n guard n board n follow n recover n none n | B12 cover C
+//! at-position P of fight F (p %) modes none .. stand .. walk .. pause ..
+//! move .. take .. cover .. chosen-covered .. at-cover-hint ..`: the on-foot
+//! AI samples by what the bot was doing, and (card TPOS,
+//! `analysis/bot-design.md` B12) of the Fight samples those at a Tactician's
+//! position with cover from the target, those at one at all, all of them by
+//! `FightState` mode, of the COVER ones those whose position was chosen with
+//! cover from the target, and those at an authored Cover hint's position
+//! (the PS2's own B12 reading: attack time at Cover hints, SAIR 4.6); then
+//! `tactician <key>: queries Q ceiling C (p %)`: the Tactician's queries and
+//! those in which a candidate with cover from the target passed its filters
+//! (B12's ceiling: the bar is the lower of 20 % and half of it).
 //!
 //! `HIT_CENSUS=1` (card REACT) adds `fire <key>: under-fire-s N | slow p % |
 //! spell3 p % | fight-s N slow p % spell3 p % | bursts B lived L moved M (p %)
@@ -1096,6 +1106,217 @@ impl Recycles {
     }
 }
 
+/// A seated spell of [`TurretCensus`]: (generation, first tick, bolts, the
+/// last bolt's tick, over 60 s with no bolt in 20 s yet).
+type Spell = (u32, u64, u64, u64, bool);
+
+/// Card TURR's census, the `turrets:` line (`ROUND_VERBOSE=1`, a map with
+/// building turrets): the share of AI time in a building turret's seat, the
+/// seated spells (over 60 s; over 60 s with no shot in their last 20 s -
+/// bar B8: none), the bolts fired a seated minute, the gunner-ticks seated
+/// once the gunner's team had been in the endgame for a second (B8: none),
+/// the gunners' hits and kills on soldiers, how claims ended and the
+/// seated time per turret. Read-only.
+#[derive(Default)]
+struct TurretCensus {
+    /// AI unit-ticks alive, and of those in a building turret's seat.
+    ai: u64,
+    seated: u64,
+    /// Per unit index, its open spell.
+    open: Vec<Option<Spell>>,
+    /// Closed spells: (ticks, bolts, the quiet flag).
+    spells: Vec<(u64, u64, bool)>,
+    endgame: u64,
+    endgame_since: [Option<u64>; 2],
+    /// Seated ticks per vehicle slot.
+    by_turret: Vec<u64>,
+    /// Per unit index, its open claim on a turret (generation, turret), and
+    /// how claims ended: [boarded, died on the way, dropped].
+    claim: Vec<Option<(u32, core::vehicle::VehicleHandle)>>,
+    claim_end: [u64; 3],
+    /// Hits on soldiers by gunners in building turrets, and the kills.
+    hits: u64,
+    kills: u64,
+}
+
+impl TurretCensus {
+    const LONG: u64 = 60 * core::TICK_HZ as u64;
+    const QUIET: u64 = 20 * core::TICK_HZ as u64;
+
+    fn observe(&mut self, sim: &core::sim::Sim) {
+        let tick = sim.tick;
+        for team in 0..2u8 {
+            let e = &mut self.endgame_since[usize::from(team)];
+            *e = match (core::ai::man::endgame(sim, team), *e) {
+                (true, None) => Some(tick),
+                (true, s) => s,
+                (false, _) => None,
+            };
+        }
+        let mut seen = vec![false; sim.units.len()];
+        if self.open.len() < sim.units.len() {
+            self.open.resize(sim.units.len(), None);
+        }
+        if self.by_turret.len() < sim.vehicles.len() {
+            self.by_turret.resize(sim.vehicles.len(), 0);
+        }
+        for (h, u) in sim.alive_units() {
+            if u.controller != core::unit::Controller::Ai {
+                continue;
+            }
+            self.ai += 1;
+            let Some(m) = u.mount.filter(|m| core::ai::man::is_turret(sim, m.vehicle)) else {
+                continue;
+            };
+            let i = h.index as usize;
+            seen[i] = true;
+            self.seated += 1;
+            self.by_turret[m.vehicle.index as usize] += 1;
+            let bolts = sim
+                .events
+                .iter()
+                .filter(|e| matches!(e, core::sim::Event::Shot { unit, .. } if *unit == h))
+                .count() as u64;
+            if self.open[i].is_some_and(|o| o.0 != h.gen) {
+                self.close(i, tick);
+            }
+            let o = self.open[i].get_or_insert((h.gen, tick, 0, tick, false));
+            o.2 += bolts;
+            if bolts > 0 {
+                o.3 = tick;
+            }
+            // (A gunner's exit is asked at its think: a second's grace.)
+            o.4 |= tick - o.1 > Self::LONG && tick - o.3 > Self::QUIET + core::TICK_HZ as u64;
+            if self.endgame_since[usize::from(u.team).min(1)]
+                .is_some_and(|s| tick - s >= core::TICK_HZ as u64)
+            {
+                self.endgame += 1;
+            }
+        }
+        for (i, s) in seen.iter().enumerate() {
+            if !s {
+                self.close(i, tick);
+            }
+        }
+        for e in &sim.events {
+            if let core::sim::Event::Hit {
+                shooter,
+                health_left,
+                ..
+            } = e
+            {
+                let seated = sim
+                    .unit(*shooter)
+                    .and_then(|u| u.mount)
+                    .is_some_and(|m| core::ai::man::is_turret(sim, m.vehicle));
+                if seated {
+                    self.hits += 1;
+                    self.kills += u64::from(*health_left <= 0.0);
+                }
+            }
+        }
+        if self.claim.len() < sim.units.len() {
+            self.claim.resize(sim.units.len(), None);
+        }
+        for i in 0..sim.units.len() {
+            let u = &sim.units[i];
+            let now = (u.alive && u.mount.is_none())
+                .then(|| u.ai.ride.and_then(|r| r.board))
+                .flatten()
+                .filter(|&vh| core::ai::man::is_turret(sim, vh))
+                .map(|vh| (u.gen, vh));
+            if let Some((gen, vh)) = self.claim[i].filter(|&c| Some(c) != now) {
+                let k = if !u.alive || u.gen != gen {
+                    1
+                } else if u.mount.is_some_and(|m| m.vehicle == vh) {
+                    0
+                } else {
+                    2
+                };
+                self.claim_end[k] += 1;
+            }
+            self.claim[i] = now;
+        }
+    }
+
+    fn close(&mut self, i: usize, tick: u64) {
+        if let Some((_, start, bolts, _, quiet)) = self.open.get_mut(i).and_then(Option::take) {
+            self.spells.push((tick - start, bolts, quiet));
+        }
+    }
+
+    fn line(&mut self, sim: &core::sim::Sim, classes: &[String]) -> Option<String> {
+        let turrets: Vec<_> = sim
+            .vehicles
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.kind == core::vehicle::VehicleKind::Turret)
+            .collect();
+        if turrets.is_empty() {
+            return None;
+        }
+        for i in 0..self.open.len() {
+            self.close(i, sim.tick);
+        }
+        let n = &sim.nav_stats;
+        let long = self.spells.iter().filter(|s| s.0 > Self::LONG).count();
+        let quiet = self.spells.iter().filter(|s| s.2).count();
+        let longest = self.spells.iter().map(|s| s.0).max().unwrap_or(0);
+        let mut lens: Vec<u64> = self.spells.iter().map(|s| s.0).collect();
+        lens.sort_unstable();
+        let median = lens.get(lens.len() / 2).copied().unwrap_or(0);
+        let fired = self.spells.iter().filter(|s| s.1 > 0).count();
+        let bolts: u64 = self.spells.iter().map(|s| s.1).sum();
+        let minutes = self.seated as f64 / (60.0 * f64::from(core::TICK_HZ));
+        let mut by: Vec<(usize, u64)> = turrets
+            .iter()
+            .map(|(i, _)| (*i, self.by_turret.get(*i).copied().unwrap_or(0)))
+            .filter(|b| b.1 > 0)
+            .collect();
+        by.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let by: Vec<String> = by
+            .iter()
+            .take(6)
+            .map(|&(i, t)| {
+                let v = &sim.vehicles[i];
+                format!(
+                    "{} ({:.0},{:.0},{:.0}) {} s",
+                    classes.get(v.class as usize).map_or("?", String::as_str),
+                    v.pos.x,
+                    v.pos.y,
+                    v.pos.z,
+                    t / u64::from(core::TICK_HZ)
+                )
+            })
+            .collect();
+        Some(format!(
+            "    turrets: {} | seat share {:.2} % of AI time | spells {} (with a shot {fired}, median {:.1} s, over 60 s {long}, over 60 s with no shot in its last 20 s {quiet}, longest {} s) | bolts a seated minute {:.1}, hits {} kills {} | seated in the endgame {} ticks | offers {} (defence {}) boards {} (claims boarded {}, died on the way {}, dropped {}) | exits 1:{} 2:{} 3:{} 4:{} 5:{} unreached {} | by turret [{}]",
+            turrets.len(),
+            100.0 * self.seated as f64 / self.ai.max(1) as f64,
+            self.spells.len(),
+            median as f64 / f64::from(core::TICK_HZ),
+            longest / u64::from(core::TICK_HZ),
+            if minutes > 0.0 { bolts as f64 / minutes } else { 0.0 },
+            self.hits,
+            self.kills,
+            self.endgame,
+            n.man_offers,
+            n.man_defence_offers,
+            n.man_boards,
+            self.claim_end[0],
+            self.claim_end[1],
+            self.claim_end[2],
+            n.man_codes[1],
+            n.man_codes[2],
+            n.man_codes[3],
+            n.man_codes[4],
+            n.man_codes[5],
+            n.man_codes[6],
+            by.join(", "),
+        ))
+    }
+}
+
 /// One unit's sample of a second ago, ten seconds ago, … (`Shares`).
 #[derive(Clone, Copy)]
 struct Past {
@@ -1108,7 +1329,7 @@ struct Past {
 
 /// Slots of the per-behaviour counters: one per `core::ai::Behaviour`
 /// (its last variant + 1).
-const N_BEHAVIOURS: usize = core::ai::Behaviour::Overwatch as usize + 1;
+const N_BEHAVIOURS: usize = core::ai::Behaviour::Man as usize + 1;
 
 /// The shares line (module header, card RCYC): walking in place, the locus
 /// (of the units on foot, card FOFG) and the steering, from one sample per
@@ -1158,9 +1379,44 @@ struct Shares {
     /// Card FGHT: every on-foot AI sample by its behaviour — the `behave`
     /// line.
     behave_by: [u64; N_BEHAVIOURS],
+    /// B12 (card TPOS): the Fight samples at a Tactician's position with
+    /// cover from the target (`core::ai::tactic::covered_from_target`), and
+    /// those at one at all.
+    cover_fight: u64,
+    at_position: u64,
+    /// ...and the Fight samples by `FightState::mode` (0 ..= 6), and of the
+    /// COVER ones those chosen with cover from the target.
+    fight_mode: [u64; 7],
+    chosen_covered: u64,
+    /// ...and the COVER ones at a position of an authored Cover hint.
+    at_cover_hint: u64,
+    /// ...and every Fight sample in one of [`FIGHT_SPLIT`]'s classes.
+    fight_split: [u64; 13],
     /// Per unit index: its generation, where the spell began, its samples.
     stand_at: Vec<(u32, glam::Vec3, u32)>,
 }
+
+/// The `fightsplit` line's classes of a Fight sample (card TPOS): no
+/// position and the last query found none (waiting to ask again), no
+/// position otherwise, card FGHT's own stand / walk / pause / move, walking
+/// to a covered / an open position, at a covered one with cover from the
+/// target (B12), more than B12's 1.5 m off it, the target not behind its
+/// cover (gone round), no contact held, at an open one.
+const FIGHT_SPLIT: [&str; 13] = [
+    "none-wait",
+    "none",
+    "own",
+    "take-covered",
+    "take-open",
+    "B12",
+    "off-spot",
+    "round",
+    "no-contact",
+    "open",
+    "endgame",
+    "vehicle-target",
+    "own-wait",
+];
 
 /// B9's spell: this long (s = samples)...
 const STAND_SECS: u32 = 20;
@@ -1173,6 +1429,53 @@ const CONTACT_M: f32 = 20.0;
 /// A unit beyond a rim is on a hull when it is this far under the nearest
 /// hub's floor (m): the census's own threshold, over a kerb.
 const RIM_UNDER: f32 = 0.3;
+
+/// A Fight sample's [`FIGHT_SPLIT`] class.
+fn fight_class(sim: &core::sim::Sim, u: &core::unit::Unit) -> usize {
+    use core::ai::FightState as F;
+    let st = &u.ai;
+    let held = st
+        .tpos
+        .held
+        .and_then(|i| sim.positions.positions.get(i as usize));
+    if sim
+        .battle
+        .teams
+        .iter()
+        .any(|t| t.tickets() <= core::ai::HOLD_ENDGAME)
+    {
+        return 10;
+    }
+    if st
+        .target
+        .and_then(|h| sim.unit(h))
+        .is_some_and(|t| t.mount.is_some())
+    {
+        return 11;
+    }
+    match st.fight.mode {
+        0 if st.tpos.retry_at > sim.tick => 0,
+        0 => 1,
+        F::TAKE if st.tpos.covered => 3,
+        F::TAKE => 4,
+        F::COVER if st.tpos.covered => {
+            let Some(q) = held else { return 1 };
+            let c = st.target.and_then(|h| core::perception::contact_of(st, h));
+            if core::ai::tactic::covered_from_target(sim, u) {
+                5
+            } else if core::nav::xz_dist(u.soldier.pos, q.pos) > core::ai::tactic::NEAR_ENOUGH {
+                6
+            } else if c.is_some() {
+                7
+            } else {
+                8
+            }
+        }
+        F::COVER => 9,
+        _ if st.tpos.retry_at > sim.tick => 12,
+        _ => 2,
+    }
+}
 
 impl Shares {
     fn observe(&mut self, sim: &core::sim::Sim, tick: u64) {
@@ -1195,6 +1498,23 @@ impl Shares {
                 self.stand_foot += 1;
                 let b = u.ai.behaviour;
                 self.behave_by[b as usize] += 1;
+                if b == core::ai::Behaviour::Fight {
+                    self.cover_fight += u64::from(core::ai::tactic::covered_from_target(sim, u));
+                    self.at_position += u64::from(u.ai.fight.mode == core::ai::FightState::COVER);
+                    self.fight_mode[usize::from(u.ai.fight.mode).min(6)] += 1;
+                    self.chosen_covered += u64::from(
+                        u.ai.fight.mode == core::ai::FightState::COVER && u.ai.tpos.covered,
+                    );
+                    self.fight_split[fight_class(sim, u)] += 1;
+                    self.at_cover_hint += u64::from(
+                        u.ai.fight.mode == core::ai::FightState::COVER
+                            && u.ai
+                                .tpos
+                                .held
+                                .and_then(|i| sim.positions.positions.get(i as usize))
+                                .is_some_and(|q| q.source == core::ai::tactic::Source::Cover),
+                    );
+                }
                 let (gen, at, n) = self.stand_at[i];
                 let idle = u.ai.target.is_none() && !b.stands();
                 if idle && gen == h.gen && n > 0 && core::nav::xz_dist(at, p) < STAND_M {
@@ -1342,7 +1662,7 @@ impl Shares {
         .collect::<Vec<_>>()
         .join(" ");
         format!(
-            "shares {key}: unit-s {n} | walk-in-place {} ({:.1} %) | locus H {:.1} % A {:.1} % N {:.1} % | steer idle {:.1} fwd {:.1} slide {:.1} fan {:.1} back {:.1} ledge {:.1} % | slide-in-N {:.1} % | rim {} ({:.2} %) on-level {} longest {} s | contact20 {:.1} % | retarget {} in {} foot-s | stand20 {} in {} foot-s ({:.2} %) [{}] | seated {} ({:.1} %) foot {} | top {}\nbehave {key}: foot-s {} | {behave}\n",
+            "shares {key}: unit-s {n} | walk-in-place {} ({:.1} %) | locus H {:.1} % A {:.1} % N {:.1} % | steer idle {:.1} fwd {:.1} slide {:.1} fan {:.1} back {:.1} ledge {:.1} % | slide-in-N {:.1} % | rim {} ({:.2} %) on-level {} longest {} s | contact20 {:.1} % | retarget {} in {} foot-s | stand20 {} in {} foot-s ({:.2} %) [{}] | seated {} ({:.1} %) foot {} | top {}\nbehave {key}: foot-s {} | {behave} | B12 cover {} at-position {} of fight {} ({:.1} %) modes none {} stand {} walk {} pause {} move {} take {} cover {} chosen-covered {} at-cover-hint {}\n",
             self.wip,
             pct(self.wip, n),
             pct(self.locus[0], on_foot),
@@ -1371,6 +1691,28 @@ impl Shares {
             on_foot,
             if top.is_empty() { "-" } else { &top },
             self.stand_foot,
+            self.cover_fight,
+            self.at_position,
+            self.behave_by[B::Fight as usize],
+            pct(self.cover_fight, self.behave_by[B::Fight as usize]),
+            self.fight_mode[0],
+            self.fight_mode[1],
+            self.fight_mode[2],
+            self.fight_mode[3],
+            self.fight_mode[4],
+            self.fight_mode[5],
+            self.fight_mode[6],
+            self.chosen_covered,
+            self.at_cover_hint,
+        ) + &format!(
+            "fightsplit {key}: fight {} | {}\n",
+            self.behave_by[B::Fight as usize],
+            FIGHT_SPLIT
+                .iter()
+                .zip(self.fight_split)
+                .map(|(k, v)| format!("{k} {v} ({:.1} %)", pct(v, self.behave_by[B::Fight as usize])))
+                .collect::<Vec<_>>()
+                .join(" ")
         )
     }
 }
@@ -3154,9 +3496,18 @@ fn run_map(
     // AMBM), a line per change to stderr.
     let tickets = [0, 1].map(|i| w.sim.battle.teams[i].tickets());
     let mut music = game::music::HeadlessLog::from_env(path, mission.as_ref(), tickets);
+    let mut turret_census = TurretCensus::default();
+    let has_turrets = w
+        .sim
+        .vehicles
+        .iter()
+        .any(|v| v.kind == core::vehicle::VehicleKind::Turret);
     while t < max_ticks && w.sim.outcome.is_none() {
         w.step_tick(&idle);
         t += 1;
+        if has_turrets {
+            turret_census.observe(&w.sim);
+        }
         if let Some(m) = music.as_mut() {
             m.tick(&w.sim);
             if w.sim.outcome.is_some() {
@@ -3466,6 +3817,10 @@ fn run_map(
                 w.sim.nav_stats.ai_drive_ticks,
                 w.sim.nav_stats.seat_shots,
             );
+            // Card TURR: bots in building turrets.
+            if let Some(l) = turret_census.line(&w.sim, &vehicle_classes) {
+                outln!(out, "{l}");
+            }
             // Card WAI: the walkers bots pilot, and how far they take them.
             let walkers = w
                 .sim
@@ -3841,6 +4196,46 @@ fn run_map(
     });
     if let Some(s) = &shares {
         census.push_str(&s.line(key));
+        // Card TPOS: B12's ceiling - the Tactician's queries in which a
+        // candidate with cover from the target passed its filters.
+        let ns = &w.sim.nav_stats;
+        census.push_str(&format!(
+            "tactician {key}: queries {} ceiling {} ({:.1} %) | {} | ceiling-without-covered-pick {}\n",
+            ns.tpos_queries,
+            ns.tpos_ceiling,
+            100.0 * ns.tpos_ceiling as f64 / ns.tpos_queries.max(1) as f64,
+            core::ai::tactic::EV_NAMES
+                .iter()
+                .zip(ns.tpos_ev)
+                .map(|(k, v)| format!("{k} {v}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            ns.tpos_ev[16],
+        ));
+        census.push_str(&format!(
+            "tfunnel {key}: {}\n",
+            [
+                "within",
+                "storey",
+                "nearest32",
+                "x-band",
+                "x-taken",
+                "x-body",
+                "x-line",
+                "x-backward",
+                "x-hazard",
+                "x-barrier",
+                "passed",
+                "x-drop",
+                "x-ray",
+                "scored-no-pick"
+            ]
+            .iter()
+            .zip(ns.tpos_funnel)
+            .map(|(k, v)| format!("{k} {v}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+        ));
     }
     if let Some(f) = &fire {
         census.push_str(&f.line(key));

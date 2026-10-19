@@ -11,10 +11,11 @@
 //! - **The model, one GLB primitive per (segment, node).** A hard-skinned
 //!   segment (`BNAM`) is on one node already. A soft one (`BMAP` + `BIND`)
 //!   is cut by its vertices' node: on every ground turret of both discs each
-//!   vertex is on one node at full weight and no triangle has vertices on
-//!   two (`lead_tmp/vturd/softcensus.py`: 0 of 6,838 and 8 of 15,796
-//!   triangles, the 8 on a space-map class). A model with such a triangle is
-//!   left whole and gets no rig.
+//!   vertex is on one node at full weight, and no triangle has vertices on
+//!   two but on two models (`lead_tmp/vturd/softcensus.py`: 241 of BF1's
+//!   6,838 triangles, all on the fambaa, and 8 of BF2's 15,796, on the
+//!   space-map `imp_bldg_boxturret`; `analysis/re-turret-draw.md`). A model
+//!   with such a triangle is left whole and gets no rig.
 //! - **The rig** ([`manifest::ManifestTurretRig`]): every `skel` node's
 //!   model-space bind matrix and parent, and the node of each primitive of
 //!   the drawn model.

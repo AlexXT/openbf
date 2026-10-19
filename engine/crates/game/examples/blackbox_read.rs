@@ -97,6 +97,41 @@ fn doing(p: &Probe) -> String {
             p.hold_blocked
         );
     }
+    // Card TPOS: the fight's mode and the Tactician's position.
+    if p.fmode != 0 || p.tpos.is_some() {
+        const MODES: [&str; 7] = ["none", "stand", "walk", "pause", "move", "TAKE", "COVER"];
+        let _ = write!(
+            s,
+            " [fight {}",
+            MODES.get(usize::from(p.fmode)).unwrap_or(&"?")
+        );
+        if let Some(i) = p.tpos {
+            let _ = write!(
+                s,
+                " pos #{i} {} {:.1} m off, {}{}{}, hits {}, phase {:.1} s",
+                at(p.tpos_at),
+                d(p.tpos_at),
+                if p.tpos_bits & 1 != 0 {
+                    "covered"
+                } else {
+                    "open"
+                },
+                if p.tpos_bits & 2 != 0 {
+                    " firing"
+                } else {
+                    " hidden"
+                },
+                match p.tpos_bits & 12 {
+                    4 => " lean -1",
+                    8 => " lean +1",
+                    _ => "",
+                },
+                p.tpos_hits,
+                p.tpos_phase
+            );
+        }
+        s.push(']');
+    }
     if p.board >= 0 && p.board_at != [0.0; 3] {
         let _ = write!(s, " [vehicle at {} {:.1} m]", at(p.board_at), d(p.board_at));
     }

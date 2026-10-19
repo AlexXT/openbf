@@ -58,16 +58,27 @@ use super::{
 use crate::nav;
 use crate::sim::{PadState, Sim, ENTER_REACH};
 use crate::unit::{Unit, UnitHandle};
-use crate::vehicle::{Mount, SeatKind, VehicleHandle, STUCK_MOVED};
+use crate::vehicle::{Mount, SeatKind, VehicleHandle, VehicleKind, STUCK_MOVED};
 use glam::Vec3;
 
 /// The seat `me` can still take in `vh`, or `None`: the vehicle is alive, the
 /// port can drive its class (a hover, or since card WAI a walker), and CanEnter gives this bot either the
 /// pilot seat or — its pilot seat taken, by a teammate since CanEnter checks
-/// the team — a gunner seat with a gun (card VTAI).
+/// the team — a gunner seat with a gun (card VTAI). Card TURR: a building
+/// turret (no pilot seat) when CanEnter gives a seat with a gun.
 pub(crate) fn claim_seat(sim: &Sim, me: UnitHandle, vh: VehicleHandle) -> Option<u8> {
     let v = sim.vehicle(vh)?;
     let class = v.class as usize;
+    let armed = |k: u8| {
+        sim.seat_setup
+            .get(class)
+            .and_then(|s| s.as_ref())
+            .and_then(|s| s.guns.get(usize::from(k)))
+            .is_some_and(Option::is_some)
+    };
+    if v.kind == VehicleKind::Turret {
+        return sim.enter_seat(me, vh).filter(|&k| armed(k));
+    }
     let hover = sim.hover_params.get(class).is_some_and(Option::is_some);
     let walker = sim.walker_params.get(class).is_some_and(Option::is_some);
     if !hover && !walker {
@@ -77,14 +88,7 @@ pub(crate) fn claim_seat(sim: &Sim, me: UnitHandle, vh: VehicleHandle) -> Option
         return None;
     }
     let k = sim.enter_seat(me, vh)?;
-    let armed = || {
-        sim.seat_setup
-            .get(v.class as usize)
-            .and_then(|s| s.as_ref())
-            .and_then(|s| s.guns.get(usize::from(k)))
-            .is_some_and(Option::is_some)
-    };
-    (k == 0 || armed()).then_some(k)
+    (k == 0 || armed(k)).then_some(k)
 }
 
 /// The reach within which a claim is boarded: the vehicle's radius plus the
@@ -120,6 +124,10 @@ pub(super) fn claim(sim: &Sim, me: UnitHandle, u: &Unit, st: &mut AiState) {
     };
     let mut best: Option<(f32, VehicleHandle)> = None;
     for (vh, v) in sim.alive_vehicles() {
+        // Card TURR: a turret is offered with a purpose (`man::offer_pass`).
+        if v.kind == VehicleKind::Turret {
+            continue;
+        }
         let d = nav::xz_dist(pos, v.pos);
         if d > BOARD_SEEK || best.is_some_and(|(b, _)| d >= b) || (near_post && !command(sim, vh)) {
             continue;
@@ -224,11 +232,16 @@ pub(super) fn board_goal(
         .is_some_and(|s| s.occupant.is_some());
     let left = piloted && !reach && sim.tick >= r.since + GUNNER_WAIT;
     // The post can change under a claim (the commander re-plans), so the
-    // vehicle must still route to the CURRENT one.
-    let routes = st
-        .target_cp
-        .and_then(|i| sim.cps.get(i as usize))
-        .is_some_and(|cp| routes_to(sim, vh, cp));
+    // vehicle must still route to the CURRENT one. Card TURR: a turret is
+    // claimed for itself, not for a post - but not in the endgame.
+    let turret = super::man::is_turret(sim, vh);
+    let routes = if turret {
+        !super::man::endgame(sim, u.team)
+    } else {
+        st.target_cp
+            .and_then(|i| sim.cps.get(i as usize))
+            .is_some_and(|cp| routes_to(sim, vh, cp))
+    };
     let late = sim.tick >= r.since + BOARD_GIVEUP;
     if older || left || late || !routes || claim_seat(sim, me, vh).is_none() {
         nt.claim = if older || left {
@@ -246,6 +259,9 @@ pub(super) fn board_goal(
             sim.tick + BOARD_BLOCK
         };
         st.ride = Some(r);
+        if turret && late {
+            super::man::unreached(sim, st, vh, nt);
+        }
         return None;
     }
     let at = at?;
@@ -259,11 +275,15 @@ pub(super) fn board_goal(
 /// [`BOARD_BLOCK`], as when its clock runs out.
 pub(super) fn give_up(sim: &Sim, st: &mut AiState, nt: &mut NavTick) {
     if let Some(mut r) = st.ride {
-        r.board = None;
+        let vh = r.board.take();
         r.use_req = false;
         r.block_until = sim.tick + BOARD_BLOCK;
         st.ride = Some(r);
         nt.claim = NavTick::CLAIM_GIVEUP;
+        // Card TURR: a turret the walk cannot reach is closed to the bot.
+        if let Some(vh) = vh.filter(|&vh| super::man::is_turret(sim, vh)) {
+            super::man::unreached(sim, st, vh, nt);
+        }
     }
 }
 
@@ -280,10 +300,14 @@ pub(super) fn settle(sim: &Sim, st: &mut AiState) {
         r.sticks = None;
         r.hover = None;
     }
-    if st
-        .ride
-        .is_some_and(|r| r.board.is_none() && !r.use_req && sim.tick >= r.block_until)
-    {
+    // (Card TURR: a turret closed to it, or its seat's clocks, keep it.)
+    if st.ride.is_some_and(|r| {
+        r.board.is_none()
+            && !r.use_req
+            && sim.tick >= r.block_until
+            && sim.tick >= r.closed_until
+            && r.man.is_none()
+    }) {
         st.ride = None;
     }
 }
@@ -291,13 +315,15 @@ pub(super) fn settle(sim: &Sim, st: &mut AiState) {
 /// The think of a SEATED bot: a pilot drives its route and fires its seat's
 /// gun as it goes; a gunner aims and fires (`gunner::aim`, card VTAI). A
 /// pilot asks to get out at its post, with nowhere to go, when stuck, or in a
-/// class the port cannot drive; a gunner when its vehicle has no pilot.
+/// class the port cannot drive; a gunner when its vehicle has no pilot. A
+/// building turret's gunner is `man::seated`'s (card TURR).
 pub(super) fn drive(
     sim: &Sim,
     me: UnitHandle,
     m: Mount,
     st: &mut AiState,
-    nt: NavTick,
+    mut nt: NavTick,
+    thinking: bool,
 ) -> (PadState, NavTick) {
     let mut pad = PadState::default();
     st.steer = SteerPick::Idle;
@@ -316,13 +342,17 @@ pub(super) fn drive(
             ..r
         });
     };
+    if v.kind == VehicleKind::Turret {
+        super::man::seated(sim, me, m, st, &mut pad, &mut nt, thinking);
+        return (pad, nt);
+    }
     if v.seats.get(usize::from(m.seat)).map(|s| s.kind) != Some(SeatKind::Pilot) {
         let piloted = v
             .seats
             .first()
             .is_some_and(|s| s.kind == SeatKind::Pilot && s.occupant.is_some());
         if piloted {
-            super::gunner::aim(sim, me, st, &mut pad, Look::Seat);
+            super::gunner::aim(sim, me, st, &mut pad, Look::Seat, None);
         } else {
             out(st);
         }

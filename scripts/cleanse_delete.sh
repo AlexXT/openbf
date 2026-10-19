@@ -15,7 +15,7 @@
 #           the bake's own output files, bake_trees() below), the older literal names lead_tmp/<name>/{baked,bake,before,
 #           bake_before,bake_after,smoke,full_after,baked_after,c2_before,c2_after,goldens_committed,nd,base,spot1..6,…}, lead_tmp/roster_bake,
 #           and the superseded s13 scratch bake + pre-s13 walkabout set (s13/baked, s13/walkabout_before) — regenerable from scripts/scratch_bake.sh (recipes are in the
-#           branch READMEs). Skipped while a branch/worktree named <name> exists.
+#           branch READMEs). Skipped while a branch/worktree named <name> exists or a card <NAME>.md is not done.
 #   Tier C  small stale files the audit verified unreferenced: the session-8 copy of NEXT_SESSION_PROMPT.md
 #           at the artifacts root, briefs/*.bak_*, loose lead_tmp/*.log, lead_tmp/ordnance, __pycache__ dirs.
 # What it NEVER touches: engine/assets_baked, engine/goldens, engine/target, engine/artifacts/{loop,briefs
@@ -50,12 +50,15 @@ case "${1:-}" in
     ( cd "$D/bake_inuse/common_bf1" && exec sleep 120 ) & U1=$!; ( cd "$L/inuse_target/release" && exec sleep 120 ) & U2=$!
     trap 'kill "$U1" "$U2" 2>/dev/null; /bin/rm -rf -- "$T"' EXIT; sleep 0.3
     mk "$D/after/bf1_kam1/vantage.png"                            # not: a picture set
+    mk "$T/engine/artifacts/loop/cards/OPENC.md"; printf -- '---\nid: OPENC\nstatus: todo\n---\n' > "$T/engine/artifacts/loop/cards/OPENC.md"
+    mk "$L/openc/pics/a.png"; mkdir -p "$L/openc/pics/side_bf1/soldiers"   # not: an open card's evidence, branch or none
+    printf -- '---\nid: DONEC\nstatus: done\n---\n' > "$T/engine/artifacts/loop/cards/DONEC.md"; mk "$L/donec/bake/tat1/manifest.ron"   # listed: landed
     mk "$D/models/bf1_hot1_hoth_cannon/manifest.ron"              # not: a single-model export
     ln -s "$T/engine/assets_baked" "$D/link_to_shipped"           # not: find does not follow it
     ln -s "$T/engine/assets_baked" "$D/bake"                      # a literal name, but it resolves into assets_baked
     ln -s "$T/engine/assets_baked/common_bf1" "$D/land/bake_x/common_bf2"   # an overlay's link: --yes drops the LINK only
     got="$(env -u OPENBF_LOOP_DIR -u OPENBF_LEAD_TMP bash "$T/scripts/cleanse_delete.sh" --dry-run | awk -F'\t' 'NF == 2 { sub(".*/lead_tmp/", "", $2); print $2 }' | sort)"
-    want="$(printf '%s\n' deadbr/bake-z deadbr/bake_whatever deadbr/bake_y deadbr/land/bake_x deadbr_target | sort)"
+    want="$(printf '%s\n' deadbr/bake-z deadbr/bake_whatever deadbr/bake_y deadbr/land/bake_x deadbr_target donec/bake | sort)"
     if [ "$got" = "$want" ]; then
       env -u OPENBF_LOOP_DIR -u OPENBF_LEAD_TMP bash "$T/scripts/cleanse_delete.sh" --yes >/dev/null
       if [ -f "$T/engine/assets_baked/common_bf1/common.ron" ] && [ ! -e "$D/land/bake_x" ] && [ -f "$D/sheets/a.png" ] \
@@ -78,6 +81,9 @@ live_names() {  # every branch name and every worktree basename currently alive
 }
 mapfile -t LIVE < <(live_names | sort -u)
 is_live() { local n; for n in "${LIVE[@]}"; do [ "$n" = "$1" ] && return 0; done; return 1; }
+# a card <NAME>.md that is not done: its work has not landed, so its lead_tmp/<name>/ is evidence, not a copy (cleanse 18:
+# lead_tmp/uskn/pics held side_bf1/soldiers beside the 34 pictures card USKN cites, and USKN, a todo card, has no branch)
+card_open() { local c="$ART/loop/cards/${1^^}.md"; [ -f "$c" ] && ! grep -q '^status: *done' "$c"; }
 
 # A scratch bake tree, at ANY depth under a landed branch's lead_tmp/<name>/ (CLN4): a directory holding one of the
 # bake's own output files — common_bf{1,2}/common.ron, <map>/manifest.ron for a map group (tat1, tat2, bf1_kam1 …),
@@ -103,6 +109,7 @@ for d in "$LT"/*/; do
   name="$(basename "$d")"
   case "$name" in tools|s[0-9]*|*_target) continue ;; esac
   is_live "$name" && { echo "keep (live): $d"; continue; }
+  card_open "$name" && { echo "keep (open card): $d"; continue; }
   # the old literal names stay as a fallback, so nothing collected before CLN4 stops being collected
   for sub in baked baked_before bake_before bake_after smoke full_after baked_after ogg_ctl1 ogg_ctl2 before c2_before c2_after goldens_committed nd base spot1 spot2 spot3 spot4 spot5 spot6 bake bake_nopc; do add "$d$sub"; done
   while IFS= read -r t; do add "$t"; done < <(bake_trees "${d%/}")

@@ -169,6 +169,11 @@ impl Sim {
                 crate::commander::plan(self, t);
             }
         }
+        // 1a'. Card TURR: the turret offers (`ai::man`), after the plan and
+        //      before the thinks, so a bot handed one walks to it this tick.
+        if !self.vehicles.is_empty() {
+            crate::ai::man::offer_pass(self);
+        }
 
         // 1b. Controllers → per-unit pads (AI think reads the sim, writes back
         //    its scratch state afterwards).
@@ -194,7 +199,10 @@ impl Sim {
             }
         }
         let mut recycled: Vec<(usize, DeathCause)> = Vec::new();
-        for (i, st, p, nt) in ai_updates {
+        // Card TPOS: positions taken this tick, granted in unit-index order.
+        let mut granted: Vec<glam::Vec3> = Vec::new();
+        for (i, mut st, p, nt) in ai_updates {
+            ai::tactic::grant(&self.positions, self.tick, &mut st, &mut granted);
             self.units[i].ai = st;
             // Card BNDS: a bot off the level with no way back is given up
             // here, in the write-back's fixed order — and (card RCYC) one
@@ -222,6 +230,17 @@ impl Sim {
             self.nav_stats.contacts_max = self.nav_stats.contacts_max.max(nt.contacts);
             self.nav_stats.heard_contacts += u64::from(nt.heard);
             self.nav_stats.line_held += u64::from(nt.line_held);
+            self.nav_stats.tpos_queries += u64::from(nt.tpos_query != 0);
+            self.nav_stats.tpos_ceiling += u64::from(nt.tpos_query == 2);
+            for (b, n) in self.nav_stats.tpos_ev.iter_mut().take(16).enumerate() {
+                *n += u64::from(nt.tpos_ev >> b & 1);
+            }
+            for (n, f) in self.nav_stats.tpos_funnel.iter_mut().zip(nt.tpos_funnel) {
+                *n += u64::from(f);
+            }
+            self.nav_stats.tpos_ev[16] += u64::from(
+                nt.tpos_query == 2 && nt.tpos_ev & crate::ai::tactic::EV_PICK_COVERED == 0,
+            );
             // Card UCALL: the think's combat calls; on BF2 only the
             // tracker's take, BF2's AcquiredTarget line (card UVO2,
             // `FUN_002cde30` B2:255580).
@@ -253,6 +272,9 @@ impl Sim {
                 if let Some(call) = issued.filter(|_| self.units[i].mount.is_none()) {
                     self.events.push(Event::Call { unit, call });
                 }
+            }
+            if let Some(n) = self.nav_stats.man_codes.get_mut(usize::from(nt.man)) {
+                *n += u64::from(nt.man != 0);
             }
             match nt.claim {
                 crate::ai::NavTick::CLAIM_NEW => self.nav_stats.ai_claims += 1,

@@ -12,16 +12,16 @@ module's `//!` header is its spec.
 | crate | owns | depends on (workspace; external) | src lines |
 |---|---|---|--:|
 | `mungefs` | the PS2 LVL (`ucfb`) and ISO9660 readers; the runtime never links it | flate2, thiserror | 15,197 |
-| `bake` | the offline tool: LVL → GLB / KTX2 / OGG / RON in `engine/assets_baked/` | mungefs, manifest; glam, png, serde(_json), ron, anyhow | 19,090 |
-| `manifest` | the bake↔runtime schema, data only | serde | 3,692 |
+| `bake` | the offline tool: LVL → GLB / KTX2 / OGG / RON in `engine/assets_baked/` | mungefs, manifest; glam, png, serde(_json), ron, anyhow | 19,178 |
+| `manifest` | the bake↔runtime schema, data only | serde | 3,701 |
 | `pak` | the game's read-only data: a directory, or the archive appended to the packed game (card PACK) | — | 713 |
-| `core` | the deterministic sim: soldiers, weapons, AI, posts, collision | glam, serde, parry3d, libm | 65,229 |
+| `core` | the deterministic sim: soldiers, weapons, AI, posts, collision | glam, serde, parry3d, libm | 68,890 |
 | `render` | the wgpu renderer, windowed or headless | wgpu, winit, glam, bytemuck, pollster, image, thiserror | 8,555 |
 | `ui` | BF2's HUD (interpreter + layout), egui menus, shell, spawn and loading screens | manifest; egui(-wgpu, -winit), wgpu, winit, glam | 5,599 |
 | `input` | gilrs pad → `PadState` | core; gilrs | 547 |
-| `audio` | kira playback behind the `backend` feature; the streamed music decoder | pak; kira (optional), anyhow | 864 |
+| `audio` | kira playback behind the `backend` feature; the streamed music decoder | pak; kira (optional), anyhow | 866 |
 | `net` | empty home for the locked LAN feature | — | 10 |
-| `game` | the binary + library: assets, viewer, play loop, goldens | core, manifest, pak, input, render, ui, audio; glam, winit, gilrs, ron, serde(_json), gltf, ktx2, wgpu, anyhow; dev: bake, mungefs, image | 46,126 |
+| `game` | the binary + library: assets, viewer, play loop, goldens | core, manifest, pak, input, render, ui, audio; glam, winit, gilrs, ron, serde(_json), gltf, ktx2, wgpu, anyhow; dev: bake, mungefs, image | 46,366 |
 
 Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest`) → `game` → `core`, `render`, `ui`,
 `audio`. 117,987 src lines in 216 `.rs` files; tests and examples add 22,748 lines in 77 files.
@@ -75,8 +75,8 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
 - `mungefs/src/stream.rs` 292 — music/VO streams · `Stream`
 
 ## bake — the `bake` binary (groups: `scripts/rebake.sh`)
-- `bake/src/main.rs` 345 — the CLI, one subcommand per bake (`map`, `common`, `soldier`, `vehicle`, `effects`, `sounds`, …)
-- `bake/src/lib.rs` 62 — module roots · `write_ron`
+- `bake/src/main.rs` 399 — the CLI, one subcommand per bake (`map`, `common`, `soldier`, `vehicle`, `effects`, `sounds`, …)
+- `bake/src/lib.rs` 66 — module roots · `write_ron`
 - `bake/src/map.rs` 2192 — a map LVL → models, textures, terrain, water, collision, nav, `manifest.ron`, its own
   `classes.ron`, its `effects.ron` (plus the TUR sublevels its worlds place, `side_classes`); the common
   bake · `bake_map`, `bake_common`
@@ -98,14 +98,14 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
 - `bake/src/ktx2w.rs` 227 — KTX2 RGBA8 writer, full mip chain · `write_rgba8`
 - `bake/src/lighting.rs` 999 — `sky_` + `lght` → lighting (sun, ambient, BF2's Light2 and `Static()` bits), fog, sky ·
   `lighting_from`, `sky_from`
-- `bake/src/soldier.rs` 1100 — SIDE soldiers, weapons, clips (BF2: the cloths they wear as extra segments, `cloth.rs`); a soldier segment's alpha (the disc's per-segment rule,
+- `bake/src/soldier.rs` 1106 — SIDE soldiers, weapons, clips (BF2: the cloths they wear as extra segments, `cloth.rs`); a soldier segment's alpha (the disc's per-segment rule,
   queue SKA; a pass sheet keeps its gloss alpha, DSHN); a weapon's `skel` nodes beside its GLB (card FXMF: the
   fire point) · `bake_soldier_anims`, `bake_weapon`, `SOLDIER_CLIPS`, `segment_blends`, `weapon_nodes`
 - `bake/src/vehicle.rs` 547 — a SIDE LVL's vehicle classes → `side_<game>/vehicles/<side>/`: every LOD, the destruction
   chunks, `coll` + `prim`, rigid in the skeleton's bind pose (card VBAKE; a model-space body's `BNAM` parts on
   their bones, VBIND), each class's skel nodes, a walker's
   record (WALK) and skin — its top LOD with `JOINTS_0`, `walkers/<model>.glb` (WSKN) · `bake_vehicles`, `VEHICLE_BASES`
-- `bake/src/anim_sets.rs` 352 — the PS2's soldier animation sets resolved from the disc (card ANIMS, re-soldier-anim-layers §2, §6): the clip inventory, what `soldiers/<model>.sets.ron` holds (sets as clip indices, the two bone masks, BF1's record facts, BF2's `sanm` facts), a clip's root speed as the PS2 measures it · `Inventory`, `SoldierSets`, `plan_bf1`, `plan_bf2`, `masks`, `root_speed`
+- `bake/src/anim_sets.rs` 354 — the PS2's soldier animation sets resolved from the disc (card ANIMS, re-soldier-anim-layers §2, §6): the clip inventory, what `soldiers/<model>.sets.ron` holds (sets as clip indices, the two bone masks, BF1's record facts, BF2's `sanm` facts), a clip's root speed as the PS2 measures it · `Inventory`, `SoldierSets`, `plan_bf1`, `plan_bf2`, `masks`, `root_speed`
 - `bake/src/anim_sets/bf1.rs` 231 — BF1's six tables over nine weapon sets and the fallback table (`FUN_0022d828`; 979 slots equal to PS2 memory) · `build`, `Tables`, `FALLBACK`, `weapon_set`
 - `bake/src/anim_sets/bf2.rs` 732 — BF2's (family, weapon class) sets: what the class ODFs register and the loader's two passes along the parent chains (`FUN_00282f78`) · `Registry`, `Registry::register`, `build`, `base_name`
 - `bake/src/walker.rs` 211 — a walker class's anim table (card WALK, re-walker §5: the 11 entries' clips from its
@@ -119,7 +119,7 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
   VTUR: the seats' fire points, turret nodes; card VRIDE: the bind axes a rider hangs by), for the map, common and
   side bakes; a class's skeleton lookup ·
   `attach`, `of`, `wants`, `Skeletons`
-- `bake/src/turret_rig.rs` 419 — an armed building's model as rigid per-node parts (card VTURD, re-turret-draw 1, 2.4,
+- `bake/src/turret_rig.rs` 420 — an armed building's model as rigid per-node parts (card VTURD, re-turret-draw 1, 2.4,
   6.1 `[O]`): a soft segment cut into one GLB primitive per node (a model with a triangle across nodes stays whole),
   and the class's rig - every `skel` node's bind matrix and parent, the node of each drawn primitive · `TurretRigs`
   (`of`, `split`, `attach`)
@@ -143,15 +143,15 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
 - `bake/src/sounds.rs` 784 — a SOUND LVL → WAVs + `sounds.ron` (with its `Music` records, `music`; every record with the sub-level that defines it, card SNDE), `Inherit` templates resolved through the game's CORE.LVL; the engine records resolved per sub-level (`engines`: layers in the layered record's order, graphs joined by layer name) · `bake_sounds`
 - `bake/src/foley.rs` 85 — the LVL's foley tables → `<map>/sounds/foley.ron` (card FOLY; written by `bake sounds`) · `table`, `write`
 - `bake/src/sound_names.rs` 367 — names for hashed sound properties · `build_dictionary`
-- `bake/src/global_sound.rs` 535 — GLOBAL VO, per-map streams · `bake_global_sound`
+- `bake/src/global_sound.rs` 552 — GLOBAL VO, per-map streams · `bake_global_sound`
 - `bake/src/adpcm.rs` 61 — SPU2 ADPCM decode · `decode`
 - `bake/src/ogg.rs` 281 — Vorbis with a reproducible serial · `encode_mono`
 - `bake/src/beep.rs` 111 — the BF1 loading beep · `bake_beep`
-- `bake/src/hud.rs` 338 — BF2's HUD into the common bake: the five layouts, the four fonts, the COMMON/CORE sheets the layouts name (called by `bake_common`), each game's English text table (`bake locl`, card EVMSG), and a CORE.LVL's fonts under a prefix (`bake fonts`: BF1's as `bf1_<font>`, card SQHUD) · `bake_hud`, `bake_fonts`, `bake_locl`
+- `bake/src/hud.rs` 342 — BF2's HUD into the common bake: the five layouts, the four fonts, the COMMON/CORE sheets the layouts name (called by `bake_common`), each game's English text table (`bake locl`, card EVMSG), and a CORE.LVL's fonts under a prefix (`bake fonts`: BF1's as `bf1_<font>`, card SQHUD) · `bake_hud`, `bake_fonts`, `bake_locl`
 - `bake/src/loadscreen.rs` 170 — BF1 loading-screen LVLs (the zoom sequence) and BF2's still pools → KTX2 + RON · `bake_loadscreen`
 
 ## manifest — the schema
-- `manifest/src/lib.rs` 1926 — `manifest.ron` / `common.ron` / `vehicles.ron` / `effects.ron` / `sounds.ron` / `foley.ron` / `load.ron` / `classes/*.ron` records and the `foliage.bin` codec · `Manifest`, `CommonManifest`, `VehicleManifest`, `ManifestWalker`, `ClassDef`, `FxSet`, `SoundsRon`, `FoleyRon`, `LoadScreen`, `foliage_bin`
+- `manifest/src/lib.rs` 1935 — `manifest.ron` / `common.ron` / `vehicles.ron` / `effects.ron` / `sounds.ron` / `foley.ron` / `load.ron` / `classes/*.ron` records and the `foliage.bin` codec · `Manifest`, `CommonManifest`, `VehicleManifest`, `ManifestWalker`, `ClassDef`, `FxSet`, `SoundsRon`, `FoleyRon`, `LoadScreen`, `foliage_bin`
 - `manifest/src/anim_sets.rs` 288 — `soldiers/<model>.sets.ron`: a soldier's animation sets over its GLB's clips, and the two games' slot name tables · `SoldierSets`, `Bf1Sets`, `Bf2Sets`, `bf1::weapon_set`, `bf2::base_name`
 - `manifest/src/hud.rs` 137 — `hud/*.ron`, `fonts/*.ron`, the `locl` text table · `HudIndex`, `HudLayout`, `HudNode`, `HudArg`, `HudFont`, `HudGlyph`, `HudLocl`, `locl_key`
 - `manifest/src/tests.rs` 1341 — the round trip: what the bake writes, the runtime reads
@@ -161,7 +161,7 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
 - `core/src/sim.rs` 138 — the facade: the module header (the tick order), the test fixtures the parts' tests
   share, and a re-export of every item in the eight parts below, so no `crate::sim::X` path names a part (queue SPL5)
   · `Sim`, `PadState`, `InputLog`, `Event`, `buttons`
-- `core/src/sim/state.rs` 1677 — what the sim is and how it is hashed: the `Sim` struct, its counters, cheats and
+- `core/src/sim/state.rs` 1696 — what the sim is and how it is hashed: the `Sim` struct, its counters, cheats and
   per-tick events, the constructors, the queries (a unit by handle, the ground under a point — the foot as a ring of
   rays: over a slit, GRND, and up the top of a short steep bevel, RAIL — the terrain ray),
   `Sim::hash`, the door tick and whether a body is a leaf of a door that is opening (`door_opening`, card MOUTH2) or a point lies in such a leaf's box (`opening_leaf_over`, card DOORS), the grenades on the ground bots are warned of (`Hazard`, card HOLD); the hash tests, the
@@ -174,7 +174,7 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
 - `core/src/sim/spawn.rs` 1949 — who is on the field: a spawn through the reinforcement gate (on the floor of its node and on the level, `spawn_ground`; a post's node inside a solid body on top of it, as the PS2 — the pen test `floor_reach` and `resolve_spawn_seats`, card LLEG), the no-overspawn
   shedding, the class tables and the AI's class weights (default 4 : standard 2 : special 1, card AICLW), the spawn screen's class choice, the respawn at a friendly post, the spawn waves, where a team may spawn (its posts' nodes and its live command
   walkers' six class points, card CWSP) and which of them a bot takes (one post drawn by BF2's `AISpawnWeight`, kept from the end of the respawn delay to the spawn, then one of that post's nodes, card BSPN; a human still draws from the flat node list); the spawn, class, spawn-screen and seat tests · `Sim::spawn`, `Sim::spawn_ai`, `Sim::ai_class`, `Sim::spawn_points`, `Sim::spawn_posts`, `Sim::draw_spawn_post`, `walker_point`, `SpawnWaves`, `Sim::floor_reach`, `Sim::floor_flood` (the same flood stopped at a goal, with the walk's length; card SPNC's census), `Sim::floor_path` (its steps, best-first to a hub's disc within a band of the line: card TGAP's wall test), `PEN_CELLS`, `SEAT_REACH`
-- `core/src/sim/blast.rs` 428 — an explosion's area damage (card VDTH, re-vehicle-death §2-§5): the ≤ 20 gather in the
+- `core/src/sim/blast.rs` 445 — an explosion's area damage (card VDTH, re-vehicle-death §2-§5): the ≤ 20 gather in the
   blast box, LOS past terrain and the world, the falloff on each victim's sphere, TakeDamage with the team rules; a
   destroyed vehicle's class explosion goes through it · `Sim::explode`, `soldier_blast_sphere`, `BLAST_GATHER_MAX`
 - `core/src/sim/bounds.rs` 1501 — the playable level (cards KFLR, BNDS, LVLF: a trench cut into the terrain is on it; `analysis/re-kill-floor.md`): each hub's floor
@@ -187,13 +187,13 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
   kill past the invincibility cheat, as a death region does · `Sim::resolve_nav_floors`, `Sim::level_at`,
   `Sim::rim_drop`, `Sim::return_point`, `Sim::return_path`, `Sim::floor_walk_to` (card RLOOP: the same floor search to one point), `Sim::floor_line`, `ReturnPath`, `Sim::arc_unwalkable`, `Sim::lands_under_the_map`, `Level`, `BOUND_DROP`,
   `RIM_DROP`, `KILL_FLOOR_DROP`
-- `core/src/sim/combat.rs` 819 — a bolt's impact (damage — a soldier's or a vehicle's hull pool, D12's human damage layer, the kill and its ticket) and the
+- `core/src/sim/combat.rs` 826 — a bolt's impact (damage — a soldier's or a vehicle's hull pool, D12's human damage layer, the kill and its ticket) and the
   environmental deaths (a death region, a lethal landing, the kill floor, a landing under the map — which of them
   the invincibility cheat spares: `DeathCause::cheat_spares`); the bolt, cheat, damage and death tests ·
   `Sim::kill_environment`
 - `core/src/sim/round.rs` 358 — the command posts and how the round ends: capture (soldiers on foot only), the bleed, D12's Elite
   handicap, domination, the outcome; the capture, defeat and handicap tests · `Sim::add_cp`
-- `core/src/sim/seats.rs` 697 — enter, drive, exit (card VSEAT, re-vehicles §5, re-hover §5.2): step 1c's use
+- `core/src/sim/seats.rs` 701 — enter, drive, exit (card VSEAT, re-vehicles §5, re-hover §5.2): step 1c's use
   input (the ACTION edge; the aim-cone pick, CanEnter's seat, a player's AI takeover) and the bots' enter / exit
   requests (VAI; a driver out with its stuck window spent marks the vehicle, VMESH; a new pilot's need-gunner call and
   its answers, UTALK), the 9-point exit placement (a
@@ -204,19 +204,22 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
   `Sim::enter_seat`, `Sim::enter_vehicle`, `Sim::exit_vehicle`, `driver_input`
 - `core/src/sim/seats/tests.rs` 352 — enter / refuse / take over / drive / turn / exit / shaping on flat ground with
   the skiff's numbers
-- `core/src/sim/guns.rs` 462 — seat guns (card VTUR, re-vehicles §5/§9): step 1c's seat switch (SWITCH_WEAPON, FUN_0020b5e8),
-  step 4's rider, human or bot (VTAI) — the look, the 512 m camera ray, the aimer, the seat's weapons fired through
+- `core/src/sim/guns.rs` 492 — seat guns (card VTUR, re-vehicles §5/§9): step 1c's seat switch (SWITCH_WEAPON, FUN_0020b5e8),
+  step 4's rider, human or bot (VTAI) — the look, the 512 m camera ray (past a turret's own building), the aimer (a
+  building turret's lays its barrel's line on the point; a bot's takes its own aim point, card TURR), the seat's weapons fired through
   `WeaponState` and `Bolt::spawn`, a bot's shot held to the fairness rule; a seat's live look / eye / barrel for a
   bot's perception and aim; gun states made when anyone rides an armed seat · `Sim::next_seat`, `Sim::switch_pass`,
   `Sim::seat_gun`, `Sim::seat_look`, `SeatLook`
-- `core/src/sim/guns/tests.rs` 392 — switch, fire point, aimer rate and clamp, a side gun's rest, the pilot's
-  locked yaw, the hash with nobody aboard, a gunner's bolt hitting a soldier, a bot gunner firing at what it sees
-- `core/src/sim/step.rs` 2042 — `Sim::step`, one tick in the header's order, and its unit separation; the wall
+- `core/src/sim/guns/tests.rs` 503 — switch, fire point, aimer rate and clamp, a side gun's rest, the pilot's
+  locked yaw, the hash with nobody aboard, a gunner's bolt hitting a soldier, a bot gunner firing at what it sees;
+  Mygeeto's recoilless turret: the camera ray past its own building, the barrel's line on the point, the muzzle at
+  its fire point (card TURR)
+- `core/src/sim/step.rs` 2064 — `Sim::step`, one tick in the header's order, and its unit separation; the wall
   pass's velocity slide (card JWAL); a human's shot from the fire point at what the aim ray hits (card AIMA:
   `Sim::aim_hit`, `AIM_RAY_START` / `AIM_RAY_LENGTH`); the soldier's zoom routine - the press, its cancels, the
   divided turn rates (card ZOOM: `Sim::tick_zoom`); the movement, zoom, wall-pass, ledge, stamina-cheat, AI-fire and
   aim-ray tests · `Sim::step`
-- `core/src/sim/vehicles.rs` 1611 — the vehicle slots: spawn with slot reuse, the handle queries, the live team
+- `core/src/sim/vehicles.rs` 1739 — the vehicle slots: spawn with slot reuse, the handle queries, the live team
   (§7.1: the last entrant's in any seat, neutral when emptied), the two occupancy writers that keep `Seat.occupant`
   and `Unit.mount` in step, removal; the hull pool's damage (bolts through VehicleScale, collision damage) and
   death (the event, the riders, no wreck); tick stage 7, the spawn pads (§7: follow the post, spawn, the idle
@@ -235,7 +238,7 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
   stance, the ideal chase camera, a human's aim ray and the fire point (card AIMA, re-aim-assist §10); a human's zoom:
   the ZOOM camera sections and the scope view's eye and aim (card ZOOM, re-zoom §5) · `Unit`, `Zoom`,
   `UnitSpec`, `UnitHandle`, `AIM_BOX_MIN`/`MAX`, `CameraSection`, `camera_section`, `IdealCamera`, `SPAWN_PITCH`; BF2's aim-error block every unit carries about itself as a target and the direction its own error points (card CLSE2: `AimBlock` - decay, budget, growth by change of velocity, the tumbling direction; its tests)
-- `core/src/vehicle.rs` 482 — the second entity kind (re-vehicles §5-§8): the seat ring, one hull pool (the
+- `core/src/vehicle.rs` 498 — the second entity kind (re-vehicles §5-§8): the seat ring, one hull pool (the
   class's HealthType), the kind, the live and home teams, the hull-contact damage formula, a class's seat setup
   (VSEAT; its AISizeType route table, VAI; its seats' guns, VTUR), the seats' gun states · `Vehicle`, `VehicleSpec`, `SeatSetup`, `VehicleHandle`, `Seat`, `SeatKind`, `Mount`, `is_ring`, `impact_damage`, `collision_desc`
 - `core/src/vehicle/hover.rs` 819 — the hover integrator (cards HOVR, HCON, HOVX, HHUL, HSTEP; re-hover §4/§6/§7/§13): BF2's drive (spring
@@ -254,7 +257,7 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
 - `core/src/vehicle/walker/tests.rs` 409 — §14.6's AT-ST numbers on a flat ground: 5.0 m/s at full stick, the
   ×0.5 floor, 10 m/s boosting for 4 s then 2.2 s to recover, ≤ 1.0 / 0.6 rad/s, the turn-step thresholds, the
   one-pair lift, the 29.4 fall, the stride and reverse sequences
-- `core/src/vehicle/gun.rs` 622 — a seat's guns (card VTUR, re-vehicles §5/§9): the aimer (PS2 defaults, rate-limited,
+- `core/src/vehicle/gun.rs` 636 — a seat's guns (card VTUR, re-vehicles §5/§9): the aimer (PS2 defaults, rate-limited,
   clamped), the weapons, fire point, pivot and eye, the barrel's bind heading, the model-frame angles; the run-time
   state · `Aimer`, `GunSetup`, `GunWeapon`, `GunState`, `AIM_RAY`, `dir`, `angles`, `turned`
 - `core/src/vehicle/hover/tests.rs` 989 — each equation against re-hover §9's hand numbers; the skiff settling (its bob band in the HSTEP order),
@@ -300,18 +303,19 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
   contact bug), the step and ground constants, the parry conversions the parts share, the test fixtures their
   tests share, and a re-export of every item in the four parts below, so no `crate::collision::X` path names a
   part (queue SPL3) · `STEP_HEIGHT`, `WALKABLE_MIN_NY`, `TERRAIN_BURY`, `NO_GROUND`
-- `core/src/collision/shape.rs` 1070 — the soldier capsule, the AABB, a body's shape (its ray cast: a cylinder in closed form, `ray_cylinder`, card OBST2 — held to parry's cast and, card OBSV, to an oracle that knows only the inside test: misses, grazes, starts inside, short rays), a body's extent on the ground in a given frame (`Body::ground_extent`, the vehicle footprints of `core/src/ai/avoid.rs`) and the mesh builder, the layer
+- `core/src/collision/shape.rs` 1076 — the soldier capsule, the AABB, a body's shape (its ray cast: a cylinder in closed form, `ray_cylinder`, card OBST2 — held to parry's cast and, card OBSV, to an oracle that knows only the inside test: misses, grazes, starts inside, short rays), a body's extent on the ground in a given frame (`Body::ground_extent`, the vehicle footprints of `core/src/ai/avoid.rs`) and the mesh builder, the layer
   mask, bodies (a hull's with its vehicle as `owner`), a vehicle class's hull part, terrain cutters; the layer-mask
   tests · `Capsule`, `Aabb`, `Shape`, `trimesh`, `Layers`, `Body`, `HullPart`
-- `core/src/collision/world.rs` 886 — the baked world and its broad phase, an XZ grid of body indices built once
+- `core/src/collision/world.rs` 887 — the baked world and its broad phase, an XZ grid of body indices built once
   that offers each query its candidates in index order; its movers (DR2's doors), filed under an envelope; the live
   vehicles' hulls (VHULL), visited after the map's bodies, and who skips whose (`HullFilter`) ·
   `CollisionWorld`, `BodyGrid`, `CollisionWorld::move_body`, `CollisionWorld::set_hull`, `HullFilter`
-- `core/src/collision/rays.rs` 1033 — the cutter test, the ground ray, the world ray bolts and LOS take, the marched
+- `core/src/collision/rays.rs` 1053 — the cutter test, the ground ray, the world ray bolts and LOS take, the marched
   terrain ray, BF2's own terrain segment test (card GRNP, re-grenades §13.2 `[O]`: the first bisection midpoint within
   0.1 m of the ground, not the crossing — the grenade's sweep takes it), the lead solve · `is_cut_by`,
   `CollisionWorld::ray_down`, `CollisionWorld::ray`, `CollisionWorld::ray_with` (a `HullFilter`, the hull's owner in
-  `RayHit`), `ray_heightfield`, `ray_terrain_ps2` · card VMESH: `CollisionWorld::enclosing` (the mesh body a point is shut in, by crossing parity: 2 of 3 rays up and 7 of 8 sideways odd)
+  `RayHit`), `CollisionWorld::ray_past` (past the map bodies of up to two instances: a turret's own building, card
+  TURR), `ray_heightfield`, `ray_terrain_ps2` · card VMESH: `CollisionWorld::enclosing` (the mesh body a point is shut in, by crossing parity: 2 of 3 rays up and 7 of 8 sideways odd)
 - `core/src/collision/walls.rs` 2316 — the wall pass (and `wall_sweep_small`: the sweep against only the small bodies, what the AI's look-ahead asks, card OBST2): the push-out (a body's wall contact first, a ceiling's horizontal part: card WTUN), the soldier's LEDGE rule (card JWAL,
   `analysis/re-soldier-walls.md`; a riser below the step inside the capsule's footprint is a kerb, `top_in_disc`, card SKIRT), its sub-steps along the move and no push through a face (card WPSH), the sweep
   (Phases A.2–A.4), the parry contact workaround, a hover hull box's or cylinder's contacts (`shape_contacts`, HHUL) · `CollisionWorld::push_out`, `CollisionWorld::push_out_soldier` (and `_hulls`, the AI's hull probe, card STFAL),
@@ -330,10 +334,10 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
 - `core/src/nav.rs` 1500 — the planning graph: the PS2's locate (`locate`: BF1 hub sphere, BF2 disc, 3-D corridors, the nearest arc; card LOC3) and the port's XZ unit locate (`locate_unit_on`, deviation D17), the PS2 router, the corner walk round barriers (`detour`: the PS2's lazy search - the silhouette corners of the barriers a segment actually crosses, card OBST2), the mission's barrier switches (`set_barriers`) · `NavGraph`
 - `core/src/nav/tests.rs` 811 — the planning graph's tests: both locates, the chooser, the BFS, jet arcs, the route table's bytes, barriers, the corner walk (a crowded band, a ring of rails, a shut end, the silhouette pair; card OBST2)
 - `core/src/route_patch.rs` 289 — BF2 `plnp` route patches: Block/UnblockPlanningGraphArcs on the route table · `RoutePatches`
-- `core/src/ai.rs` 930 — the facade: the module header (Phases A–A.4, and which steering is ours), every AI tuning
+- `core/src/ai.rs` 949 — the facade: the module header (Phases A–A.4, and which steering is ours), every AI tuning
   constant, kept together (PROVISIONAL; VAI's `BOARD_*` / `DRIVE_*`, VTAI's `GUNNER_WAIT`), the test fixtures the parts' tests share, and a
   re-export of every item in the parts below, so no `crate::ai::X` path names a part (queue SPL4) · `HOLD_RANGE`, `THINK_PERIOD`, `PROBE_DIST`
-- `core/src/ai/state.rs` 1521 — what a bot carries between ticks (the fields grouped by the layer that owns them, card SPL11), and its hash: the route leg, the steering's last
+- `core/src/ai/state.rs` 1689 — what a bot carries between ticks (the fields grouped by the layer that owns them, card SPL11), and its hash: the route leg, the steering's last
   pick, the per-think diagnostics, its trigger on a single-shot weapon (STTAP), its vehicle business (VAI), its way back to the level (BNDS), the position it holds
   (HOLD), the no-net-progress watch (RCYC), the mover's books and the walk's outcome and the behaviour's name (MOVR: `MoverState`, `Walk`, `Behaviour`), what its position is in a fight (FGHT: `FightState` — stand, walk to a ring point, pause; REACT: on its way to the position a hit sent it to, and the tick its roll is pressed, `HoldState::roll_at`); the AI-hash test · `AiState`, `FightState`, `Route`, `NavTick`, `SteerPick`,
   `RouteSource`, `RideState`, `LostState`, `HoldState`, `StallState`
@@ -354,22 +358,34 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
 - `core/src/ai/avoid.rs` 1272 — the AVOIDANCE of a bot on foot (card OBST, `analysis/bot-design.md` 4.7; ours, PROVISIONAL): the heading the mover walks on its pick tick — one side per obstacle kept as a commitment (`AiState::slide` + `MoverState::round`; a rim barrier is marked `Round::rim` and gets no allowance from the progress window, card OBSR), an inside corner turned along the next wall on the same hand, the leave rule (the obstacle is left only when the free straight way ends nearer the aim point than the walk has been; until then along it and round its end, on its own level), a small body passed by the tangent of its disc before it is touched (`SteerPick::Round`), a STANDING vehicle passed by its footprint (card OBSV: the rectangle about the hull parts at a soldier's height, turned at its corner on one side chosen once, `Round::foot`; a walk point a vehicle is parked on is reached at its side, `at_foot_of`); the tests of going round (a block, a crate, a turret, a hull, a 20 m and a 40 m wall, one box at 252 yaws and offsets as a map body and as a parked hull, the side kept, a moving / boarded / overhead hull, a bot beside a hull, a waypoint and a detour corner under a vehicle, a yard, the level, the rim mark) · `pick`, `clear`, `footprint`, `foot_ahead`, `at_foot_of`, `ROUND_MAX`, `ROUND_TRAVEL`, `LEAVE_LOOK`, `LOOK_DIST`, `SMALL_BODY`, `CLIMB_MAX`, `FOOT_LOOK`, `FOOT_STILL`, `FOOT_CLEAR`
 - `core/src/ai/steer.rs` 1437 — the steering's PROBES (card OBST: the heading picked from them is `avoid.rs`'s): the wall sweep ahead (and the hull probe), a leaf of a door that is opening as no wall (`StopKind::Door`, card MOUTH2: the bot walks on at it) and as no steep floor (card DOORS: the diagonal edge of BF2 Death Star's blast door under the steep-floor probe), a `BARR` barrier at an edge of the level as a wall (`barrier_ahead`, card BNDS), the floor probe (card STFAL), the steep-floor probe (`steep_ahead`, card STHOP; a band the soldier's run carries him over is no wall, `short_band`, card SKIRT), the ramp test (`ramp_clear`, card OFFG: the level sweep asked again along the floor up a ramp);
   the walking tests (the slide, the stuck side-step, the pad's frame); which test shuts the way ahead, as a diagnostic the sim never calls (`way_ahead`, card BLKB) · `rotate_xz`, `way_ahead`, `Stop`, `StopKind`
-- `core/src/ai/tactic.rs` 436 — card TPOS, `analysis/bot-design.md` 4.1: the POSITION TABLE built once when the posts are in (`Sim::build_positions`, DERIVED, not hashed): Cover / Snipe hints, 8 points outside each soldier barrier, each hub's centre + 8 ring points, kept when standable; per position its floor, source, a hint's facing and stances, its hub, LOW and CORNER cover over 16 directions; an 8 m grid index (`within`) · `PositionTable`, `Position`, `Source`, `sector_bit`, `build`
-- `core/src/ai/behave.rs` 2588 — what a bot on foot is DOING (card SPL11, `analysis/bot-design.md` 3): `think`, one priority chain a tick — perceive and retarget on the think period, then what walks the bot (the return to the level, the run from a grenade, the held position, a fighter's ring point, the vehicle it boards, the leg) and what it looks at — which hands exactly one `AimRequest` to the gunner and one `MoveRequest` to the mover and writes no stick itself; a seated bot's tick goes to `ride`. Until their cards replace them: the position a bot holds and fights from (card
-  HOLD: the spot, the dwell, the shuffle, the strafe on a burst, the step out of a friend's line, the close hold), the on-hit dodge, the run from a grenade, the return walk of a bot off the level along its floor walk (card RETW) and its jump at a low wall (card BNDS); a failed walk's ladder (card MOVR: `recover` — the post given up for the commander to draw another); the FIGHT (card FGHT, re-soldier-ai 4.4-4.5: a seen target inside the weapon's `MaxRange` + 10 m, not a rider, is fought from a position of the bot's fixed style — `fight_position`: it stands to shoot on a spot 4 m clear of the other fighters, `stand_spot`, or circles: a walk over the graph to a point of the ring round its target, `ring_point` / `ring_walk`, a 1.9 s pause, the next; `style`); the HIT (card REACT, ours: a bot on a position that is hit draws once per burst over its tier's row — stays, strafes 2.5 m, rolls aside once it is under way, or moves to a ring point round the target it sees / a spot within 7 m — `react`; no step of a holder goes through a death region, `react_ok`, and a roll or a move ends in a hub of the graph, `in_hub`); the position, fight, reaction, grenade, lost-bot and dodge tests · `think`, `Tick`, `lost_jump`
+- `core/src/ai/tactic.rs` 1358 — card TPOS, `analysis/bot-design.md` 4.1 / 4.6: the POSITION TABLE built once when the posts are in (`Sim::build_positions`, DERIVED, not hashed; card TPOSA): Cover / Snipe hints, 8 points outside each soldier barrier, each hub's centre + 8 ring points, kept when standable; per position its floor, source, a hint's facing and stances, its hub, LOW and CORNER cover over 16 directions; an 8 m grid index (`within`). The TACTICIAN (`fight`, `choose`): a fighter's position - candidates (the 32 nearest with cover from the target in the band, within `COVER_REACH` 15 m, and the 32 nearest within 8 m), yes / no filters, three tries (cover = crouch-shut toward the target + the confirming ray), teammates a blast apart where the place allows (`SPREAD`), the score; kept while its conditions hold (re-scored every `RESCORE`, the PS2's 5 s; an open one asks for cover every 2 s; the 5-12 s timer from cover takes only cover; the mover's arrival counts only near the position, `walk_arrived`); the hide / fire cycle and the next position after 5-12 s; two hits leave it (`hit`); a walk there ends near it (`cut_short`: within 1.5 m it is there where the bot stopped, else failed, the last four failures remembered), a new position is 3 m from the one left, a Cover hint hides by its arrow (the PS2's rule, `Position::hides_toward`) and one at a barrier's edge is moved out of it; reservations granted in the write-back (`grant`); B12 (`covered_from_target`); the fight-time split's events (`EV_*` on `NavTick::tpos_ev`, the funnel `NavTick::tpos_funnel`; the sweep's `fightsplit` / `tactician` / `tfunnel` lines) · `PositionTable`, `Position`, `Source`, `sector_bit`, `sector_pair`, `build`, `fight`, `grant`
+- `core/src/ai/tactic/tests.rs` 774 — the table's and the Tactician's tests: the crate's cover taken and cycled, spacing, the endgame, two hits, no winner, a move not a twitch, a walk cut short / past its deadline / gaining nothing for 1 s, a position behind a barrier, a hint's arrow, a covered candidate past 40 nearer open points, the 15 m reach, the 5 s re-score, an open position giving way to cover, the drop test, a hint pushed out of a barrier's margin, a walk ended short of the position held, the timer from cover taking only cover
+- `core/src/ai/behave.rs` 2430 — what a bot on foot is DOING (card SPL11, `analysis/bot-design.md` 3): `think`, one priority chain a tick — perceive and retarget on the think period, then what walks the bot (the return to the level, the run from a grenade, the held position, a fighter's ring point, the vehicle it boards, the leg) and what it looks at — which hands exactly one `AimRequest` to the gunner and one `MoveRequest` to the mover and writes no stick itself; a seated bot's tick goes to `ride`. Until their cards replace them: the position a bot holds and fights from (card
+  HOLD: the spot, the step out of a friend's line, the close hold; its hold at a hub, the dwell, the shuffle and the strafe on a burst went with card TPOS), the on-hit dodge, the run from a grenade, the return walk of a bot off the level along its floor walk (card RETW) and its jump at a low wall (card BNDS); a failed walk's ladder (card MOVR: `recover` — the post given up for the commander to draw another); the FIGHT (card FGHT, re-soldier-ai 4.4-4.5: a seen target inside the weapon's `MaxRange` + 10 m, not a rider, is fought from a position of the bot's fixed style — `fight_position`: it stands to shoot on a spot 4 m clear of the other fighters, `stand_spot`, or circles: a walk over the graph to a point of the ring round its target, `ring_point` / `ring_walk`, a 1.9 s pause, the next; `style`); the HIT (card REACT, ours: a bot on a position that is hit draws once per burst over its tier's row — stays, strafes 2.5 m, rolls aside once it is under way, or moves to a ring point round the target it sees / a spot within 7 m — `react`; no step of a holder goes through a death region, `react_ok`, and a roll or a move ends in a hub of the graph, `in_hub`); the position, fight, reaction, grenade, lost-bot and dodge tests · `think`, `Tick`, `lost_jump`
 - `core/src/ai/arsenal.rs` 746 — the weapon a bot on foot fights with, and its grenade (card GRAI, `analysis/re-grenades.md` 7): the PS2's choice over every slot once a think (ammunition, the AI's target-kind mask, the range band, plenty of ammunition, the score — PROVISIONAL), the grenade test (a 3 s window in 30 per bot, a target in a group of its own side, BF2's difficulty roll), the explosive claim (one thrower per target and team), what the pick means for the pad, the low-arc ballistic aim of a throw; a target that rides is its VEHICLE to the choice (card HVYW, `analysis/re-soldier-ai.md` 22: the hull's kind against the mask, the PS2's "too weak" rule with its exemption by ordnance - the launcher for a tank, no rifle at one), and OURS: a heavy weapon (the launchers, the wrist rocket) at a soldier only in a crowd of three, a bot holding one prefers the vehicle as its target, a vehicle nothing it holds is for is spared only past 10 m, the standing fight is for a weapon with the hull in its band (a grenade is thrown in passing) · `think`, `choose`, `score`, `against_vehicle`, `is_crowd`, `vehicle_bonus`, `grenade_forced`, `in_window`, `is_group`, `armed`, `Armed`, `lob`, `lob_aim`, `LOB_PITCH`; card SNPR's `sidearm` (a sniper's pistol inside the rifle's MinRange or for a target within 25 m and coming on, kept to its reach)
-- `core/src/ai/arsenal/tests.rs` 1651 — the solver, the window, the group test, BF2's roll, the mask, the choice's preferences, a bot's throws in its window landing by the target; card HVYW's: the too-weak rule per game and ordnance, the choice for a vehicle, a heavy weapon's crowd, and five scenes (a rocket at a tank in range and line, at a 4-man group and not at a lone soldier, none with a friend walking into its line, no rifle at a walker, who takes which target), the rifle at a vehicle within 10 m, no fight position for a launcher out of its band or a grenade, no standing for a throw at a vehicle that cannot be made, the stand for a throw at soldiers from the tick the grenade is picked
+- `core/src/ai/arsenal/tests.rs` 1664 — the solver, the window, the group test, BF2's roll, the mask, the choice's preferences, a bot's throws in its window landing by the target; card HVYW's: the too-weak rule per game and ordnance, the choice for a vehicle, a heavy weapon's crowd, and five scenes (a rocket at a tank in range and line, at a 4-man group and not at a lone soldier, none with a friend walking into its line, no rifle at a walker, who takes which target), the rifle at a vehicle within 10 m, no fight position for a launcher out of its band or a grenade, no standing for a throw at a vehicle that cannot be made, the stand for a throw at soldiers from the tick the grenade is picked
 - `core/src/ai/snipe.rs` 338 — card SNPR (OURS, the maintainer's sniper with a purpose): a bot with a scoped rifle picks the Snipe hint (else a high hub) within 60 m its route reaches with the best lane onto enemy ground (enemy posts and their hubs in sight from 15 m to its sight, weighted by distance), one sniper a spot, walks there, holds it (behaviour Overwatch, a reason to stand) while an enemy has been seen in the last 20 s, then picks again with that spot excluded · `is_sniper`, `pick`, `lane`, `upkeep`, `holds`, `arrive`, `walk_failed`, `SNIPE_REACH`, `SNIPE_QUIET`, `SNIPE_SPACING`
 - `core/src/ai/snipe/tests.rs` 341 — the long-lane hint over a nearer short-lane one, two snipers on one tick take two spots, the spot left after 20 quiet seconds and kept while an enemy is in sight, the pistol at 15 / 22 m and the rifle past its reach, a perch 2.5 m over the floor given up from under it
-- `core/src/ai/gunner_foot.rs` 1758 — the gunner of a bot on foot, the ONLY writer of its look sticks and FIRE (card SPL11): the aim point at a seen enemy - BF1's lead point offset by the shooter's tracked error (`track_error`; PROVISIONAL: the PS2's BF1 has none, card CLSE2B), BF2's offset by the TARGET's own error block (`unit::AimBlock`) through `radius` (size, stance, speed, cap) along the shooter's tumbling direction (card CLSE2) - BF2's scaling of the error vector by target, range and the weapon class's AIBubble keys (cards CLSE, CLSE2: `error_vector`), the aim tracker and the slew, the bursts and pauses by the weapon class's Barrage keys under each game's own rule and the trigger's `MaxRange` test (card CLSE4), the charge, the tap of a single-shot weapon (card STTAP: `tap`), no shot with a friend in the line of fire (card FFLN: `friend_in_line`; card HVYW: a missile's line is wider by what the shooter and the friend walk in its wind-up and flight), the AI sniper table's spread; the aim and fire tests · `run`, `AimRequest`, `GunReport`, `yaw_toward`, `seen_aim`, `fire_discipline`, `track_error`, `radius`, `stance_factor`, `range_table`
+- `core/src/ai/gunner_foot.rs` 1757 — the gunner of a bot on foot, the ONLY writer of its look sticks and FIRE (card SPL11): the aim point at a seen enemy - BF1's lead point offset by the shooter's tracked error (`track_error`; PROVISIONAL: the PS2's BF1 has none, card CLSE2B), BF2's offset by the TARGET's own error block (`unit::AimBlock`) through `radius` (size, stance, speed, cap) along the shooter's tumbling direction (card CLSE2) - BF2's scaling of the error vector by target, range and the weapon class's AIBubble keys (cards CLSE, CLSE2: `error_vector`), the aim tracker and the slew, the bursts and pauses by the weapon class's Barrage keys under each game's own rule and the trigger's `MaxRange` test (card CLSE4), the charge, the tap of a single-shot weapon (card STTAP: `tap`), no shot with a friend in the line of fire (card FFLN: `friend_in_line`; card HVYW: a missile's line is wider by what the shooter and the friend walk in its wind-up and flight), the AI sniper table's spread; the aim and fire tests · `run`, `AimRequest`, `GunReport`, `yaw_toward`, `seen_aim`, `fire_discipline`, `track_error`, `radius`, `stance_factor`, `range_table`
 - `core/src/ai/gunner_foot/tests/radius_rows.rs` 89 — 80 rows of PS2 RAM (BF2 Kamino, units at rest: size term, stance word, error, visibility, cap, radius) that `gunner_foot::radius` must reproduce (card CLSE2)
 - `core/src/ai/mover.rs` 1197 — the mover of a bot on foot, the ONLY writer of its move sticks, ROLL_STANCE and JUMP (card SPL11): the commitment to a destination and the arrived latch (card MOVR: a bot that arrives stands, a request that barely moves is ignored), arrival at a post or a defence spot on the spot's own floor (card STEND:
   `off_floor`, `SPOT_FLOOR_TOL`), the walk block (the side-step offset, the steering's heading picked every third tick and held, the short step to a held position, the last step's scale, a lost bot's jump), the routeless dodge's strafe, the stance controller, the roll; then the progress books — the side-step countdown and the stuck window (a window with no progress is a failed walk), a lost bot's return window, the last resort's watch (`stall`); it answers the walk's outcome; the arrival, deadband, blocked-walk, think-phase, short step and hold range tests · `run`, `MoveRequest`, `Moved`, `stuck_window`
-- `core/src/ai/ride.rs` 698 — a bot and a vehicle (card VAI): the boarding claim (the pilot seat of a hover or a
+- `core/src/ai/ride.rs` 728 — a bot and a vehicle (card VAI): the boarding claim (the pilot seat of a hover or a
   walker, or a teammate's armed gunner seat, VTAI) and the walk to it (WAI2: over the graph, a claim lost to another
   bot, a command walker claimed whatever the trip), the seated bot's dispatch (a gunner, a walker's or a hover's
-  pilot), the wait for a gunner, the drop hub (WAI); the board-drive-dismount and gunner-claim tests
+  pilot; a building turret's gunner is `man`'s, card TURR), the wait for a gunner, the drop hub (WAI); the
+  board-drive-dismount and gunner-claim tests
   · `claim`, `claim_seat`, `board_goal`, `board_point`, `command`, `drive`, `board_reach`, `at_drop`
+- `core/src/ai/man.rs` 563 — a bot in a building turret (card TURR, `analysis/bot-design.md` 6.1, D11; ours): the
+  purpose test (attack: an enemy the team knows of in an arc, in reach, the muzzle's line clear; defence: a turret by
+  a front-line post with a known enemy near it), the offer pass (the nearest free bot within the PS2's 50 m, one a
+  turret, two a post, none in the endgame), the five exits and the turret closed after leaving or an unreached walk
+  · `offer_pass`, `purpose`, `hittable`, `defends`, `front_line`, `known`, `arc_holds`, `arc_of`, `exit_rule`, `endgame`,
+  `seated`, `is_turret`, `seat_gun`
+- `core/src/ai/man/tests.rs` 857 — the offer's two clauses with their controls, the post's cap, the nearest bot,
+  each exit, the turret closed after leaving and after an unreached walk, the turn to what the team knows, a turret
+  boarder walking past a near enemy; the gunner's aim (TAIM, merged): Mygeeto's recoilless turret hitting a soldier
+  40 m out, the target inside the arc, the sight past its own building, a turret on a tower hitting a soldier below
 - `core/src/ai/hover_drive.rs` 520 — a bot at a hover's pilot seat (card VDROP, re-hover-ai.md): the PS2's stick law
   (the throttle / strafe pair or cos(error), the squared turn, the fade inside ForwardSpeed / 2, the obstacle probe's
   shifted goal and halved throttle, the unstick manoeuvre with BF1's 4 s / BF2's 15 s cooldown, BF2's slow-turn
@@ -388,21 +404,24 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
   BF1-disc class and spider on flat ground (convergence, 5.0 m/s, the spider's 5° crab; a BF1-map spider, e0c 0,
   under 2°, card WALKB1); the ride to the post
 - `core/src/ai/walker_drive/tests/ps2_rows.rs` 155 — the 145 rows (numbers read from PS2 RAM, the RE session's ps2_rows.csv) · `ROWS`
-- `core/src/ai/gunner.rs` 184 — a seated bot's seat gun (card VTAI): the look stick toward its SEEN target (D10's
-  aim point; a walker pilot's at the walker's own rates, WAI), FIRE under on foot's reaction / range / burst gates
-  and a barrel cone · `aim`, `Look`
+- `core/src/ai/gunner.rs` 200 — a seated bot's seat gun (card VTAI): the look stick toward its SEEN target (D10's
+  aim point; a walker pilot's at the walker's own rates, WAI; a turret gunner with nothing seen at its idle point,
+  TURR), FIRE under on foot's reaction / range / burst gates and a barrel cone; the point it returns is a building
+  turret's aimer's (`ManState::aim`, the PS2's AI seat) · `aim`, `Look`
 - `core/src/commander.rs` 2509 — each AI unit's kept target post: the PS2's Conquest goal (the draw by post value, the
   re-draw triggers per game; `analysis/re-conquest-goal.md`), defend hints, the cap of defenders a post and one defender a hint (card DEFS, ours) ·
   `TeamPlan`, `plan`, `draw_post`, `defend_cap`, `post_threatened`
-- `core/src/perception.rs` 899 — contacts, view cone, LOS, target choice · `scan`, `choose_target`
-- `core/src/skill.rs` 586 — difficulty tiers (the per-tier liveliness of a holding bot among them, card HOLD; what a bot on a position does when it is hit, card REACT: `Tier::react`), the skill vector · `Difficulty`, `Skill`, `Tier`
-- `core/src/squad.rs` 1057 — BF1's four squad orders on bots (card SQACK, `analysis/re-squad-orders.md`): the press marks the units in reach, each takes it at its next think and answers; follow (two per leader), hold, the release · `Order`, `Pending`, `Command`, `steer`
+- `core/src/perception.rs` 977 — contacts, view cone, LOS, target choice (a building turret's gunner sees from its
+  muzzle and past its own building, and chooses inside its arc: card TURR) · `scan`, `choose_target`,
+  `choose_target_with`, `los_seat`, `past_buildings`
+- `core/src/skill.rs` 575 — difficulty tiers (how quickly a bot runs from a grenade, card HOLD; what a bot on a position does when it is hit, card REACT: `Tier::react`), the skill vector · `Difficulty`, `Skill`, `Tier`
+- `core/src/squad.rs` 1060 — BF1's four squad orders on bots (card SQACK, `analysis/re-squad-orders.md`): the press marks the units in reach, each takes it at its next think and answers; follow (two per leader), hold, the release · `Order`, `Pending`, `Command`, `steer`
 
 ## game — the binary and its library
-- `game/src/main.rs` 506 — the binary's CLI: its `//!` header lists every flag and `OPENBF_*` variable (bar two test hooks), `main`
+- `game/src/main.rs` 525 — the binary's CLI: its `//!` header lists every flag and `OPENBF_*` variable (bar two test hooks), `main`
   parses them, and `ViewerArgs` and `BattleSetup` carry them to the modes in the three parts below (queue SPL2; the
   binary's root owns `game/src/`, the library's directory, so the parts load by `#[path]`)
-- `game/src/main/battle.rs` 556 — the battle every mode builds and shows: the map load and upload, the teams, the
+- `game/src/main/battle.rs` 553 — the battle every mode builds and shows: the map load and upload, the teams, the
   `WalkSim` setup (the pads' class models kept for the viewer), the marker/target/bolt/post boxes, the squad icons, the HUD and spawn-screen models ·
   `make_walk`, `walk_draws`, `hud_model`
 - `game/src/main/headless.rs` 793 — the offscreen modes: `--bench`, and `--headless` (a captured frame, a
@@ -412,7 +431,7 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
   profile autosave, the dev-mode black box's hooks (F9, quit, the stuck alarm), the battle's audio out (event sounds,
   engine loops, foley, music takes: `play_event_sounds`, `start_take`) · `run_windowed`, `run_shell`
 - `game/src/lib.rs` 42 — module roots
-- `game/src/assets.rs` 1647 — a baked map dir → CPU scene; the texture tier; a geometry's collision bodies and
+- `game/src/assets.rs` 1655 — a baked map dir → CPU scene; the texture tier; a geometry's collision bodies and
   their subsets (the map's world, a vehicle class's hull, VHULL) · `load_scene`, `Scene`, `TextureTier`,
   `mode_layer_index`, `body_layers`, `hull_parts`
 - `game/src/viewer.rs` 55 — the facade: the XFRM transform convention, and a re-export of every item in the
@@ -438,7 +457,7 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
 - `game/src/viewer/pickups.rs` 135 — the items on the field drawn (card PWUP, re-powerups §4): each `Sim::pickups`
   entry as its class's model from `common_<game>/models/`, upright at the item, uploaded on first use; BF1 hides it
   for its last 2 s; drawn through `VehicleVisuals::draws` so every draw site has it · `PickupVisuals`, `item_drawn`
-- `game/src/viewer/vehicles.rs` 509 — the battle's vehicles drawn (card VDRAW): each class's LOD0 found in the map's
+- `game/src/viewer/vehicles.rs` 507 — the battle's vehicles drawn (card VDRAW): each class's LOD0 found in the map's
   bake, then every side's vehicle bake, its textures across them all; every live `Sim::vehicles` entry drawn rigid at its
   sim transform through the world path — a walker with a baked skin posed, CPU-skinned into per-walker dynamic
   meshes (WSKN) · `VehicleVisuals`, `VehicleSides`, `find_model`, `find_texture`
@@ -456,18 +475,18 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
   now for a rider (card VRIDE) · `WalkerRig`, `node_now`, `skin`
 - `game/src/viewer/camera.rs` 199 — the golden pose, a pose as a camera, the XFRM instance transform, the
   auto-framing · `GOLDEN_CAM`, `instance_matrix`, `overview_bounds`, `look_at`
-- `game/src/walk.rs` 1567 — play mode: the player in `core::Sim` (its handle follows the slot through a respawn), the chase camera (the PS2's ideal camera, tilted below the aim, AIMA)
+- `game/src/walk.rs` 1596 — play mode: the player in `core::Sim` (its handle follows the slot through a respawn), the chase camera (the PS2's ideal camera, tilted below the aim, AIMA)
   and the reticle's place on screen, the zoom's projection (S and the FOV eased as the PS2's, card ZOOM), a rider's seat camera (VSEAT, PROVISIONAL; turned by a gun seat's look,
   VTUR; a building turret's zoomed view at the eye point with the class's `FirstPersonFOV`, card VTURZ) · `WalkSim`,
   `vehicle_camera`, `turret_scope_camera`, `ps2_reticle_y`
 - `game/src/ride.rs` 134 — a scripted ride (VSEAT): walk to the nearest boardable vehicle, enter, drive 200 m,
   exit, recorded as an `InputLog` (`--ride-script`) · `script`, `Ride`
 - `game/src/layout.rs` 832 — posts, spawn paths, nav graph from the manifest · `MapLayout`, `nav_graph`
-- `game/src/mission.rs` 670 — mission RON → teams, tickets, spawn timing, the sound sub-level the script loads (`sound`, card SNDE), the start-of-round `plnp` blocks and `DisableBarriers` calls, the script's voice-over and music setters; which of a map's missions two armies run and the player's team in it (`pick`, card ERAM) · `MissionDef`, `MusicCalls`, `Pick`
+- `game/src/mission.rs` 701 — mission RON → teams, tickets, spawn timing, the sound sub-level the script loads (`sound`, card SNDE), the start-of-round `plnp` blocks and `DisableBarriers` calls, the script's voice-over and music setters; which of a map's missions two armies run and the player's team in it (`pick`, card ERAM) · `MissionDef`, `MusicCalls`, `Pick`
 - `game/src/roster.rs` 1121 — side classes → factions and unit specs; a class's other weapon slots built for the
   sim and registered (card GREN) · `FactionRoster`, `weapon_from_db`, `thrown_weapon_from_db`, `held_slots`,
   `ClassRoster::register`, `laser_look`, `flash_look`, `impact_look`, `explosion_look`
-- `game/src/classdb.rs` 534 — `classes.ron` with BASE inheritance, a map's own beside the sides, a name matched
+- `game/src/classdb.rs` 533 — `classes.ron` with BASE inheritance, a map's own beside the sides, a name matched
   ignoring case (`resolve`); a soldier class's weapon slots the PS2's way (`weapon_slots`: the parent's copy, then
   `WEAPONSECTION` / numbered keys) · `ClassDb`, `WeaponSlot`
 - `game/src/vehicle_class/walker.rs` 844 — a walker class (card WALK, re-walker §11): ctor defaults, the setter's
@@ -485,7 +504,7 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
   hull bodies they resolve to (HHUL, re-hover §13.2) · `HoverClass::hull`, `hull_names`; a building turret (`armedbuilding`, VTURB): its `BuildingSection` sections,
   a gunner-only ring, a building's HealthType · `TURRET_BASES`, `is_turret`; a flyer class's LandedHeight (VREST,
   re-vehicle-rest §2: the authored number, else minus the baked vis-box min y, in prop order) · `FLYER_BASES`, `landed_height`
-- `game/src/vehicle_pads.rs` 1034 — a map's `com_item_vehicle_spawn` instances → `PadDef`s (and each class's
+- `game/src/vehicle_pads.rs` 1040 — a map's `com_item_vehicle_spawn` instances → `PadDef`s (and each class's
   `GeometryName`): the side table
   (Atk = team 1, Def = team 2), the post's load-time team, the classes absent from the db, a mission's extra side
   files (`mission_side_files`: BF1 NAB1's gun, KAAD; BF2's `bf2_tur.ron` on the 11 maps whose conquest reads TUR, VTUR2); `install` puts them in
@@ -517,8 +536,8 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
 - `game/src/foley.rs` 747 — soldier foley (card FOLY, re-foley `[O]`): the battle's sound sub-levels, best first - the mission's own, then the map's (`sublevels`, `battle_levels`; one rule for the library, the foley table and the engine records, card SNDE) - and an other-era army's own sub-level (`foreign_armies`); the battle's sub-level table, the surface under a soldier (terrain / water; the prop under the feet is PROVISIONAL-missing), the PS2's movement clip rules of both games, a step per half clip cycle for a drawn soldier, the stance sounds · `Foley`, `Table`, `Surface`, `clip_bf1`, `clip_bf2`, `View`, `Who`, `WHO`
 - `game/src/engine_sound.rs` 377 — a vehicle's engine loop (card VSND, re-vehicle-sounds `[O]`): the record's graphs and factors, the PS2's engine instance (on with a pilot, the `TurnOffTime` run-down, the hover's filtered acceleration, the walker's slip), one instance per vehicle per tick; presentation only · `graph`, `factors`, `Instance`, `EngineSounds`, `EngineClass`, `Voice`
 - `game/src/engine_sound/tests.rs` 413 — the AAT's and Utapau's AT-ST graphs inline (rest, full speed, the filter, the run-down, the walker's left end) and the PS2's live multipliers replayed through the baked NAB1 records (data-gated)
-- `game/src/dev.rs` 38 — the hidden dev mode (`OPENBF_DEV=1`) · `on`
-- `game/src/unit_probe.rs` 514 — one unit's state as a diagnostic row (where it is, its objective and leg, the behaviour that ran and the going-round commitment — card OBST2, `Doing`, `round*` —, the steering's
+- `game/src/dev.rs` 40 — the hidden dev mode (`OPENBF_DEV=1`) · `on`
+- `game/src/unit_probe.rs` 558 — one unit's state as a diagnostic row (where it is, its objective and leg, the behaviour that ran and the going-round commitment — card OBST2, `Doing`, `round*` —, the steering's
   pick, what it walked at this tick and what shuts the way along the direction the steering was asked, with the body
   (card BLKF; nothing for a bot that did not walk), the hold's goal / spot / time left / strafe side, the boarding
   target's place, lost / stuck): the sweep's `UNIT_SAMPLES` row and the black box's,
@@ -551,9 +570,9 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
 - `game/src/holo.rs` 748 — the command post's hologram (card CPHOL, re-point-lights §3, §10, §15 `[O]`): the class's keys, the state per post (the 2 s fade across a capture, the one-update dips, the pops, the turn) stepped at the PS2's update rate on the sim's clock, the beam and the owner's icon as particle draws in the VIEWER's relation colour, the still render's · `Holos`, `Holo`, `HoloArt`, `holo_draws`, `still_draws`, `switched_on`
 - `game/src/water_anim.rs` 1177 — moving water: FFT ocean (whole cells reaching the far pass, nothing past it), foam, bob · `Ocean`, `Foam`, `WaterMotion`, `cells_in_range`
 - `game/src/weather.rs` 931 — the map's precipitation and wind (card WTHR, re-weather.md): N particles in one unit cube tiled in 5 m cells, the cell walk and its rain shadows, streaks and flakes as draws, splashes · `Weather`, `Precip`, `Wind`, `Shadow`, `View`, `cell_walk`
-- `game/src/sounds.rs` 2542 — runtime sounds: lookup (a name's definition is the battle's own sub-level's, as the PS2 loads the one its mission names; another sub-level's only for a name it does not define - card SNDE, `for_battle`, `load_for`; referees `game/tests/suite/sound_sublevels.rs` against the disc and probe `game/examples/audit_takes.rs`), pick, the PS2's level by distance (`analysis/re-sound-distance.md`); 2-D voice lines with their length; the engine layers' looping voices (`loop_voices`); a `Music` record with its takes' places on the disc (`music`, `MusicTrack`); the one-shots handed to the mixer, kept for the black box when `handed` is on (card SNDB); the world's emitters' voices (card AMBS: a looping voice in range, a disc stream kept from the battle's start, a one-shot re-asked when idle; `ambient_voices`, `ambient_heard`, `ambient_take`); each unit's ONE voice for its cries (card UCRY, `cry`, `cries`, `play_cries`: a cry cuts the one still sounding; per tick only a unit's last cry starts); a unit's line for the voice queue through BF1's stream gates (card UCALL, `ask_line`: one take drawn, silent inside its own lock, then the property's interval and chance, then the level; `line_secs` times a queued line without a mixer) · `SoundLib`, `Refused`, `attenuation`, `Handed`, `AmbientHeard`, `AmbientTake`
+- `game/src/sounds.rs` 2519 — runtime sounds: lookup (a name's definition is the battle's own sub-level's, as the PS2 loads the one its mission names; another sub-level's only for a name it does not define - card SNDE, `for_battle`, `load_for`; referees `game/tests/suite/sound_sublevels.rs` against the disc and probe `game/examples/audit_takes.rs`), pick, the PS2's level by distance (`analysis/re-sound-distance.md`); 2-D voice lines with their length; the engine layers' looping voices (`loop_voices`); a `Music` record with its takes' places on the disc (`music`, `MusicTrack`); the one-shots handed to the mixer, kept for the black box when `handed` is on (card SNDB); the world's emitters' voices (card AMBS: a looping voice in range, a disc stream kept from the battle's start, a one-shot re-asked when idle; `ambient_voices`, `ambient_heard`, `ambient_take`); each unit's ONE voice for its cries (card UCRY, `cry`, `cries`, `play_cries`: a cry cuts the one still sounding; per tick only a unit's last cry starts); a unit's line for the voice queue through BF1's stream gates (card UCALL, `ask_line`: one take drawn, silent inside its own lock, then the property's interval and chance, then the level; `line_secs` times a queued line without a mixer) · `SoundLib`, `Refused`, `attenuation`, `Handed`, `AmbientHeard`, `AmbientTake`
 - `game/src/music.rs` 425 — the battle's music fed from the sim (card AMBM): the mission's music calls + the bank's `Music` records → `core::music`, a frame's changes for the voice and the log; the music volume option (card MUSV: profile `music_volume`, `OPENBF_MUSIC_VOLUME`, 0 = no take); `MUSIC_LOG`'s headless log · `BattleMusic`, `HeadlessLog`, `volume_option`
-- `game/src/announce.rs` 728 — the commander fed from the sim: mission lines (keyed by the armies really in the battle,
+- `game/src/announce.rs` 742 — the commander fed from the sim: mission lines (keyed by the armies really in the battle,
   not the script's team numbers) + post tables → `core::announcer`, played per frame by `game/src/main/windowed.rs`;
   census probe `game/examples/audit_annc.rs` (a whole round per mission, every line asked and started, against its own
   model of the PS2 script's bleed rate); the units' combat calls (card UCALL: `calls` per tick, `gate_calls` through the
@@ -561,16 +580,16 @@ Flow: disc → `mungefs` → `bake` → `engine/assets_baked/` (schema `manifest
   unit at or under its class's threshold asks its `LowHealthSound` while its own handle - `VoiceQueue::holds` - is idle;
   voice-stream lines only); card UVO2: a BF2 battle's unit voice through `crate::vo` (`Commander::vo`, `vo_body`) ·
   `Commander`, `CallAsk`, `battle_lines`
-- `game/src/vo.rs` 866 — BF2's unit voice, the class's `VOSound` lines (card UVO2, `analysis/re-unit-chatter.md` 3): the
+- `game/src/vo.rs` 982 — BF2's unit voice, the class's `VOSound` lines (card UVO2, `analysis/re-unit-chatter.md` 3): the
   PS2's event table, an entry's event and condition word, a class's chain of entries, the context (the object above /
   below, behind / left / right, near / far, its kind and `VOUnitType`), the ranking, the speaker rule (50 m of the
   subject - the player when none is named - an enemy 31 in 101, the subject's nearest team-mate when no speaker is
   named), AcquiredTarget (71 in 101), FriendlyFire, Grenade, the human's killing sprees and the slaughter counters ·
   `Vo`, `VoLines`, `Entry`, `Said`, `Who`, `Body`, `context`, `best`, `class_lines`, `EVENTS`, `ASKED`
-- `game/src/profile.rs` 195 — the autosaved profile · `Profile`
-- `game/src/hud_feed.rs` 389 — BF2's HUD on screen: loads the baked layout, fonts, sheets and meshes (the weapons' own models from the side bakes), runs `ui::hud_tree` / `ui::hud_draw` per frame, paints through `render::hud`; per weapon row (card HUDW) a BF1 class keys BF2's table by its own name, a model the layout does not place gives way to the icon sheet, and a world model's opaque parts are drawn without their sheet's alpha · `HudView`
-- `game/src/minimap.rs` 468 — the minimap's feed (card BMAP): the map square from `mapbounds` (else the posts' box + 100 m), the `<world>_map` image, each post's and class's `MapTexture` / `MapScale` / view radii, and the per-frame model from the battle (posts, detected units, vehicles); `still` for captures · `MapStatic`, `ClassIcon`, `bounds_of`, `still`
-- `game/src/gallery.rs` 1329 — headless map / unit / walkabout sheets (the water stepped to 0 s per eye; the walkabout's soldier on the floor under him, `soldier_spot`) · `map_sheet`, `vantage_camera`, `model_class` (a unit sheet holds its class's own weapon)
+- `game/src/profile.rs` 197 — the autosaved profile · `Profile`
+- `game/src/hud_feed.rs` 387 — BF2's HUD on screen: loads the baked layout, fonts, sheets and meshes (the weapons' own models from the side bakes), runs `ui::hud_tree` / `ui::hud_draw` per frame, paints through `render::hud`; per weapon row (card HUDW) a BF1 class keys BF2's table by its own name, a model the layout does not place gives way to the icon sheet, and a world model's opaque parts are drawn without their sheet's alpha · `HudView`
+- `game/src/minimap.rs` 469 — the minimap's feed (card BMAP): the map square from `mapbounds` (else the posts' box + 100 m), the `<world>_map` image, each post's and class's `MapTexture` / `MapScale` / view radii, and the per-frame model from the battle (posts, detected units, vehicles); `still` for captures · `MapStatic`, `ClassIcon`, `bounds_of`, `still`
+- `game/src/gallery.rs` 1328 — headless map / unit / walkabout sheets (the water stepped to 0 s per eye; the walkabout's soldier on the floor under him, `soldier_spot`) · `map_sheet`, `vantage_camera`, `model_class` (a unit sheet holds its class's own weapon)
 - `game/src/bench.rs` 305 — `--bench` per adapter · `Report`
 
 ## render — wgpu
@@ -670,7 +689,7 @@ copy); a packed game starts with dev mode off (`dev::flag`).
 - `input/src/lib.rs` 547 — gilrs → `PadState`, PS2 layout · `Mapping`, `pad_from_gamepad`; `open_gilrs` (the only
   way to open gilrs: `input/pads.txt`'s project SDL mappings + gilrs's DB + `SDL_GAMECONTROLLERCONFIG`), `log_pads` /
   `pad_warning` (per-pad resolution log, dead camera/FIRE warning), `TRIGGER_PRESS`; `input/examples/pads.rs` prints the log
-- `audio/src/lib.rs` 337 — kira playback through the master limiter; a looping voice with settable gain, rate and pan; a one-shot that can be cut (card UCRY) · `Audio`, `Voice`, `Shot`
+- `audio/src/lib.rs` 339 — kira playback through the master limiter; a looping voice with settable gain, rate and pan; a one-shot that can be cut (card UCRY) · `Audio`, `Voice`, `Shot`
 - `audio/src/limiter.rs` 170 — the master limiter on the main track (card MIXH): 2 ms lookahead, stereo-linked, ceiling at full scale, 80 ms release; a mix under full scale passes untouched · `Limiter`
 - `audio/src/stream.rs` 357 — streamed music (card AMBM): a take's SPU2 ADPCM decoded block by block (stereo: a 16 KiB left block, then a right one) from the bake's byte-for-byte copy of the disc's stream (`manifest::music_body`, card PACK) through `pak::open`, played through kira's streaming sound · `StreamTake`, `TakeReader`, `MusicVoice`, `Audio::play_stream`
 - `net/src/lib.rs` 10 — empty until the LAN phase
@@ -774,7 +793,7 @@ copy); a packed game starts with dev mode off (`dev::flag`).
 | a vehicle's rider drawn or hidden, where he hangs, his seat pose (card VRIDE) | `game/src/soldier_vis.rs` (`rider_now`, `step_hover_nines`) | `game/src/vehicle_class.rs` (`RiderHang`, `SeatSpec::animated_pilot_position`, `is_seat_pose_key`), `game/src/vehicle_pads.rs` (`PadBuild::riders`), `game/src/viewer/turret_pose.rs` (`HoverNine`), `game/src/viewer/walker_pose.rs` (`WalkerRig::node_now`), `game/src/viewer/vehicles.rs` (`walker_rigs`), `bake/src/hardpoints.rs` (the bind axes), `bake/src/soldier.rs` (`SEAT_CLIPS`), `game/tests/suite/vehicle_rider.rs` (the census `game/tests/data/vehicle_rider_census.txt`, the PS2's placements, the bike rides `game/tests/data/vehicle_rider_bike_<game>.txt`, the draw end to end) |
 | how a walker is drawn (skin, pose, leg layers) | `game/src/viewer/walker_pose.rs` | `bake/src/walker.rs` (`skin_glb`), `bake/src/vehicle.rs`, `bake/src/glb.rs` (`model_to_glb_joints`), `game/src/viewer/vehicles.rs`, `game/src/assets.rs` (`load_glb_joints`) |
 | a seat's gun (weapons, aimer, fire point, the seat switch) | `core/src/vehicle/gun.rs` | `core/src/sim/guns.rs`, `game/src/vehicle_pads.rs` (`seat_gun`), `bake/src/hardpoints.rs` (the fire points) |
-| how a bot boards, drives and leaves a vehicle, and fires a seat gun | `core/src/ai/ride.rs`, `core/src/ai/walker_drive.rs` (a walker's sticks), `core/src/ai/gunner.rs` | `core/src/ai/behave.rs` (the dispatch), `core/src/sim/seats.rs` (`ai_use_pass`, `ride`), `core/src/ai/route.rs` (`mover`) |
+| how a bot boards, drives and leaves a vehicle, and fires a seat gun | `core/src/ai/ride.rs`, `core/src/ai/walker_drive.rs` (a walker's sticks), `core/src/ai/gunner.rs`; a building turret: `core/src/ai/man.rs` (card TURR) | `core/src/ai/behave.rs` (the dispatch), `core/src/sim/seats.rs` (`ai_use_pass`, `ride`), `core/src/ai/route.rs` (`mover`) |
 | where a team spawns (posts' nodes, a command walker's points, the opening wave) | `core/src/sim/spawn.rs` (`spawn_points`, `walker_spawn_points`, `pad_walker_spawn_points`) | `game/src/vehicle_class/walker.rs` (`SpawnPointLocation`), `game/src/walk.rs` (`add_posts`, `opening_wave`), `game/src/main/battle.rs` (`spawn_model`), `game/examples/round_to_outcome.rs` (`SPAWN_CENSUS`) |
 | vehicle spawn pads (which class, when, the decay) | `core/src/vehicle_pad.rs` | `core/src/sim/vehicles.rs` (`tick_vehicle_pads`), `game/src/vehicle_pads.rs` |
 | where a pad's vehicle stands (the pad's ray; a parked flyer's LandedHeight) | `core/src/sim/vehicles.rs` (`tick_vehicle_pads`, `PAD_RAY`) | `game/src/vehicle_class.rs` (`landed_height`), `game/src/vehicle_pads.rs` (`vis_floors`, `install`), `bake/src/vehicle.rs` + `manifest/src/lib.rs` (`ManifestVehicle::vis_min_y`), `game/tests/suite/vehicle_pads.rs` (the class table) |

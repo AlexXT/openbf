@@ -5322,3 +5322,19 @@ check's numbers reproduced and its logic marked PARTLY (folded into the text).
   `re-chunk-census.md` 3). Cards VSHD (-> build, data), VSHD2 (draw), SBLOB (the separate `player_shadow` blob). Workflow
   verifier (6 agents): 27 / 27 batch claims SUPPORTED; 6 absence / twin claims by two readers each, 5 SUPPORTED by both,
   1 PARTLY by both (the gate's dead setter 0x4ae850, wording), none overturned.
+
+## 2026-10-19 (loop lane 2, card BNDY) — the map boundary: the shapes, the half-plane test, the 10 / 6.5 s countdown → `analysis/re-boundary.md` [O]
+
+- [O] Shapes come only from the map LVL's `bnd_` chunk (`Boundary { Path(name) }`, the first path of a name; one caller
+  of the push per game [receipt:e88fecd8]); per shape a CONVEX half-plane test over its closed edges, a point inside any
+  shape is inside, x and z only, no shapes = never outside (B1 FUN_002956d8 / FUN_002958f8, B2 FUN_0034c550 /
+  FUN_0034c780). 22 of 32 baked maps have one; BF1 YAV1 / YAV2 and BF2 COR1 DAG1 DEA1 MUS1 MYG1 NAB2 TAN1 UTA1 none.
+- [O] Every unit with a soldier (AI too) is tested each update; outside -> BF1 10.0 s / BF2 6.5 s (2.17 s for a steered
+  guided rocket), the local human's team line + "Leaving Battlefield" (alpha spring), killed below 0 with what it
+  drives (the invincibility cheat spares); inside -> cleared. [M] 296 / 296 PS2 test points agree on the six showcase
+  maps + BF1 KAM1 / HOT1 (12 non-convex points outside on the PS2), RAM shapes = the transcription on 32 maps, death at
+  10.0 / 6.5 s, AI timers run on BF1 and BF2.
+- [O] Corrects the 10-16 draft: BF2's flyer +0x660 bit 7 is the fly-height flag (Lua Min/MaxPlayerFlyHeight, default
+  +-200, set per mission, e.g. UTA1 29.5, MYG1 20): a human flyer above the ceiling counts as outside (card VFLY).
+  Workflow verifier (6 agents, every claim to two readers): 16 / 19 SUPPORTED by both, 2 PARTLY by both (narrowed),
+  1 NOT SUPPORTED by both (rewritten), none overturned.

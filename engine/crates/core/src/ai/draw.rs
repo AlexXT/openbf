@@ -44,11 +44,8 @@ pub const SALT_NEED_GUNNER: u32 = 0x6E_ED60;
 /// its grenade window) and the coin between two weapons of one score.
 pub const SALT_NUMBER: u32 = 0x9E_4A0B;
 pub const SALT_ARM: u32 = 0xA2_3E71;
-/// Card HOLD: the dwell and the spot of a hold, its shuffles, the strafe on a
-/// burst.
+/// Card HOLD: the dwell and the spot of a hold.
 pub const SALT_HOLD: u32 = 0x40_1D00;
-pub const SALT_SHUFFLE: u32 = 0x5F_0FF1;
-pub const SALT_STRAFE: u32 = 0x57_4AFE;
 /// Card REACT: what a bot on a position does about a hit, and where to.
 pub const SALT_REACT: u32 = 0x2E_AC70;
 /// Card FGHT: a bot's fixed fighting style (stand or circle; `^ 1` its
@@ -67,6 +64,9 @@ pub const SALT_POST_POINT: u32 = 0x9A_22B1;
 /// A leg's point of the next hub ([`super::route::hub_point`], card HUBP):
 /// three per try.
 pub const SALT_HUB_POINT: u32 = 0x4B_9017;
+/// Card TPOS: a bot's own bias per position (`^ 1` its cycle's phases, `^ 2`
+/// the wait for the next position, `^ 3` the move on a hit).
+pub const SALT_TPOS: u32 = 0x7B_05C0;
 
 /// [`route_rand`]'s FNV shape with a per-use-site salt folded in.
 pub fn unit_rand(unit_index: u32, tick: u64, gen: u32, salt: u32) -> u32 {

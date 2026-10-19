@@ -465,6 +465,11 @@ pub struct Body {
     /// map's own bodies. A query may skip an owner's bodies
     /// ([`super::HullFilter`]) and a ray reports the owner it hit.
     pub owner: Option<VehicleHandle>,
+    /// The map instance this body is of (`game::assets::Scene`'s body
+    /// order), `None` for a hull or a fixture's body. A building turret's
+    /// camera ray skips its own building's (card TURR,
+    /// [`super::CollisionWorld::ray_past`]).
+    pub instance: Option<u32>,
     /// Card VMESH: a mesh whose every edge is shared by exactly two of its
     /// triangles (vertices welded at a millimetre) - a WATERTIGHT solid
     /// such as BF1 Endor's cp2 boulder, which nobody can walk into. Rooms,
@@ -497,6 +502,7 @@ impl Body {
             shape,
             layers,
             owner: None,
+            instance: None,
         }
     }
 }

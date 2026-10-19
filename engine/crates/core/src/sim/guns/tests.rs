@@ -390,3 +390,114 @@ fn a_full_circle_turret_turns_past_180_and_its_gun_follows() {
         assert!((g.look.1 - want * DEG).abs() < 1e-4, "{ry}: {:?}", g.look);
     }
 }
+
+/// Card TURR: BF2 Mygeeto's recoilless turret (`tur_bldg_recoilless_lg`):
+/// the pivot `aimer_y` at the origin, `hp_fire1` 3.39 m over it and 1.28 m
+/// to the side, `EyePointOffset 1.0 4.2 -8.3`, `AimerYawLimits 0 0`,
+/// `AimerPitchLimits -30 20`, `PitchLimits -30 20`, turned at 1.5 rad/s;
+/// at the origin facing +Z. `building`: the turret's own building as a map
+/// body round the camera's eye (instance 7, the turret's), as the bake
+/// builds it.
+fn recoilless_gun() -> GunSetup {
+    use crate::vehicle::gun::{Slew, Turn};
+    let mut g = gun([1.281, 3.388, 3.372], [0.0, 0.0, 0.0], [0.0, 0.0], false);
+    g.eye = Vec3::new(1.0, 4.2, -8.3);
+    g.aimer.pitch = [-30.0 * DEG, 20.0 * DEG];
+    g.aimer.pitch_rate = 1.0;
+    g.turn = Some(Turn::from_class(
+        Some([-180.0, 180.0]),
+        Some([-30.0, 20.0]),
+        (1.5, 1.0),
+        (10.0, 10.0),
+        Slew::Linear,
+    ));
+    g.framed = true;
+    g
+}
+
+fn recoilless_building() -> crate::collision::Body {
+    use crate::collision::{Body, Shape};
+    let mut b = Body::new(
+        glam::Mat4::from_translation(Vec3::new(0.0, 3.0, -5.0)),
+        Shape::Box {
+            half: Vec3::new(3.0, 3.0, 6.0),
+        },
+    );
+    b.instance = Some(7);
+    b
+}
+
+fn recoilless_world(building: bool) -> (Sim, VehicleHandle) {
+    let (mut s, v) = dish_world();
+    s.seat_setup[0].as_mut().unwrap().guns[0] = Some(recoilless_gun());
+    if building {
+        s.collision =
+            crate::collision::CollisionWorld::new(vec![recoilless_building()], Vec::new());
+        s.vehicle_mut(v).unwrap().instance = Some(7);
+    }
+    (s, v)
+}
+
+/// How far `p` is from the barrel's line (from the muzzle along the barrel).
+fn off_the_barrel(s: &Sim, u: UnitHandle, p: Vec3) -> f32 {
+    let l = s.seat_look(u).unwrap();
+    let w = p - l.muzzle;
+    (w - l.barrel * w.dot(l.barrel)).length()
+}
+
+/// Card TURR: the camera ray of a building turret passes its own building
+/// (the PS2's excludes the turret's owner entity, B1 `FUN_00223850`
+/// B1:138064, BF2 `FUN_0026cea0` B2:189959): a human looking level from an
+/// eye inside his turret's building lays the barrel on the ray's far end,
+/// 512 m out. The same building as no one's map body (instance 8) stops the
+/// ray at the eye and the barrel runs to its limit. And the aimer lays the
+/// BARREL's line on that point, not the pivot's (PS2 RAM, Mygeeto: 0.004 m
+/// off the barrels' line, 3.5 m off the pivot's): it passes 0.281 m beside
+/// it, the fire point's offset from the eye's line (1.281 against 1.0 m),
+/// which an aimer with no yaw of its own keeps; none above or below.
+#[test]
+fn a_turrets_camera_ray_passes_its_own_building_and_its_barrel_meets_the_point() {
+    for own in [true, false] {
+        let (mut s, v) = recoilless_world(true);
+        if !own {
+            s.vehicle_mut(v).unwrap().instance = Some(8);
+        }
+        let p = s
+            .spawn(&UnitSpec::player(0, Vec3::new(0.0, 0.0, 4.0)))
+            .unwrap();
+        assert!(s.enter_vehicle(p, v, 0));
+        for _ in 0..90 {
+            s.step(&[PadState::default()]);
+        }
+        let g = s.vehicle(v).unwrap().guns[0].clone().unwrap();
+        assert_eq!(g.look, (0.0, 0.0), "the look rests level");
+        let far = Vec3::new(1.0, 4.2, -8.3) + Vec3::Z * crate::vehicle::gun::AIM_RAY;
+        let off = off_the_barrel(&s, p, far);
+        if own {
+            assert!(
+                (off - 0.281).abs() < 0.01,
+                "the barrel's line passes {off} m off the point"
+            );
+            assert!(g.aim.1.abs() < 1.0 * DEG, "aim {:?}", g.aim);
+        } else {
+            assert!(off > 10.0, "{off}");
+            assert!(
+                (g.aim.1 - 20.0 * DEG).abs() < 1e-3 || (g.aim.1 + 30.0 * DEG).abs() < 1e-3,
+                "the aimer ran to a limit: {:?}",
+                g.aim
+            );
+        }
+    }
+}
+
+/// Card TURR: a building turret's barrel hangs off its aimer at its bind
+/// offset (re-turret-draw 2.3, `lead_tmp/vturd/replay_aimer.py` A3): the
+/// muzzle at rest IS the fire point, 1.28 m to the side - not turned onto
+/// the pivot's axis by its heading, as a vehicle's side gun is.
+#[test]
+fn a_building_turrets_muzzle_rests_at_its_fire_point() {
+    let g = recoilless_gun();
+    assert!(g.muzzle((0.0, 0.0)).distance(g.fire_point) < 1e-5);
+    let m = g.muzzle((90.0 * DEG, 0.0));
+    assert!(m.distance(Vec3::new(3.372, 3.388, -1.281)) < 1e-3, "{m}");
+}

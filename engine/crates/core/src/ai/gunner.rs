@@ -13,12 +13,18 @@
 //! straight at the aim point at the aimer's full stick rates — the seat's
 //! rates stand in for on foot's D9 tracker; the tolerance is a cone about the
 //! BARREL (on foot's is per axis about the look); with nothing seen the look
-//! returns to the aimer's rest; a charge weapon in a seat is never fired.
+//! returns to the aimer's rest (card TURR: a turret gunner's to the last
+//! known point of what it can hit); a charge weapon in a seat is never
+//! fired.
 //! A building turret's look turns by the PS2's rate law (card VTURL,
 //! `gun::Turn`): the bot asks for the rate that would stop on its aim -
 //! at most what the filter can brake from (BF1 `gap x filter`, BF2
 //! `sqrt(2 filter gap)`) and the gap in one tick - and turns the short way
-//! round a turret that wraps.
+//! round a turret that wraps. Its AIMER takes the point [`aim`] returns
+//! (`ai::ManState::aim`, card TURR) in place of the camera ray's hit, as the
+//! PS2's does for a seat with no player (B1 `FUN_0026d748` hands it the AI's
+//! own aim, `FUN_00236700`, B1:191963-191967); and it sees from its muzzle
+//! (`perception::scan`).
 
 use super::gunner_foot::{fire_discipline, seen_aim};
 use super::state::AiState;
@@ -43,29 +49,38 @@ pub(super) enum Look {
     Walker { yaw_rate: f32, pitch_rate: f32 },
 }
 
-/// Aim `me`'s seat gun and press FIRE when the shot is on.
-pub(super) fn aim(sim: &Sim, me: UnitHandle, st: &mut AiState, pad: &mut PadState, look: Look) {
+/// Aim `me`'s seat gun and press FIRE when the shot is on. With no target
+/// seen the look goes to `idle` (card TURR: a turret gunner's last known
+/// point of what it can hit), else to the rest. Returns the point aimed at
+/// (the seen target's aim point, else `idle`).
+pub(super) fn aim(
+    sim: &Sim,
+    me: UnitHandle,
+    st: &mut AiState,
+    pad: &mut PadState,
+    look: Look,
+    idle: Option<glam::Vec3>,
+) -> Option<glam::Vec3> {
     let (Some(s), Some(u)) = (sim.seat_look(me), sim.unit(me)) else {
-        return;
+        return None;
     };
-    let Some(w) = s.gun.weapons.first() else {
-        return;
-    };
+    let w = s.gun.weapons.first()?;
     let wc = &sim.weapon_classes[w.class];
     let skill = sim.difficulty.skill_at(u.skill);
     let tier = sim.difficulty.tier();
     let held = st.target.and_then(|h| perception::contact_of(st, h));
     let enemy = held.filter(|c| c.seen_now).and_then(|c| sim.unit(c.handle));
     let point = enemy.map(|e| seen_aim(sim, me, st, s.eye, e, wc.ordnance.velocity, wc));
+    let at = point.or(idle);
 
     if let (Look::Seat, Some(t)) = (look, s.gun.turn) {
-        let want = point.map(|p| gun::angles(s.rot.inverse() * (p - s.eye)));
+        let want = at.map(|p| gun::angles(s.rot.inverse() * (p - s.eye)));
         turn_stick(&t, s.look, want, pad);
     } else {
         // The look: `Sim::seat_gun` turns yaw by −rx·rate·dt and pitch by
         // +ry·rate·dt, so the stick that closes the gap in one tick, clamped.
         let a = s.gun.aimer;
-        let want = point.map_or(a.rest(), |p| gun::angles(s.rot.inverse() * (p - s.eye)));
+        let want = at.map_or(a.rest(), |p| gun::angles(s.rot.inverse() * (p - s.eye)));
         let want = (
             want.0.clamp(a.yaw[0], a.yaw[1]),
             want.1.clamp(a.pitch[0], a.pitch[1]),
@@ -93,7 +108,7 @@ pub(super) fn aim(sim: &Sim, me: UnitHandle, st: &mut AiState, pad: &mut PadStat
 
     fire_discipline(sim, me, u, st, wc, &skill);
     let (Some(e), Some(p)) = (enemy, point) else {
-        return;
+        return at;
     };
     let on = (p - s.muzzle).normalize_or_zero().dot(s.barrel) >= fmath::sin_cos(AIM_TOLERANCE).1;
     let range = (e.capsule().center() - s.muzzle).length();
@@ -106,6 +121,7 @@ pub(super) fn aim(sim: &Sim, me: UnitHandle, st: &mut AiState, pad: &mut PadStat
     {
         pad.buttons |= buttons::FIRE;
     }
+    at
 }
 
 /// The sticks that turn a [`gun::Turn`] look toward `want` (the rest when

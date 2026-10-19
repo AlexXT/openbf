@@ -1,0 +1,857 @@
+//! Card TURR's scenes on flat ground: a building turret at the origin facing
+//! +Z (a gun on a full-circle mount, BF2's dish-turret limits), one bot of
+//! team 0 near it, three idle team-mates far off (so the team is not in the
+//! endgame) and an idle enemy that does not die. One scene a rule: the offer
+//! (attack and defence clauses, with their controls), the post's cap, each
+//! of the five exits, the turret closed after leaving and after a walk that
+//! did not reach it.
+
+use super::*;
+use crate::cp::CpDef;
+use crate::region::Region;
+use crate::sim::Sim;
+use crate::unit::{Controller, UnitSpec};
+use crate::vehicle::gun::{Aimer, GunWeapon, Slew, Turn};
+use crate::vehicle::{SeatKind, SeatSetup, VehicleSpec};
+use crate::weapon::{DamageDesc, HealthType, WeaponClass};
+
+const DEG: f32 = std::f32::consts::PI / 180.0;
+const HZ: u64 = crate::TICK_HZ as u64;
+
+/// The turret's gun: class `weapon`, pivot 3 m up; a full-circle yaw unless
+/// `yaw` limits it (degrees, the PS2's terms).
+fn gun_setup(weapon: usize, yaw: Option<[f32; 2]>) -> GunSetup {
+    GunSetup {
+        weapons: vec![GunWeapon {
+            class: weapon,
+            infinite: true,
+            spare_clips: 0,
+        }],
+        fire_point: Vec3::new(0.0, 3.0, 2.0),
+        pivot: Vec3::new(0.0, 3.0, 0.0),
+        eye: Vec3::new(0.0, 0.5, -1.0),
+        aimer: Aimer {
+            yaw: [0.0, 0.0],
+            pitch: [-15.0 * DEG, 40.0 * DEG],
+            ..Aimer::default()
+        },
+        pilot: false,
+        turn: Some(Turn::from_class(
+            Some(yaw.unwrap_or([-180.0, 180.0])),
+            Some([-10.0, 35.0]),
+            (1.0, 1.0),
+            (10.0, 10.0),
+            Slew::Linear,
+        )),
+        framed: true,
+    }
+}
+
+struct Scene {
+    s: Sim,
+    v: VehicleHandle,
+    bot: UnitHandle,
+    enemy: UnitHandle,
+}
+
+fn turret_at(s: &mut Sim, pos: Vec3) -> VehicleHandle {
+    s.spawn_vehicle(&VehicleSpec {
+        kind: VehicleKind::Turret,
+        class: 0,
+        home_team: None,
+        neutral_when_empty: true,
+        spawn_pad: None,
+        pos,
+        yaw: 0.0,
+        max_health: 1000.0,
+        health_type: HealthType::Building,
+        seats: vec![SeatKind::Gunner(0)],
+    })
+}
+
+fn bot_at(s: &mut Sim, pos: Vec3) -> UnitHandle {
+    s.spawn(&UnitSpec {
+        controller: Controller::Ai,
+        ..UnitSpec::trooper(0, pos)
+    })
+    .unwrap()
+}
+
+/// The scene: the bot at `bot`, the enemy at `enemy` (both on the ground),
+/// the turret's gun firing class `weapon` (0 the rifle, 1 a charge rifle a
+/// bot never fires) over `yaw`.
+fn scene(bot: Vec3, enemy: Vec3, weapon: usize, yaw: Option<[f32; 2]>) -> Scene {
+    scene_with(bot, enemy, gun_setup(weapon, yaw))
+}
+
+/// [`scene`] with the turret's gun `g`.
+fn scene_with(bot: Vec3, enemy: Vec3, g: GunSetup) -> Scene {
+    let mut s = Sim::empty(5);
+    s.heightfield = Some(crate::heightfield::Heightfield {
+        size: 2,
+        unit: 4000.0,
+        offset_x: 2000.0,
+        offset_z: 2000.0,
+        heights: vec![0.0; 4],
+    });
+    // Class 0 is `Sim::empty`'s rifle.
+    let charge = s.add_weapon_class(WeaponClass {
+        max_pressed_time: 1.0,
+        ..WeaponClass::bf1_rifle()
+    });
+    assert_eq!(charge, 1);
+    s.seat_setup = vec![Some(SeatSetup {
+        radius: 3.0,
+        boardable: vec![true],
+        exit_drop: 15.0,
+        ai_size: 1,
+        guns: vec![Some(g)],
+    })];
+    let v = turret_at(&mut s, Vec3::ZERO);
+    let b = bot_at(&mut s, bot);
+    for k in 0..3 {
+        s.spawn(&UnitSpec::trooper(
+            0,
+            Vec3::new(600.0 + 5.0 * k as f32, 0.0, 600.0),
+        ))
+        .unwrap();
+    }
+    let e = s
+        .spawn(&UnitSpec {
+            max_health: 1.0e9,
+            ..UnitSpec::trooper(1, enemy)
+        })
+        .unwrap();
+    Scene {
+        s,
+        v,
+        bot: b,
+        enemy: e,
+    }
+}
+
+/// A team-0 post 20 m from the turret and an enemy post 220 m off - its
+/// neighbour (no graph: any other post is one).
+fn defended(sc: &mut Scene) {
+    let post = |name: &str, pos: Vec3| CpDef {
+        name: name.into(),
+        pos,
+        capture: Region::sphere(pos, 8.0),
+        control: None,
+        value_bleed: 100,
+        value_atk: [100, 100],
+        value_def: [100, 100],
+        spawn_nodes: vec![],
+        capture_time: 10.0,
+        neutralize_time: 12.0,
+    };
+    sc.s.add_cp(post("ours", Vec3::new(0.0, 0.0, 20.0)), Some(0));
+    sc.s.add_cp(post("theirs", Vec3::new(0.0, 0.0, 220.0)), Some(1));
+}
+
+/// A team-mate's memory holds `e` where it stands: the first of the idle
+/// team-mates, who never think, so the record is never aged out.
+fn tell(s: &mut Sim, e: UnitHandle) {
+    let at = s.unit(e).unwrap().capsule().center();
+    let tick = s.tick;
+    let mate = s
+        .units
+        .iter()
+        .position(|u| u.alive && u.team == 0 && u.controller == Controller::Idle)
+        .unwrap();
+    s.units[mate].ai.contacts[0] = Some(crate::perception::Contact {
+        handle: e,
+        first_seen: tick,
+        last_seen: tick,
+        last_pos: at,
+        seen_now: true,
+        heard: false,
+    });
+}
+
+fn seated(s: &Sim, b: UnitHandle, v: VehicleHandle) -> bool {
+    s.unit(b)
+        .and_then(|u| u.mount)
+        .is_some_and(|m| m.vehicle == v)
+}
+
+/// Step until `f` holds, at most `ticks`; the tick it held at.
+fn until(s: &mut Sim, ticks: u64, mut f: impl FnMut(&Sim) -> bool) -> Option<u64> {
+    for _ in 0..ticks {
+        s.step(&[]);
+        if f(s) {
+            return Some(s.tick);
+        }
+    }
+    None
+}
+
+/// The attack clause: an enemy the bot sees 30 m behind the turret, inside
+/// its arc and range - the bot is offered it, boards, turns it round and
+/// fires. Controls: the same enemy out of sight and range (130 m), and a
+/// turret whose arc looks the other way, are never offered.
+#[test]
+fn a_bot_mans_a_turret_that_can_hit_an_enemy_the_team_knows_of() {
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, 10.0),
+        Vec3::new(4.0, 0.0, -30.0),
+        0,
+        None,
+    );
+    let (b, v) = (sc.bot, sc.v);
+    let at = until(&mut sc.s, 10 * HZ, |s| seated(s, b, v)).expect("never manned");
+    assert!(at < 8 * HZ, "manned at tick {at}");
+    assert_eq!(sc.s.nav_stats.man_offers, 1);
+    assert_eq!(sc.s.nav_stats.man_boards, 1);
+    let shot = until(&mut sc.s, 10 * HZ, |s| s.nav_stats.seat_shots > 0);
+    assert!(shot.is_some(), "the gunner never fired");
+    assert!(seated(&sc.s, b, v), "left with a target to hit");
+    assert_eq!(sc.s.unit(b).unwrap().ai.behaviour, Behaviour::Man);
+
+    for (enemy, yaw) in [
+        (Vec3::new(4.0, 0.0, -130.0), None),
+        (Vec3::new(4.0, 0.0, -30.0), Some([-60.0, 60.0])),
+    ] {
+        let mut sc = scene(Vec3::new(3.0, 0.0, 10.0), enemy, 0, yaw);
+        let (b, v) = (sc.bot, sc.v);
+        assert_eq!(until(&mut sc.s, 10 * HZ, |s| seated(s, b, v)), None);
+        assert_eq!(sc.s.nav_stats.man_offers, 0, "{enemy} {yaw:?}");
+    }
+    // Known to the team but out of reach: 70 m off, past the 49 m a gunner
+    // sees a standing soldier at (the rifle reaches 120 m); or behind a wall.
+    for wall in [false, true] {
+        let enemy = if wall {
+            Vec3::new(4.0, 0.0, 30.0)
+        } else {
+            Vec3::new(4.0, 0.0, 70.0)
+        };
+        let mut sc = scene(Vec3::new(3.0, 0.0, -150.0), enemy, 0, None);
+        if wall {
+            use crate::collision::{Body, CollisionWorld, Shape};
+            sc.s.collision = CollisionWorld::new(
+                vec![Body::new(
+                    glam::Mat4::from_translation(Vec3::new(0.0, 4.0, 15.0)),
+                    Shape::Box {
+                        half: Vec3::new(10.0, 4.0, 0.25),
+                    },
+                )],
+                Vec::new(),
+            );
+        }
+        tell(&mut sc.s, sc.enemy);
+        let g = seat_gun(&sc.s, sc.v, 0).unwrap().clone();
+        let k = known(&sc.s, 0);
+        assert_eq!(k.len(), 1);
+        assert_eq!(hittable(&sc.s, sc.v, &g, 0, &k), None, "wall {wall}");
+        // The same enemy 30 m off in the open: hittable.
+        if !wall {
+            sc.s.units[sc.enemy.index as usize].soldier.pos = Vec3::new(4.0, 0.0, 30.0);
+            tell(&mut sc.s, sc.enemy);
+            assert!(hittable(&sc.s, sc.v, &g, 0, &known(&sc.s, 0)).is_some());
+        }
+    }
+}
+
+/// The defence clause: the turret, whose arc is the front 120 degrees,
+/// stands 20 m from a front-line post of the team, and a team-mate knows of
+/// an enemy behind it, 46 m from the post - nothing it can hit, but it is
+/// offered and manned. Not with that enemy 70 m from the post, nor beside a
+/// post of the enemy's, nor when the other post is the team's own too (not
+/// a front line).
+#[test]
+fn a_turret_by_a_front_line_post_with_an_enemy_near_is_manned() {
+    let front = Some([-60.0, 60.0]);
+    let at = Vec3::new(0.0, 0.0, 20.0);
+    // (enemy, post 0's owner, post 1's owner, post 0's place, manned)
+    for (enemy, owner, other, post, manned) in [
+        (Vec3::new(5.0, 0.0, -25.0), 0, 1, at, true),
+        (Vec3::new(5.0, 0.0, -50.0), 0, 1, at, false),
+        (Vec3::new(5.0, 0.0, -25.0), 1, 1, at, false),
+        (Vec3::new(5.0, 0.0, -25.0), 0, 0, at, false),
+        // The post 45 m off the turret's side, the enemy 14 m from it,
+        // outside the arc.
+        (
+            Vec3::new(55.0, 0.0, -10.0),
+            0,
+            1,
+            Vec3::new(45.0, 0.0, 0.0),
+            false,
+        ),
+    ] {
+        let mut sc = scene(Vec3::new(3.0, 0.0, 10.0), enemy, 0, front);
+        defended(&mut sc);
+        sc.s.cps[0].owner = Some(owner);
+        sc.s.cps[1].owner = Some(other);
+        sc.s.cps[0].def.pos = post;
+        tell(&mut sc.s, sc.enemy);
+        let (b, v) = (sc.bot, sc.v);
+        let at = until(&mut sc.s, 10 * HZ, |s| seated(s, b, v));
+        assert_eq!(at.is_some(), manned, "{enemy} {owner} {other} {post}");
+        assert_eq!(sc.s.nav_stats.man_defence_offers, u64::from(manned));
+    }
+}
+
+/// The route graph's neighbours (`l_graph`: hubs 0 - 1 - 2 in a row): with a
+/// post at each hub, the middle one is the only neighbour of the first, so
+/// the first is on the front line when the middle is the enemy's and not
+/// when only the far one is.
+#[test]
+fn a_front_line_post_has_an_enemy_neighbour_on_the_route_graph() {
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, 10.0),
+        Vec3::new(400.0, 0.0, 0.0),
+        0,
+        None,
+    );
+    sc.s.nav = Some(crate::ai::tests::l_graph());
+    defended(&mut sc);
+    defended(&mut sc);
+    sc.s.cps.truncate(3);
+    for (k, cp) in sc.s.cps.iter_mut().enumerate() {
+        cp.nav_hub = Some(k as u16);
+    }
+    for (owners, front) in [([0, 1, 0], true), ([0, 0, 1], false), ([0, 0, 0], false)] {
+        for (cp, o) in sc.s.cps.iter_mut().zip(owners) {
+            cp.owner = Some(o);
+        }
+        assert_eq!(front_line(&sc.s, 0, 0), front, "{owners:?}");
+    }
+    // The middle post is the far one's neighbour too.
+    for (cp, o) in sc.s.cps.iter_mut().zip([1, 0, 0]) {
+        cp.owner = Some(o);
+    }
+    assert!(front_line(&sc.s, 0, 1));
+    assert!(!front_line(&sc.s, 0, 2));
+}
+
+/// A post keeps at most two of its turrets manned or claimed: three turrets
+/// beside one post, three free bots, an enemy all three can hit - two
+/// claims.
+#[test]
+fn a_post_takes_two_gunners() {
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, 10.0),
+        Vec3::new(4.0, 0.0, -30.0),
+        0,
+        None,
+    );
+    defended(&mut sc);
+    for x in [-8.0, 8.0] {
+        turret_at(&mut sc.s, Vec3::new(x, 0.0, 0.0));
+        bot_at(&mut sc.s, Vec3::new(x + 3.0, 0.0, 10.0));
+    }
+    until(&mut sc.s, 3 * HZ, |_| false);
+    let claimed =
+        sc.s.alive_units()
+            .filter(|(_, u)| u.mount.is_some() || u.ai.ride.is_some_and(|r| r.board.is_some()))
+            .count();
+    assert_eq!(
+        claimed, MAN_POST_CAP,
+        "{} offers",
+        sc.s.nav_stats.man_offers
+    );
+}
+
+/// Seat the scene's bot by hand at tick 1.
+fn sit(sc: &mut Scene) {
+    sc.s.step(&[]);
+    assert!(sc.s.enter_vehicle(sc.bot, sc.v, 0));
+}
+
+/// Exit 1: a gunner at a defended post (an enemy its team knows of behind
+/// the turret's 120-degree arc, 46 m from the post) with nothing it can hit
+/// gets out 10 s after it sat down, by rule 1 - then the turret is closed
+/// to it for 20 s and offered to it again after.
+#[test]
+fn exit_1_ten_seconds_with_nothing_to_hit_and_closed_for_twenty() {
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, 10.0),
+        Vec3::new(5.0, 0.0, -25.0),
+        0,
+        Some([-60.0, 60.0]),
+    );
+    defended(&mut sc);
+    tell(&mut sc.s, sc.enemy);
+    sit(&mut sc);
+    let (b, v) = (sc.bot, sc.v);
+    let sat = sc.s.tick;
+    let out = until(&mut sc.s, 15 * HZ, |s| !seated(s, b, v)).expect("never left");
+    assert!(out - sat >= MAN_NO_TARGET, "left after {} ticks", out - sat);
+    assert!(out - sat <= MAN_NO_TARGET + THINK_PERIOD + 1);
+    assert_eq!(
+        sc.s.nav_stats.man_codes[1], 1,
+        "{:?}",
+        sc.s.nav_stats.man_codes
+    );
+    // Closed to it for 20 s: no claim, though the post is still defended
+    // and the bot is held 10 m from the turret (it would walk off to post 1).
+    let claim = |s: &Sim| {
+        s.unit(b)
+            .unwrap()
+            .ai
+            .ride
+            .is_some_and(|r| r.board == Some(v))
+    };
+    let hold = |s: &mut Sim| {
+        let u = &mut s.units[b.index as usize].soldier;
+        (u.pos, u.vel) = (Vec3::new(3.0, 0.0, 10.0), Vec3::ZERO);
+    };
+    for _ in 0..(MAN_LEFT_CLOSED - 2 * MAN_OFFER_PERIOD) {
+        hold(&mut sc.s);
+        sc.s.step(&[]);
+        assert!(
+            !claim(&sc.s) && !seated(&sc.s, b, v),
+            "re-claimed at {}",
+            sc.s.tick
+        );
+    }
+    let again = (0..4 * MAN_OFFER_PERIOD).any(|_| {
+        hold(&mut sc.s);
+        sc.s.step(&[]);
+        claim(&sc.s) || seated(&sc.s, b, v)
+    });
+    assert!(again, "never offered again");
+}
+
+/// Exit 2: a gunner whose gun it never fires (a charge weapon) with an enemy
+/// it can hit in front sits 45 s and gets out by rule 2; with the rifle it
+/// fires and stays.
+#[test]
+fn exit_2_forty_five_seconds_with_no_shot_in_twenty() {
+    for (weapon, leaves) in [(1, true), (0, false)] {
+        let mut sc = scene(
+            Vec3::new(3.0, 0.0, 10.0),
+            Vec3::new(4.0, 0.0, 30.0),
+            weapon,
+            None,
+        );
+        sit(&mut sc);
+        let (b, v) = (sc.bot, sc.v);
+        let sat = sc.s.tick;
+        let out = until(&mut sc.s, 50 * HZ, |s| !seated(s, b, v));
+        if leaves {
+            let out = out.expect("never left");
+            assert!(out - sat >= MAN_LONG, "left after {} ticks", out - sat);
+            assert_eq!(
+                sc.s.nav_stats.man_codes[2], 1,
+                "{:?}",
+                sc.s.nav_stats.man_codes
+            );
+        } else {
+            assert_eq!(out, None, "{:?}", sc.s.nav_stats.man_codes);
+            assert!(sc.s.nav_stats.seat_shots > 0);
+        }
+    }
+}
+
+/// Exit 3: hit from behind a turret whose arc is the front 120 degrees ->
+/// out at the next think; hit from inside the arc -> stays. Under 30 % of
+/// its health -> out; at 35 % -> stays.
+#[test]
+fn exit_3_hit_from_outside_every_arc_or_the_turret_under_thirty_percent() {
+    let hit = DamageDesc {
+        damage: 10.0,
+        scales: [1.0; 7],
+        shield_scale: 1.0,
+    };
+    for (from_behind, leaves) in [(true, true), (false, false)] {
+        let mut sc = scene(
+            Vec3::new(3.0, 0.0, 10.0),
+            Vec3::new(4.0, 0.0, 30.0),
+            0,
+            Some([-60.0, 60.0]),
+        );
+        let behind =
+            sc.s.spawn(&UnitSpec {
+                max_health: 1.0e9,
+                ..UnitSpec::trooper(1, Vec3::new(-3.0, 0.0, -25.0))
+            })
+            .unwrap();
+        sit(&mut sc);
+        until(&mut sc.s, 2 * HZ, |_| false);
+        let who = if from_behind { behind } else { sc.enemy };
+        sc.s.damage_vehicle(sc.v, &hit, 1.0, Some((who, 1)));
+        let (b, v) = (sc.bot, sc.v);
+        let out = until(&mut sc.s, 2 * HZ, |s| !seated(s, b, v));
+        assert_eq!(out.is_some(), leaves, "from behind {from_behind}");
+        assert_eq!(sc.s.nav_stats.man_codes[3], u64::from(leaves));
+    }
+    for (share, leaves) in [(0.25, true), (0.35, false)] {
+        let mut sc = scene(
+            Vec3::new(3.0, 0.0, 10.0),
+            Vec3::new(4.0, 0.0, 30.0),
+            0,
+            None,
+        );
+        sit(&mut sc);
+        sc.s.vehicles[sc.v.index as usize].health.cur = share * 1000.0;
+        let (b, v) = (sc.bot, sc.v);
+        let out = until(&mut sc.s, 2 * HZ, |s| !seated(s, b, v));
+        assert_eq!(out.is_some(), leaves, "at {share}");
+        assert_eq!(sc.s.nav_stats.man_codes[3], u64::from(leaves));
+    }
+}
+
+/// Exit 4: the endgame - a team at 10 tickets, or the gunner's own team down
+/// to three - puts a gunner with a target out at its next think, and no
+/// turret is offered then.
+#[test]
+fn exit_4_the_endgame_empties_the_turrets() {
+    for tickets in [true, false] {
+        let mut sc = scene(
+            Vec3::new(3.0, 0.0, 10.0),
+            Vec3::new(4.0, 0.0, 30.0),
+            0,
+            None,
+        );
+        sit(&mut sc);
+        until(&mut sc.s, 2 * HZ, |_| false);
+        let (b, v) = (sc.bot, sc.v);
+        assert!(seated(&sc.s, b, v));
+        if tickets {
+            sc.s.battle.teams[1].reinforcements = HOLD_ENDGAME as f32;
+        } else {
+            let mate =
+                sc.s.alive_units()
+                    .find(|(h, u)| u.team == 0 && *h != b)
+                    .map(|(h, _)| h)
+                    .unwrap();
+            sc.s.units[mate.index as usize].alive = false;
+        }
+        let out = until(&mut sc.s, THINK_PERIOD + 2, |s| !seated(s, b, v));
+        assert!(out.is_some(), "tickets {tickets}: still seated");
+        assert_eq!(sc.s.nav_stats.man_codes[4], 1);
+    }
+    // ...and the attack scene's offer is not made.
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, 10.0),
+        Vec3::new(4.0, 0.0, -30.0),
+        0,
+        None,
+    );
+    sc.s.battle.teams[0].reinforcements = HOLD_ENDGAME as f32;
+    let (b, v) = (sc.bot, sc.v);
+    assert_eq!(until(&mut sc.s, 10 * HZ, |s| seated(s, b, v)), None);
+    assert_eq!(sc.s.nav_stats.man_offers, 0);
+}
+
+/// Exit 5, the purpose lost for 10 s: the purpose clock a think keeps is
+/// never older than exit 1's (a target it can hit IS a purpose), so in the
+/// sim exit 1 holds first and rule 5 cannot be isolated in a scene. The
+/// rule itself, on clocks set by hand: a target it could hit 1 s ago, the
+/// purpose 10 s ago -> 5; 9 s ago -> none.
+#[test]
+fn exit_5_the_purpose_lost_for_ten_seconds() {
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, 10.0),
+        Vec3::new(4.0, 0.0, 30.0),
+        0,
+        None,
+    );
+    sit(&mut sc);
+    sc.s.tick = 1000;
+    let g = seat_gun(&sc.s, sc.v, 0).unwrap().clone();
+    for (ago, rule) in [(MAN_PURPOSE_LOST, Some(5)), (MAN_PURPOSE_LOST - HZ, None)] {
+        let man = ManState {
+            seated: 900,
+            hittable: 970,
+            purpose: 1000 - ago,
+            look: None,
+            aim: None,
+        };
+        assert_eq!(exit_rule(&sc.s, sc.v, &g, 0, &man, 990), rule, "{ago}");
+    }
+}
+
+/// The walk has an outcome: a turret inside a closed ring of 1.5 m walls
+/// 24 m across (wider than the 10 m board reach) is offered, never reached,
+/// and then closed to the bot for 60 s.
+#[test]
+fn a_turret_the_walk_cannot_reach_is_closed_for_sixty_seconds() {
+    use crate::collision::{Body, CollisionWorld, Shape};
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, -20.0),
+        Vec3::new(10.0, 0.0, -45.0),
+        0,
+        None,
+    );
+    let wall =
+        |c: Vec3, half: Vec3| Body::new(glam::Mat4::from_translation(c), Shape::Box { half });
+    sc.s.collision = CollisionWorld::new(
+        vec![
+            wall(Vec3::new(0.0, 0.75, 12.0), Vec3::new(12.5, 0.75, 0.25)),
+            wall(Vec3::new(0.0, 0.75, -12.0), Vec3::new(12.5, 0.75, 0.25)),
+            wall(Vec3::new(12.0, 0.75, 0.0), Vec3::new(0.25, 0.75, 12.5)),
+            wall(Vec3::new(-12.0, 0.75, 0.0), Vec3::new(0.25, 0.75, 12.5)),
+        ],
+        Vec::new(),
+    );
+    let (b, v) = (sc.bot, sc.v);
+    let claim = move |s: &Sim| {
+        s.unit(b)
+            .unwrap()
+            .ai
+            .ride
+            .is_some_and(|r| r.board == Some(v))
+    };
+    assert!(until(&mut sc.s, 5 * HZ, claim).is_some(), "never offered");
+    let dropped = until(&mut sc.s, 40 * HZ, |s| !claim(s)).expect("never gave up");
+    assert!(!seated(&sc.s, b, v));
+    let r = sc.s.unit(b).unwrap().ai.ride.unwrap();
+    assert_eq!(r.closed, Some(v));
+    // (Closed at the think, the tick before the step's count.)
+    assert_eq!(r.closed_until, dropped - 1 + MAN_UNREACHED_CLOSED);
+    assert_eq!(sc.s.nav_stats.man_codes[6], 1);
+    for _ in 0..(MAN_UNREACHED_CLOSED - 2 * MAN_OFFER_PERIOD) {
+        sc.s.step(&[]);
+        assert!(!claim(&sc.s), "claimed again at {}", sc.s.tick);
+    }
+}
+
+/// The offer goes to the NEAREST free bot within 50 m: of bots 10 m and 30 m
+/// off the near one takes it; one 55 m off alone is offered nothing.
+#[test]
+fn the_nearest_free_bot_within_fifty_metres_is_offered_the_turret() {
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, 30.0),
+        Vec3::new(4.0, 0.0, -30.0),
+        0,
+        None,
+    );
+    let near = bot_at(&mut sc.s, Vec3::new(-3.0, 0.0, 10.0));
+    tell(&mut sc.s, sc.enemy);
+    until(&mut sc.s, 2, |_| false);
+    let board = |s: &Sim, h: UnitHandle| s.unit(h).unwrap().ai.ride.and_then(|r| r.board);
+    assert_eq!(board(&sc.s, near), Some(sc.v));
+    assert_eq!(board(&sc.s, sc.bot), None);
+
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, 55.0),
+        Vec3::new(4.0, 0.0, -30.0),
+        0,
+        None,
+    );
+    tell(&mut sc.s, sc.enemy);
+    until(&mut sc.s, 2 * MAN_OFFER_PERIOD, |_| false);
+    assert_eq!(sc.s.nav_stats.man_offers, 0);
+}
+
+/// A gunner that has not seen the enemy itself turns the turret to the one
+/// its team knows of (behind it) and fires once it sees him.
+#[test]
+fn a_gunner_turns_to_the_enemy_its_team_knows_of() {
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, 10.0),
+        Vec3::new(4.0, 0.0, -30.0),
+        0,
+        None,
+    );
+    tell(&mut sc.s, sc.enemy);
+    // (Facing +z, away from the enemy, so it never sees him on foot.)
+    sc.s.units[sc.bot.index as usize].soldier.yaw = std::f32::consts::PI;
+    sit(&mut sc);
+    assert!(sc
+        .s
+        .unit(sc.bot)
+        .unwrap()
+        .ai
+        .contacts
+        .iter()
+        .all(Option::is_none));
+    let shot = until(&mut sc.s, 10 * HZ, |s| s.nav_stats.seat_shots > 0);
+    assert!(shot.is_some(), "never turned to fire");
+}
+
+/// Card TURR: a bot walking to its turret does not stop to fight an enemy
+/// inside 25 m on the way (a boarder of a vehicle does) - it walks on and
+/// mans the turret, 0.4 m past the board reach here. (The posts give the
+/// bot somewhere to look while it walks: with none, no route and nobody
+/// seen, `think` idles it.)
+#[test]
+fn a_bot_walking_to_its_turret_does_not_stand_to_fight_on_the_way() {
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, 10.0),
+        Vec3::new(5.0, 0.0, 25.0),
+        0,
+        None,
+    );
+    defended(&mut sc);
+    sc.s.units[sc.bot.index as usize].soldier.yaw = std::f32::consts::PI;
+    let (b, v) = (sc.bot, sc.v);
+    let saw = until(&mut sc.s, HZ, |s| s.unit(b).unwrap().ai.target.is_some());
+    assert!(saw.is_some(), "the bot does not see the enemy 15 m off");
+    assert!(until(&mut sc.s, 5 * HZ, |s| seated(s, b, v)).is_some());
+}
+
+/// BF2 Mygeeto's recoilless turret (`tur_bldg_recoilless_lg`, the rifle in
+/// place of its rocket): the pivot `aimer_y` at the base, `hp_fire1` 3.39 m
+/// over it and 1.28 m to the side, the camera's eye 8.3 m behind and 4.2 m
+/// up (`EyePointOffset 1.0 4.2 -8.3`), `AimerYawLimits 0 0`,
+/// `AimerPitchLimits -30 20`, `PitchLimits -30 20`, turned at 1.5 rad/s.
+fn recoilless() -> GunSetup {
+    let mut g = gun_setup(0, None);
+    g.fire_point = Vec3::new(1.281, 3.388, 3.372);
+    g.pivot = Vec3::ZERO;
+    g.eye = Vec3::new(1.0, 4.2, -8.3);
+    g.aimer.pitch = [-30.0 * DEG, 20.0 * DEG];
+    g.turn = Some(Turn::from_class(
+        Some([-180.0, 180.0]),
+        Some([-30.0, 20.0]),
+        (1.5, 1.0),
+        (10.0, 10.0),
+        Slew::Linear,
+    ));
+    g
+}
+
+/// The turret's own building as the bake builds it: a map body of the
+/// turret's instance (7) round `centre`.
+fn building(sc: &mut Scene, centre: Vec3, half: Vec3) {
+    use crate::collision::{Body, CollisionWorld, Shape};
+    let mut b = Body::new(glam::Mat4::from_translation(centre), Shape::Box { half });
+    b.instance = Some(7);
+    sc.s.collision = CollisionWorld::new(vec![b], Vec::new());
+    sc.s.vehicle_mut(sc.v).unwrap().instance = Some(7);
+}
+
+/// Hits on `e` by anyone, this tick.
+fn hits_on(s: &Sim, e: UnitHandle) -> usize {
+    s.events
+        .iter()
+        .filter(|ev| matches!(ev, crate::sim::Event::Hit { victim, .. } if *victim == e))
+        .count()
+}
+
+/// Card TAIM, merged into TURR: a bot in Mygeeto's recoilless turret, its
+/// building round the camera's eye, puts a bolt on a soldier 40 m in front
+/// within 5 s. On the branch before (33016bf) the barrel never came within
+/// 7 deg of a seen target on that map (`lead_tmp/turr/myg_dbg.txt`): the
+/// camera ray hit the building at the eye, the aimer turned the pivot's
+/// line onto the ray's point (3.4 m under the barrel), the muzzle was turned
+/// onto the pivot's axis and the look was steered from the eye.
+#[test]
+fn a_bot_in_a_recoilless_turret_hits_a_soldier_forty_metres_out() {
+    let mut sc = scene_with(
+        Vec3::new(3.0, 0.0, -3.0),
+        Vec3::new(2.0, 0.0, 40.0),
+        recoilless(),
+    );
+    building(&mut sc, Vec3::new(0.0, 3.0, -5.0), Vec3::new(3.0, 3.0, 6.0));
+    sit(&mut sc);
+    let e = sc.enemy;
+    let hit = until(&mut sc.s, 5 * HZ, |s| hits_on(s, e) > 0);
+    assert!(hit.is_some(), "no bolt hit the soldier in 5 s");
+}
+
+/// A gunner keeps to its turret's arc (OURS, card TURR): an enemy it holds
+/// in memory 12 m behind a turret whose arc is the front 120 degrees, and
+/// one it sees 35 m in front - it takes the one in front and hits him. On
+/// foot's choice (the nearer) left Kashyyyk's gunners holding the look at
+/// the limit of the arc (1 shot in 29 spells over 8 seeds).
+#[test]
+fn a_gunner_takes_the_target_inside_its_arc() {
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, -3.0),
+        Vec3::new(2.0, 0.0, 35.0),
+        0,
+        Some([-60.0, 60.0]),
+    );
+    let behind =
+        sc.s.spawn(&UnitSpec {
+            max_health: 1.0e9,
+            ..UnitSpec::trooper(1, Vec3::new(1.0, 0.0, -12.0))
+        })
+        .unwrap();
+    sit(&mut sc);
+    let (b, e) = (sc.bot, sc.enemy);
+    let mut hit = false;
+    for k in 0..5 * HZ {
+        // The one behind stays fresh in the gunner's memory, unseen.
+        let at = sc.s.unit(behind).unwrap().capsule().center();
+        let tick = sc.s.tick;
+        let st = &mut sc.s.units[b.index as usize].ai;
+        st.contacts[3] = Some(crate::perception::Contact {
+            handle: behind,
+            first_seen: 0,
+            last_seen: tick,
+            last_pos: at,
+            seen_now: false,
+            heard: false,
+        });
+        sc.s.step(&[]);
+        // From its first think in the seat (it may have seen him on foot).
+        if k > THINK_PERIOD {
+            assert_ne!(sc.s.unit(b).unwrap().ai.target, Some(behind), "tick {k}");
+        }
+        hit |= hits_on(&sc.s, e) > 0;
+    }
+    assert!(hit, "the soldier in front was never hit");
+}
+
+/// A gunner sees past its own building (card TURR): its muzzle inside the
+/// turret's map body, an enemy 30 m in front is a contact at the first
+/// think; the same body as a stranger's (instance 8) hides him.
+#[test]
+fn a_gunner_sees_out_of_its_own_building() {
+    for own in [true, false] {
+        let mut sc = scene(
+            Vec3::new(3.0, 0.0, -3.0),
+            Vec3::new(2.0, 0.0, 30.0),
+            0,
+            None,
+        );
+        building(&mut sc, Vec3::new(0.0, 3.0, 1.0), Vec3::new(2.0, 2.0, 2.0));
+        if !own {
+            sc.s.vehicle_mut(sc.v).unwrap().instance = Some(8);
+        }
+        sit(&mut sc);
+        let (b, e) = (sc.bot, sc.enemy);
+        let seen = until(&mut sc.s, 2 * HZ, |s| {
+            s.unit(b)
+                .unwrap()
+                .ai
+                .contacts
+                .iter()
+                .flatten()
+                .any(|c| c.handle == e && c.seen_now)
+        });
+        assert_eq!(seen.is_some(), own, "own building {own}");
+    }
+}
+
+/// Kashyyyk's case (card TURR): the recoilless turret on a 20 m tower whose
+/// deck runs 2 m out in front of it, a soldier on the ground 30 m out, ahead
+/// or 45 deg to the side - from the camera's eye, 8.3 m behind, the line to
+/// him crosses the deck; from the muzzle it does not. The gunner looks from
+/// its muzzle and hits him within 5 s.
+#[test]
+fn a_gunner_on_a_tower_hits_a_soldier_below() {
+    for at in [Vec3::new(2.0, 0.0, 30.0), Vec3::new(18.0, 0.0, 18.0)] {
+        tower_shot(at);
+    }
+}
+
+fn tower_shot(at: Vec3) {
+    use crate::collision::{Body, CollisionWorld, Shape};
+    let mut sc = scene_with(Vec3::new(3.0, 0.0, -3.0), at, recoilless());
+    sc.s.vehicle_mut(sc.v).unwrap().pos = Vec3::new(0.0, 20.0, 0.0);
+    sc.s.collision = CollisionWorld::new(
+        vec![Body::new(
+            glam::Mat4::from_translation(Vec3::new(0.0, 19.5, -4.0)),
+            Shape::Box {
+                half: Vec3::new(6.0, 0.5, 6.0),
+            },
+        )],
+        Vec::new(),
+    );
+    let eye = Vec3::new(1.0, 24.2, -8.3);
+    let him = sc.s.unit(sc.enemy).unwrap().capsule().center();
+    assert!(
+        !crate::perception::los(&sc.s, eye, him),
+        "the deck hides {at} from the eye"
+    );
+    sit(&mut sc);
+    let e = sc.enemy;
+    let hit = until(&mut sc.s, 5 * HZ, |s| hits_on(s, e) > 0);
+    assert!(hit.is_some(), "no bolt hit the soldier at {at} in 5 s");
+}

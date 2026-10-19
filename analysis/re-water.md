@@ -499,7 +499,7 @@ global white halved = unity. [V][O] — `re-water-colour.md` §0–§3; one Opus
   right" was too kind to the PORT. The match at 539306–539324 is an EXACT INDEX equality — `a local = z*grid + x` against `a local[1]*grid + *a local`, and `a local`
   (which becomes `a local[9]` = tile+0x24) stays 0.0 unless it breaks on equality — inside `FUN_004770a8`; the BF2 twin is `FUN_00561b58` 696884–696892, the same
   shape on `DAT_00661608`. The port instead dropped every wet cell whose CENTRE fell inside a patch's AABB, and each `LPTC INFO` box is its own cell padded by
-  half a cell on every side (MEASURED, exact, on all 13 shipped patches — `bake/tests/water_patch_cells.rs` asserts box == cell ± half, which also proves the
+  half a cell on every side (MEASURED, exact, on all 13 shipped patches — `bake/tests/suite/water_patch_cells.rs` asserts box == cell ± half, which also proves the
   i-th `LPTC` ↔ i-th bit-3 cell pairing geometrically), so the box reaches the eight neighbours' centres: **17 / 32 / 2 cells were removed where the disc marks
   4 / 8 / 1** (BF1 NAB2 / BF2 NAB2 / BF2 DEA1 — DEA1 drew no lattice cell at all), holes in the water beside every patch. Fixed by `Water::has_patch` (`WMAP`
   bit 3). Also measured there: a patch's triangles cover 13–96 % of the cell they replace, i.e. the "3–24 %" of §4's tile is that area over the twice-as-wide box.
@@ -511,7 +511,7 @@ global white halved = unity. [V][O] — `re-water-colour.md` §0–§3; one Opus
   the ELSE has a middle case §4 dropped. (3) **the ocean twin never reads +0x24 at all**: `FUN_0048b1e0` (550906–550917) routes to `FUN_0048b280` whenever `DAT_005647b8`
   (= `OceanEnable`, 0xa69c431a, set at 538984 — as §1 already noted) is non-zero, and that function's whole body (550922–551180) contains NO `0x24` reference; it branches
   on `DAT_005649c0` alone (551109, 551165). So "a patch replaces its cell" holds on the FLAT-water path only, and "an either/or in every sub-pass" is too strong. No shipped
-  ocean map ships a `CPAT` (both KAM1s: 0 patches, pinned by `bake/tests/water_patch_cells.rs`), so nothing in the port turns on it. Also from the verifier, and checked:
+  ocean map ships a `CPAT` (both KAM1s: 0 patches, pinned by `bake/tests/suite/water_patch_cells.rs`), so nothing in the port turns on it. Also from the verifier, and checked:
   the exact-match walk is a MERGE-JOIN over a cursor set once (539251) and only ever advanced (539311) — it is correct because the parser appends the `LPTC`s in row-major
   order (538776–538781), so "one patch per cell" is a property of the BUILDER as much as of the cull; and past +0x24 the two games' tile records differ (BF1 floats at
   +0x28/+0x2c and tests +0x2c at 551343; BF2 bytes at +0x28/+0x29 and tests +0x29 at 708770), which is why only +0x24 may be quoted as common. [O]

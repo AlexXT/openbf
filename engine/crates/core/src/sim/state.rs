@@ -658,6 +658,17 @@ pub struct NavStats {
     /// Card FFLN: bot-ticks a shot was withheld because a friend stood in
     /// the line of fire ([`crate::ai::NavTick::line_held`]). OUTPUT only.
     pub line_held: u64,
+    /// Card TPOS: the Tactician's queries, and those in which a candidate
+    /// with cover from the target passed its filters (B12's ceiling,
+    /// [`crate::ai::NavTick::tpos_query`]). OUTPUT only.
+    pub tpos_queries: u64,
+    pub tpos_ceiling: u64,
+    /// ...each `crate::ai::tactic::EV_*` bit's thinks, and (`[16]`) the
+    /// queries with a covered candidate that gave no covered pick (every
+    /// confirming ray shut). OUTPUT only.
+    pub tpos_ev: [u64; 17],
+    /// ...and `NavTick::tpos_funnel` summed. OUTPUT only.
+    pub tpos_funnel: [u64; 14],
     /// Phase D: squad commands ISSUED (one per accepted edge, whatever the
     /// number of bots that took it — `Event::Command` carries that). OUTPUT
     /// only, never hashed: the sweep's player is idle, so the acceptance reads
@@ -686,6 +697,15 @@ pub struct NavStats {
     pub ai_claims: u64,
     pub ai_claim_giveups: u64,
     pub ai_claim_lost: u64,
+    /// Card TURR: turret offers made (`ai::man::offer_pass`), bots that sat
+    /// down in a building turret, and per [`crate::ai::NavTick::man`] code
+    /// the gunners that left by exit rule 1-5 ([1..=5]) and the claims whose
+    /// walk did not reach the turret ([6]). OUTPUT only.
+    pub man_offers: u64,
+    /// ...of those, made on the defence clause alone. OUTPUT only.
+    pub man_defence_offers: u64,
+    pub man_boards: u64,
+    pub man_codes: [u64; 7],
     /// Disperse plans that had to drop their exclusions because the map did not
     /// offer enough distinct objectives (brief D5(d)). OUTPUT only — a fact
     /// about a two-post map, not something to tune away.

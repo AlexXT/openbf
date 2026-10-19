@@ -7,7 +7,7 @@
 //! Run `bake` with no arguments for the full usage table (tex-dump, pc-tex,
 //! map, common, classes, loadscreen, sounds, sound-names, global-sound, beep,
 //! specular, omniproj, soldier, weapon, vehicle, effects, locl, fonts). scripts/rebake.sh runs all of them
-//! over the extracted discs.
+//! over the extracted discs; `extract-iso` makes those (scripts/pack.py).
 
 use anyhow::{bail, Context, Result};
 use std::io::BufWriter;

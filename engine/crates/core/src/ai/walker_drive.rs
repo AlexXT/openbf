@@ -308,7 +308,7 @@ pub(super) fn drive(
             sticks: Some([p2, p3]),
             ..r
         });
-        super::gunner::aim(sim, me, st, &mut pad, look);
+        super::gunner::aim(sim, me, st, &mut pad, look, None);
         return (pad, nt);
     }
     let Some(gp) = goal.filter(|_| !at_post && !stuck) else {
@@ -337,7 +337,7 @@ pub(super) fn drive(
         ..r
     });
     st.steer = SteerPick::Fwd;
-    super::gunner::aim(sim, me, st, &mut pad, look);
+    super::gunner::aim(sim, me, st, &mut pad, look, None);
     stuck_window(sim, me, st, pos, p2 != 0.0, &mut nt);
     (pad, nt)
 }

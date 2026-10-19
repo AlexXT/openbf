@@ -21,6 +21,10 @@
 //! [`bake_locl`] (card EVMSG) writes the English `Locl` table of a game's
 //! CORE.LVL — the HUD's event lines, team, post and soldier names — as
 //! `locl/english.ron` under that game's common bake (`manifest::hud::HudLocl`).
+//!
+//! [`bake_fonts`] writes a CORE.LVL's bitmap fonts: [`bake_hud`] runs it for
+//! BF2, and `bake fonts <core> <out> <prefix>` for BF1, whose fonts go into the
+//! BF1 common bake as `bf1_<font>` (card SQHUD).
 
 use anyhow::{anyhow, Context, Result};
 use manifest::hud::{HudArg, HudFont, HudGlyph, HudIndex, HudLayout, HudLocl, HudNode};

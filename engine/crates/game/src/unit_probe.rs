@@ -84,6 +84,8 @@ pub enum Doing {
     Recover,
     /// Card SNPR: a sniper on its spot.
     Overwatch,
+    /// Card TURR: in a building turret's seat.
+    Man,
 }
 
 impl Doing {
@@ -101,6 +103,7 @@ impl Doing {
             Doing::Follow => "follow",
             Doing::Recover => "recover",
             Doing::Overwatch => "overwatch",
+            Doing::Man => "man",
         }
     }
 }
@@ -231,6 +234,24 @@ pub struct Probe {
     pub hold_commit: f32,
     #[serde(default)]
     pub hold_blocked: u8,
+    /// Card TPOS: the fight's mode (`FightState`: 0 none, 1 stand, 2 walk,
+    /// 3 pause, 4 move, 5 take = walking to a Tactician's position, 6 cover
+    /// = at it), the position held (a table index) and its point, bits (1
+    /// covered from the target when chosen, 2 firing, 4 lean -1, 8 lean +1),
+    /// hits taken at it and seconds to its phase's end (at it: the hide /
+    /// fire swap; walking there: the walk's deadline).
+    #[serde(default)]
+    pub fmode: u8,
+    #[serde(default)]
+    pub tpos: Option<u32>,
+    #[serde(default)]
+    pub tpos_at: [f32; 3],
+    #[serde(default)]
+    pub tpos_bits: u8,
+    #[serde(default)]
+    pub tpos_hits: u8,
+    #[serde(default)]
+    pub tpos_phase: f32,
     /// The enemy it has (a unit slot) and the range to it.
     pub target: i32,
     pub target_d: f32,
@@ -272,6 +293,7 @@ pub const LEGEND: &[(&str, &str)] = &[
     ("stop/stop_d/stop_n/body", "what shuts the way along walk_dir (the steering's own direction and floor): wall (a body, see names.bodies), barrier, hull, steep, drop; open = nothing, or the bot did not walk (walk 0). Schema 1 asked toward wp, walking or not"),
     ("hold", "2 holding a position, 1 owing hubs, 0 no"),
     ("hold_goal/hold_spot/hold_left/hold_side/hold_commit/hold_blocked", "a hold (hold 2): where it stands or steps to now, the position taken, seconds of dwell left, the side the last strafe went (0 none yet), seconds the goal is still committed, ticks the steering was turned off the line to the goal"),
+    ("fmode/tpos/tpos_at/tpos_bits/tpos_hits/tpos_phase", "card TPOS: the fight's mode (0 none 1 stand 2 walk 3 pause 4 move 5 take = walking to a Tactician's position 6 cover = at it); the position held (table index, null none) and its point; bits 1 covered from the target, 2 firing, 4 lean -1, 8 lean +1; hits taken at it; seconds to the phase's end (the hide / fire swap, or the walk's deadline)"),
     ("target/target_d", "the enemy unit slot and range"),
     ("stuck_t/stuck/stall", "ticks (30/s): progress window, no-progress run, no-net-progress watch"),
     ("lost/lost_tries", "off the level: 1 suspected 2 confirmed; jump tries"),
@@ -307,6 +329,7 @@ pub fn doing_of(b: core::ai::Behaviour) -> Doing {
         B::Follow => Doing::Follow,
         B::Recover => Doing::Recover,
         B::Overwatch => Doing::Overwatch,
+        B::Man => Doing::Man,
     }
 }
 
@@ -420,6 +443,27 @@ impl Probe {
             hold_side: live_hold.map_or(0, |h| h.strafe_side),
             hold_commit: live_hold.map_or(0.0, |h| secs_to(h.commit_until)),
             hold_blocked: live_hold.map_or(0, |h| h.blocked),
+            fmode: u.ai.fight.mode,
+            tpos: u.ai.tpos.held,
+            tpos_at: u
+                .ai
+                .tpos
+                .held
+                .and_then(|i| sim.positions.positions.get(i as usize))
+                .map_or([0.0; 3], |q| q.pos.to_array()),
+            tpos_bits: u8::from(u.ai.tpos.covered)
+                | (u8::from(u.ai.tpos.firing) << 1)
+                | match u.ai.tpos.lean {
+                    -1 => 4,
+                    1 => 8,
+                    _ => 0,
+                },
+            tpos_hits: u.ai.tpos.hits,
+            tpos_phase: u
+                .ai
+                .tpos
+                .held
+                .map_or(0.0, |_| secs_to(u.ai.tpos.phase_until)),
             target: u.ai.target.map_or(-1, |t| t.index as i32),
             target_d: u
                 .ai

@@ -22,6 +22,29 @@
 //! CORNER cover (shut at both heights, a [`LEAN`] step to a side has the
 //! lane: lean to fire). The rays are the bolt's (terrain + the map's own
 //! bodies, no vehicle hull), as perception's.
+//!
+//! The TACTICIAN (`analysis/bot-design.md` 4.6, [`fight`], [`choose`]) gives
+//! a fighting bot one position of the table: within 40 m on its storey, the
+//! 32 nearest with cover from the target inside the band and the 32 nearest
+//! within 8 m; yes / no filters (reserved or within [`SPACING`] of a
+//! reserved one, a body on it, a friend's line of fire, a grenade, a death
+//! region, over [`BACKWARD`] farther from its objective, outside the
+//! weapon's band grown [`BAND_GROW`]); three tries (cover from the target -
+//! something shut at crouch height that way within [`NEAR`], the line to
+//! fire along confirmed by the ray, `Position::shields_toward`, within
+//! [`COVER_REACH`]; any within 8 m; none = the bot's own FGHT style), each first with the team's
+//! positions and bodies [`SPREAD`] away (a grenade's blast, the maintainer's KAM1
+//! bunching) and then without; a score of cover with a line (3),
+//! nearness (2), cover from its other contacts (1) and its own bias (0.5);
+//! one confirming ray from the best down. Kept while reserved, covered as it
+//! was and in the band (re-scored every [`RESCORE`], the PS2's 5 s) and not
+//! hit twice; from an open one a covered one is asked for every 2 s; at it the PS2's hide / fire cycle
+//! (hidden 2-4 s, firing 2-6 s; re-soldier-ai 4.6) and another position
+//! after 5-12 s. RESERVATIONS: a position is the bot's from the write-back
+//! ([`grant`], unit-index order) to [`FREE_AFTER`] after it is left. The
+//! weights and times are OURS and PROVISIONAL. Not yet: Capture / Guard /
+//! Overwatch at positions, a turret seat as a position (card TPOS's next
+//! slice).
 
 use crate::fmath;
 use crate::nav;
@@ -45,6 +68,12 @@ pub const EDGE_OUT: f32 = 0.9;
 pub const HUB_RING: f32 = 0.7;
 /// A point is in a barrier when within this of it (m): the census's test.
 const IN_BARRIER: f32 = 0.3;
+/// An authored hint within [`IN_BARRIER`] of a soldier barrier is moved out
+/// of it by at most this (m) rather than dropped: Polis Massa's Cover hints
+/// are authored against the barriers round its props (172 of 210 were
+/// dropped, 112 of them outside the barrier proper), and the PS2's bots fight
+/// from them 48.6 % of their attack time (re-soldier-ai 4.6).
+const HINT_PUSH: f32 = 0.5;
 /// A floor this far from the storey asked for is another storey (m).
 const STOREY: f32 = 1.5;
 /// Head room over the floor (m), asked from 0.3 m up.
@@ -97,16 +126,41 @@ pub struct Position {
     pub low: u16,
     /// CORNER cover per direction.
     pub corner: u16,
+    /// Per direction, something shut at crouch-eye height within [`NEAR`]
+    /// (what hides a crouched soldier, whatever lies beyond it), and of
+    /// those the ones shut at stand-eye height too (fired round, not over).
+    pub shut: u16,
+    pub tall: u16,
 }
 
 impl Position {
-    /// Cover of either kind toward the direction `d` (XZ).
+    /// Cover of either kind toward the direction `d` (XZ): on either of the
+    /// two sector rays either side of it ([`sector_pair`]).
     pub fn covered_toward(&self, d: Vec2) -> bool {
-        (self.low | self.corner) & sector_bit(d) != 0
+        (self.low | self.corner) & sector_pair(d) != 0
     }
     /// Any cover at all.
     pub fn covered(&self) -> bool {
         self.low | self.corner != 0
+    }
+    /// Something shut at crouch height toward `d` within [`NEAR`]: the
+    /// position hides a soldier from a target that way (the line to fire
+    /// along is the Tactician's confirming ray, not the 30 m lane).
+    pub fn shields_toward(&self, d: Vec2) -> bool {
+        self.shut & sector_pair(d) != 0
+    }
+    /// The PS2's own cover test of an authored Cover hint
+    /// (`analysis/re-soldier-ai.md` 4.6, `FUN_002d1928`): its arrow points at
+    /// the target, `d` away, within 60 degrees. No ray - the hint's direction
+    /// is its only cover geometry.
+    pub fn hint_faces(&self, d: Vec2) -> bool {
+        self.source == Source::Cover && self.facing.dot(d.normalize_or_zero()) >= FACING_COS
+    }
+    /// Cover toward `d` for the Tactician: something shut at crouch height
+    /// that way ([`Self::shields_toward`]), or a Cover hint facing it
+    /// ([`Self::hint_faces`]).
+    pub fn hides_toward(&self, d: Vec2) -> bool {
+        self.shields_toward(d) || self.hint_faces(d)
     }
 }
 
@@ -118,6 +172,18 @@ pub fn sector_bit(d: Vec2) -> u16 {
     let a = fmath::atan2(d.y, d.x).rem_euclid(std::f32::consts::TAU);
     let k = (a / std::f32::consts::TAU * DIRS as f32).round() as usize % DIRS;
     1 << k
+}
+
+/// The bits of the two sector rays either side of direction `d` (one bit
+/// when it lies on a ray; 0 for a zero vector): the masks sample one ray per
+/// sector, and a direction between two is covered when either is.
+pub fn sector_pair(d: Vec2) -> u16 {
+    if d.length_squared() < 1e-8 {
+        return 0;
+    }
+    let a = fmath::atan2(d.y, d.x).rem_euclid(std::f32::consts::TAU);
+    let x = a / std::f32::consts::TAU * DIRS as f32;
+    (1 << (x.floor() as usize % DIRS)) | (1 << (x.ceil() as usize % DIRS))
 }
 
 /// What the build did, per source: points tried, standable, covered.
@@ -247,9 +313,9 @@ impl Builder<'_> {
         Some(f)
     }
 
-    /// The (LOW, CORNER) masks at floor point `p`.
-    fn sectors(&mut self, p: Vec3) -> (u16, u16) {
-        let (mut low, mut corner) = (0u16, 0u16);
+    /// The (LOW, CORNER, shut, tall) masks at floor point `p`.
+    fn sectors(&mut self, p: Vec3) -> (u16, u16, u16, u16) {
+        let (mut low, mut corner, mut shut, mut tall) = (0u16, 0u16, 0u16, 0u16);
         let c = p + Vec3::Y * CROUCH_EYE;
         let s = p + Vec3::Y * STAND_EYE;
         for k in 0..DIRS {
@@ -258,11 +324,13 @@ impl Builder<'_> {
             if self.clear(c, d, NEAR) {
                 continue;
             }
+            shut |= 1 << k;
             if self.clear(s, d, NEAR) {
                 if self.clear(s, d, LANE) {
                     low |= 1 << k;
                 }
             } else {
+                tall |= 1 << k;
                 let side = Vec3::new(-d.z, 0.0, d.x);
                 for sg in [-1.0f32, 1.0] {
                     if self.clear(s, side * sg, LEAN) && self.clear(s + side * (LEAN * sg), d, LANE)
@@ -273,7 +341,30 @@ impl Builder<'_> {
                 }
             }
         }
-        (low, corner)
+        (low, corner, shut, tall)
+    }
+
+    /// `p` (XZ) moved out of every soldier barrier grown [`IN_BARRIER`] it is
+    /// in, along the nearer face, when that is at most [`HINT_PUSH`] in all.
+    fn out_of_barriers(&self, p: Vec2) -> Option<Vec2> {
+        let m = IN_BARRIER + 0.05;
+        let mut q = p;
+        for _ in 0..3 {
+            let Some(b) = self
+                .g
+                .barriers
+                .iter()
+                .find(|b| b.enabled && b.stops(nav::SOLDIER) && b.contains_r(q, IN_BARRIER))
+            else {
+                return (q.distance(p) <= HINT_PUSH).then_some(q);
+            };
+            let d = q - b.centre;
+            let l = [d.dot(b.axes[0]), d.dot(b.axes[1])];
+            let over = [b.half.x + m - l[0].abs(), b.half.y + m - l[1].abs()];
+            let k = usize::from(over[1] < over[0]);
+            q += b.axes[k] * (over[k] * if l[k] < 0.0 { -1.0 } else { 1.0 });
+        }
+        None
     }
 
     /// The floor of the hub nearest (x, z) in XZ within [`EDGE_HUB`].
@@ -321,9 +412,11 @@ pub fn build(sim: &Sim) -> PositionTable {
     let mut stats = TableStats::default();
     let mut out: Vec<Position> = Vec::new();
     let mut push = |b: &mut Builder, stats: &mut TableStats, mut q: Position| {
-        let (low, corner) = b.sectors(q.pos);
+        let (low, corner, shut, tall) = b.sectors(q.pos);
         q.low = low;
         q.corner = corner;
+        q.shut = shut;
+        q.tall = tall;
         q.hub = b.hub_of(q.pos);
         let s = q.source as usize;
         stats.standable[s] += 1;
@@ -339,6 +432,8 @@ pub fn build(sim: &Sim) -> PositionTable {
         hub: u16::MAX,
         low: 0,
         corner: 0,
+        shut: 0,
+        tall: 0,
     };
     for h in &g.hints {
         let source = match h.kind {
@@ -347,15 +442,27 @@ pub fn build(sim: &Sim) -> PositionTable {
             _ => continue,
         };
         stats.tried[source as usize] += 1;
-        let f = b.stand(h.pos.x, h.pos.z, h.pos.y).or_else(|| {
-            b.hub_floor_near(h.pos.x, h.pos.z)
-                .and_then(|y| b.stand(h.pos.x, h.pos.z, y))
-        });
-        let Some(f) = f else {
+        let at = |b: &mut Builder, p: Vec2| {
+            b.stand(p.x, p.y, h.pos.y)
+                .or_else(|| {
+                    b.hub_floor_near(p.x, p.y)
+                        .and_then(|y| b.stand(p.x, p.y, y))
+                })
+                .map(|f| Vec3::new(p.x, f, p.y))
+        };
+        let xz0 = Vec2::new(h.pos.x, h.pos.z);
+        let p = match at(&mut b, xz0) {
+            Some(p) => Some(p),
+            None => b
+                .out_of_barriers(xz0)
+                .filter(|q| *q != xz0)
+                .and_then(|q| at(&mut b, q)),
+        };
+        let Some(p) = p else {
             continue;
         };
         let ahead = Vec2::new(h.rows[2][0], h.rows[2][2]);
-        let mut q = blank(Vec3::new(h.pos.x, f, h.pos.z), source);
+        let mut q = blank(p, source);
         q.facing = ahead.try_normalize().unwrap_or(Vec2::ZERO);
         q.stance = h.stance_mask;
         q.stance2 = h.secondary_stance_mask;
@@ -414,6 +521,831 @@ pub fn build(sim: &Sim) -> PositionTable {
     PositionTable::index(out, stats)
 }
 
+// ── The Tactician (`analysis/bot-design.md` 4.6; OURS, the weights and
+// times PROVISIONAL): asked with a bot and the target it fights, it answers
+// one position of the table or none — the candidates near the bot, yes / no
+// filters, three tries (cover from the target; any; none = the caller's own
+// fight from where it stands), a score of non-negative terms, one confirming
+// ray from the best down. The answer is kept while its conditions hold; at
+// it the bot runs the PS2's hide / fire cycle (re-soldier-ai 4.6) and looks
+// for another position after 5-12 s.
+
+/// A position stays reserved this long after it is left (ticks): the PS2's
+/// hint rule.
+pub const FREE_AFTER: u64 = 2 * crate::TICK_HZ as u64;
+/// No two bots hold positions closer than this (m).
+pub const SPACING: f32 = 2.0;
+/// ...and a team's fighters hold them this far apart where the place allows
+/// (m; the maintainer's KAM1 bunching, 2026-10-04: a grenade's blast apart) - BF2's
+/// thermal detonator explosion's DamageRadiusInner (`com_weap_inf_
+/// thermaldetonator_exp`, key 3738439158 = 4.5; Outer 6.5).
+pub const SPREAD: f32 = 4.5;
+/// Candidates within this of the bot (m; and within the weapon's range)...
+pub const SEARCH: f32 = 40.0;
+/// ...the nearest this many.
+pub const CANDIDATES: usize = 32;
+/// A position no more than this farther from the bot's objective than the
+/// bot is (m): the PS2's band move.
+pub const BACKWARD: f32 = 15.0;
+/// The weapon's band is grown by this (m).
+pub const BAND_GROW: f32 = 5.0;
+/// Another unit on foot within this of a position stands on it (m).
+const CROWD: f32 = 1.5;
+/// A position within this of a friend's line of fire is in it (m).
+const LINE: f32 = 1.0;
+/// A Cover hint's arrow points at the target within 60 degrees.
+const FACING_COS: f32 = 0.5;
+/// The cycle (ticks): hidden 2-4 s, firing 2-6 s; another position after
+/// 5-12 s (re-soldier-ai 4.6).
+const HIDE: (u64, u64) = (60, 120);
+const FIRE: (u64, u64) = (60, 180);
+const NEXT: (u64, u64) = (150, 360);
+/// A position more than this above or below the bot is walked onto only
+/// when its floor is its hub's (m).
+const CLIMB: f32 = 1.2;
+/// A walk to a position is given until its straight length at this speed
+/// (m/s) and this slack (s): a soldier runs 6-7 m/s.
+const TAKE_SPEED: f32 = 3.0;
+const TAKE_SLACK: f32 = 3.0;
+/// A query that found nothing is not asked again for this long (ticks).
+const RETRY: u64 = 2 * crate::TICK_HZ as u64;
+/// Confirming rays from the best candidates down, at most.
+const CONFIRM: usize = 3;
+/// A position with no cover from the target (the second try) is taken only
+/// this near (m): spacing in the open, not a walk...
+const OPEN_REACH: f32 = 8.0;
+/// ...and only on the bot's own surface, within a step of its height (m):
+/// an open point on a ledge's lip was hopped at (the maintainer's Kamino scene).
+const STEP: f32 = 0.6;
+/// A walk to a position ends this near it (m), where the bot is...
+const ARRIVE_NEAR: f32 = 1.0;
+/// ...and one cut short (its deadline, the mover's give-up) this near and
+/// within [`STEP`] of its height is arrived where the bot stopped (m; B12's
+/// own radius, `covered_from_target`); an open position this near is taken
+/// where the bot stands, with no walk.
+pub const NEAR_ENOUGH: f32 = LEAN + 0.5;
+/// On the last [`OPEN_REACH`] of a walk to a position, the walk comes this
+/// much nearer (m) within [`GAIN_TICKS`] or it is cut short (`cut_short`): a
+/// position walked round is left (bots slid along a pod's flank for the
+/// whole deadline at a point on its lip, the maintainer's Kamino scene).
+pub const GAIN: f32 = 0.3;
+const GAIN_TICKS: u64 = crate::TICK_HZ as u64;
+/// Another position, when one is left, is at least this far from it (m): a
+/// move, not a twitch - bots hopped 0.6-1.5 m between neighbouring points,
+/// 7-9 reversals in 10 s (the maintainer's Kamino scene, card TPOS). A target gone
+/// round the cover may send it to any.
+const MOVE_MIN: f32 = 3.0;
+/// A position held is re-scored (the target round its cover, out of the
+/// band) this often (ticks): the PS2's 5 s (re-soldier-ai 4.6). Asked on
+/// every think, a walk to a covered position was re-picked whenever the
+/// target's bearing left its 22.5-degree sector (card TPOS).
+const RESCORE: u64 = 5 * crate::TICK_HZ as u64;
+/// A position with cover from the target is walked to only this far (m):
+/// with the farthest of the box's 40 m the fight changed before the bot got
+/// there (the maintainer's Kamino scene went to 1 bot over 6 reversals).
+const COVER_REACH: f32 = 15.0;
+
+/// The fight-time split's events (`NavTick::tpos_ev`, one bit each): the
+/// query's answer...
+pub const EV_PICK_COVERED: u16 = 1 << 0;
+pub const EV_PICK_OPEN: u16 = 1 << 1;
+pub const EV_PICK_NONE: u16 = 1 << 2;
+/// ...why the position held is left (the target round its cover, hit twice,
+/// out of the band, the 5-12 s timer)...
+pub const EV_LEAVE_ROUND: u16 = 1 << 3;
+pub const EV_LEAVE_HIT: u16 = 1 << 4;
+pub const EV_LEAVE_BAND: u16 = 1 << 5;
+pub const EV_LEAVE_TIMER: u16 = 1 << 6;
+/// ...the timer's query found nothing and the position is kept...
+pub const EV_KEEP_TIMER: u16 = 1 << 7;
+/// ...and how a walk to one ends: there, short but near enough, failed by
+/// its deadline, by no progress, by the mover's give-up, dropped (the fight
+/// over, a vehicle for a target, the endgame); an open one taken in place.
+pub const EV_WALK_ARRIVED: u16 = 1 << 8;
+pub const EV_WALK_NEAR: u16 = 1 << 9;
+pub const EV_WALK_DEADLINE: u16 = 1 << 10;
+pub const EV_WALK_STALLED: u16 = 1 << 11;
+pub const EV_WALK_GIVEN_UP: u16 = 1 << 12;
+pub const EV_WALK_DROPPED: u16 = 1 << 13;
+pub const EV_IN_PLACE: u16 = 1 << 14;
+/// ...and a bot at an open position that found a covered one.
+pub const EV_UPGRADE: u16 = 1 << 15;
+
+/// The names, in bit order (the sweep's `tactician` line).
+pub const EV_NAMES: [&str; 16] = [
+    "pick-covered",
+    "pick-open",
+    "pick-none",
+    "leave-round",
+    "leave-hit",
+    "leave-band",
+    "leave-timer",
+    "keep-timer",
+    "walk-arrived",
+    "walk-near",
+    "walk-deadline",
+    "walk-stalled",
+    "walk-given-up",
+    "walk-dropped",
+    "in-place",
+    "upgrade",
+];
+
+use super::behave::Tick;
+use super::draw::{unit_unit, SALT_TPOS};
+use super::state::{AiState, FightState, HoldState, NavTick};
+use crate::unit::Unit;
+
+/// The Tactician's answer: a table index, whether it has cover from the
+/// target, and a CORNER position's lean side.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Pick {
+    pub idx: u32,
+    pub covered: bool,
+    pub lean: i8,
+}
+
+/// A draw in `lo..hi` ticks.
+fn span(me: crate::unit::UnitHandle, tick: u64, salt: u32, (lo, hi): (u64, u64)) -> u64 {
+    lo + ((hi - lo) as f32 * unit_unit(me.index, tick, me.gen, SALT_TPOS ^ salt)) as u64
+}
+
+/// The weapon's band about its target, grown by [`BAND_GROW`] (m): inner =
+/// min(optimal, min + 3), outer = min(max(optimal, range - 10), view - 10)
+/// (re-soldier-ai 4.5).
+fn band(tk: &Tick) -> (f32, f32) {
+    let [lo, opt, max] = tk.wc.ai_range;
+    let view = crate::perception::view_distance(crate::soldier::Stance::Stand, tk.tier.view_mult);
+    (
+        opt.min(lo + 3.0) - BAND_GROW,
+        opt.max(max - 10.0).min(view - 10.0) + BAND_GROW,
+    )
+}
+
+fn xz(v: Vec3) -> Vec2 {
+    Vec2::new(v.x, v.z)
+}
+
+/// The point a bot standing at `at` fires from toward `aim`: its standing
+/// eye, a CORNER position's a [`LEAN`] step to `lean`'s side.
+fn firing_eye(at: Vec3, aim: Vec3, lean: i8) -> Vec3 {
+    let d = xz(aim - at).normalize_or_zero();
+    let side = Vec3::new(-d.y, 0.0, d.x) * (LEAN * f32::from(lean));
+    at + side + Vec3::Y * crate::unit::muzzle_height(crate::soldier::Stance::Stand)
+}
+
+/// Is the line from `from` to `to` open (terrain and the map's bodies)?
+fn line_open(sim: &Sim, from: Vec3, to: Vec3) -> bool {
+    crate::perception::los_terrain(sim, from, to) && crate::perception::los_world(sim, from, to)
+}
+
+/// The Tactician: the position for bot `tk` fighting `target`. `leaving` =
+/// the one it leaves, left out, and with it every position within
+/// [`MOVE_MIN`] of it unless `.1` (the target went round its cover).
+/// `cover_only_tries` = only the tries with cover from the target (a bot at
+/// an open position asking for better). `None` = nothing passes.
+pub(super) fn choose(
+    sim: &Sim,
+    tk: &Tick,
+    st: &AiState,
+    target: &Unit,
+    leaving: Option<(u32, bool)>,
+    cover_only_tries: bool,
+    nt: &mut NavTick,
+) -> Option<Pick> {
+    nt.tpos_query = 1;
+    let t = &sim.positions;
+    if t.is_empty() {
+        return None;
+    }
+    let Tick { me, u, wc, .. } = *tk;
+    let pos = u.soldier.pos;
+    let aim = target.soldier.pos;
+    let chest = target.muzzle();
+    let (inner, outer) = band(tk);
+    let mut near = Vec::new();
+    t.within(
+        pos,
+        SEARCH.min(wc.ai_range[2].max(inner + BAND_GROW)),
+        &mut near,
+    );
+    // On the bot's storey, and walkable onto: a floor more than a step off
+    // both the bot's and its hub's (a hint on top of a crate) is jumped at.
+    let walkable = |q: &Position| {
+        let dy = (q.pos.y - pos.y).abs();
+        dy <= super::HUB_LEVEL_TOL
+            && (dy <= CLIMB
+                || sim
+                    .nav_floor(q.hub)
+                    .is_some_and(|f| (q.pos.y - f).abs() <= CLIMB))
+    };
+    // Cover from the target: something shut at crouch height that way, or a
+    // Cover hint by the PS2's rule (re-soldier-ai 4.6) - facing the target
+    // and on the bot's side of it, (H - T).(T - me) < 0.
+    let covers = |q: &Position| {
+        let d = xz(aim - q.pos);
+        q.shut & sector_pair(d) != 0 || (q.hint_faces(d) && (-d).dot(xz(aim - pos)) < 0.0)
+    };
+    let funnel = |near: &[u32]| {
+        near.iter()
+            .filter(|&&i| covers(&t.positions[i as usize]))
+            .count()
+            .min(255) as u8
+    };
+    nt.tpos_funnel[0] = funnel(&near);
+    let exclude = leaving.map(|l| l.0);
+    let away = leaving
+        .filter(|l| !l.1)
+        .and_then(|l| t.positions.get(l.0 as usize))
+        .map(|q| q.pos);
+    near.retain(|&i| {
+        let q = &t.positions[i as usize];
+        Some(i) != exclude
+            && !st.tpos.bad.contains(&Some(i))
+            && walkable(q)
+            && away.is_none_or(|a| nav::xz_dist(q.pos, a) >= MOVE_MIN)
+    });
+    let dist = |i: u32| nav::xz_dist(t.positions[i as usize].pos, pos);
+    near.sort_by(|a, b| dist(*a).total_cmp(&dist(*b)).then(a.cmp(b)));
+    nt.tpos_funnel[1] = funnel(&near);
+    // The nearest CANDIDATES with cover from the target inside the band, and
+    // the nearest CANDIDATES within the open try's reach - the PS2 takes 30
+    // Cover hints of its box (re-soldier-ai 4.6). The 32 nearest of every
+    // kind held 5.0 of Mygeeto's 42.6 covered candidates a query: the hub
+    // points round the bot crowded them out (card TPOS).
+    {
+        let in_band = |i: u32| {
+            let d = nav::xz_dist(t.positions[i as usize].pos, aim);
+            d >= inner && d <= outer
+        };
+        let (mut cov, mut open) = (0, 0);
+        near.retain(|&i| {
+            let keep_cov = covers(&t.positions[i as usize]) && in_band(i) && cov < CANDIDATES;
+            let keep_open = dist(i) <= OPEN_REACH && open < CANDIDATES;
+            cov += usize::from(keep_cov);
+            open += usize::from(keep_open && !keep_cov);
+            keep_cov || keep_open
+        });
+    }
+    nt.tpos_funnel[2] = funnel(&near);
+    // Reserved points, the bodies standing about, the friends' lines.
+    // (point, a teammate's)
+    let mut taken: Vec<(Vec3, bool)> = Vec::new();
+    let mut bodies: Vec<(Vec3, bool)> = Vec::new();
+    let mut lines: Vec<(Vec3, Vec3)> = Vec::new();
+    for (h, o) in sim.alive_units() {
+        if h == me {
+            continue;
+        }
+        let ts = &o.ai.tpos;
+        for (i, until) in [(ts.held, ts.until), (ts.prev, ts.prev_until)] {
+            if let Some(q) = i
+                .filter(|_| until > sim.tick)
+                .and_then(|i| t.positions.get(i as usize))
+            {
+                taken.push((q.pos, o.team == u.team));
+            }
+        }
+        if o.mount.is_none() && nav::xz_dist(o.soldier.pos, pos) <= SEARCH + CROWD {
+            bodies.push((o.soldier.pos, o.team == u.team));
+            if o.team == u.team {
+                if let Some(c) =
+                    o.ai.target
+                        .and_then(|th| crate::perception::contact_of(&o.ai, th))
+                        .filter(|c| c.seen_now)
+                {
+                    lines.push((o.muzzle(), c.last_pos + Vec3::Y));
+                }
+            }
+        }
+    }
+    let objective = st
+        .target_cp
+        .and_then(|c| sim.cps.get(c as usize))
+        .map(|cp| cp.def.pos);
+    let near_seg = |p: Vec3, (a, b): (Vec3, Vec3)| {
+        let (a, b, p) = (xz(a), xz(b), xz(p));
+        let ab = b - a;
+        let k = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+        (a + ab * k).distance(p) < LINE
+    };
+    // The first filter position `i` fails (1 ..= 7), else 0.
+    let fails = |i: u32| -> usize {
+        let q = &t.positions[i as usize];
+        let p = q.pos;
+        let d = nav::xz_dist(p, aim);
+        if !(d >= inner && d <= outer) {
+            1
+        } else if taken.iter().any(|r| nav::xz_dist(r.0, p) < SPACING) {
+            2
+        } else if bodies.iter().any(|b| nav::xz_dist(b.0, p) < CROWD) {
+            3
+        } else if lines.iter().any(|l| near_seg(p, *l)) {
+            4
+        } else if !objective.is_none_or(|o| nav::xz_dist(p, o) <= nav::xz_dist(pos, o) + BACKWARD) {
+            5
+        } else if sim
+            .hazards
+            .iter()
+            .any(|z| nav::xz_dist(z.pos, p) < z.radius)
+            || sim.death_regions.iter().any(|r| r.contains(p + Vec3::Y))
+        {
+            6
+        // The walk there crosses no soldier barrier (the design's
+        // segment the Tactician validated, 4.7): a position behind one
+        // was walked at and failed, again and again (the maintainer's Kamino
+        // scene, card TPOS).
+        } else if !sim
+            .nav
+            .as_ref()
+            .is_none_or(|g| g.barrier_stop(xz(pos), xz(p), nav::SOLDIER) >= 1.0)
+        {
+            7
+        } else {
+            0
+        }
+    };
+    for &i in &near {
+        if covers(&t.positions[i as usize]) {
+            let f = fails(i);
+            if f != 0 {
+                nt.tpos_funnel[2 + f] = nt.tpos_funnel[2 + f].saturating_add(1);
+            }
+        }
+    }
+    near.retain(|&i| fails(i) == 0);
+    nt.tpos_funnel[10] = funnel(&near);
+    let others: Vec<Vec3> = st
+        .contacts
+        .iter()
+        .flatten()
+        .filter(|c| Some(c.handle) != st.target)
+        .map(|c| c.last_pos)
+        .collect();
+    if near.iter().any(|&i| covers(&t.positions[i as usize])) {
+        nt.tpos_query = 2;
+    }
+    // A teammate's position or body within SPREAD.
+    let crowded = |p: Vec3| {
+        taken
+            .iter()
+            .chain(&bodies)
+            .any(|(r, mate)| *mate && nav::xz_dist(*r, p) < SPREAD)
+    };
+    let tries: &[(bool, bool)] = if cover_only_tries {
+        &[(true, true), (true, false)]
+    } else {
+        &[(true, true), (true, false), (false, true), (false, false)]
+    };
+    for &(cover_only, wide) in tries {
+        let mut scored: Vec<(f32, u32, bool)> = Vec::new();
+        for &i in &near {
+            let q = &t.positions[i as usize];
+            if wide && crowded(q.pos) {
+                continue;
+            }
+            let d = xz(aim - q.pos);
+            let travel = nav::xz_dist(pos, q.pos);
+            let bit = sector_pair(d);
+            let cov = covers(q);
+            // In the open only a step away: spacing, not a walk.
+            if (cover_only && !cov)
+                || (cover_only && travel > COVER_REACH)
+                || (!cover_only && travel > OPEN_REACH)
+                || (!cov && (q.pos.y - pos.y).abs() > STEP)
+                || (travel <= OPEN_REACH && !no_drop(sim, pos, q.pos))
+            {
+                if cover_only && cov && !wide {
+                    nt.tpos_funnel[11] = nt.tpos_funnel[11].saturating_add(1);
+                }
+                continue;
+            }
+            let mut cover = 0.0;
+            if cov {
+                // A lane the table found: LOW over it, CORNER round it; else
+                // only the confirming ray will say (crouch-shut only).
+                cover = if q.low & bit != 0 {
+                    1.0
+                } else if q.corner & bit != 0 {
+                    0.8
+                } else {
+                    0.6
+                };
+                if q.source == Source::Cover && q.facing.dot(d.normalize_or_zero()) >= FACING_COS {
+                    cover += 0.2;
+                }
+            }
+            let near_term = (1.0 - travel / SEARCH).max(0.0);
+            let other = if others.is_empty() {
+                0.0
+            } else {
+                others
+                    .iter()
+                    .filter(|o| q.shields_toward(xz(**o - q.pos)))
+                    .count() as f32
+                    / others.len() as f32
+            };
+            let bias = unit_unit(me.index, u64::from(i), me.gen, SALT_TPOS);
+            scored.push((3.0 * cover + 2.0 * near_term + other + 0.5 * bias, i, cov));
+        }
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        for &(_, i, cov) in scored.iter().take(CONFIRM) {
+            let q = &t.positions[i as usize];
+            // Fired over (shut low, open at stand height) or round (tall).
+            let bit = sector_pair(xz(aim - q.pos));
+            let corner = cov && q.shut & bit != 0 && q.shut & !q.tall & bit == 0;
+            let sides: &[i8] = if corner { &[1, -1] } else { &[0] };
+            if let Some(&lean) = sides
+                .iter()
+                .find(|&&s| line_open(sim, firing_eye(q.pos, aim, s), chest))
+            {
+                return Some(Pick {
+                    idx: i,
+                    covered: cov,
+                    lean,
+                });
+            }
+            if cover_only && !wide {
+                nt.tpos_funnel[12] = nt.tpos_funnel[12].saturating_add(1);
+            }
+        }
+        if cover_only && !wide {
+            nt.tpos_funnel[13] = scored.len().min(255) as u8;
+        }
+    }
+    None
+}
+
+/// The straight way from `from` to `to` drops nowhere more than a [`STEP`]
+/// below both ends (the floor sampled at its quarters): a point on a pod's
+/// lip, a step up from the bot on its ramp, was walked at off the ramp's
+/// edge and slid under (the maintainer's Kamino scene, kam_bldg_pod2).
+fn no_drop(sim: &Sim, from: Vec3, to: Vec3) -> bool {
+    let (top, low) = (from.y.max(to.y), from.y.min(to.y) - STEP);
+    (1..4).all(|k| {
+        let s = from.lerp(to, k as f32 / 4.0);
+        sim.ground_point_under(Vec3::new(s.x, top, s.z), false) >= low
+    })
+}
+
+/// Leave the position held (if any): it stays reserved [`FREE_AFTER`].
+pub(super) fn release(st: &mut AiState, tick: u64) {
+    if let Some(i) = st.tpos.held.take() {
+        st.tpos.prev = Some(i);
+        st.tpos.prev_until = tick + FREE_AFTER;
+    }
+    if st.fight.tactician() {
+        st.fight.mode = 0;
+    }
+}
+
+/// The walk to the position held failed (its way is shut): it is left, not
+/// asked for again by this bot, and nothing is asked for [`RETRY`].
+pub(super) fn failed(st: &mut AiState, tick: u64) {
+    if st.tpos.held.is_some() {
+        st.tpos.bad.rotate_right(1);
+        st.tpos.bad[0] = st.tpos.held;
+    }
+    release(st, tick);
+    st.tpos.retry_at = tick + RETRY;
+}
+
+/// Take position `p`: walk to it over the graph (as a ring point), or be
+/// there (an open one within [`NEAR_ENOUGH`]: where the bot stands).
+fn take(sim: &Sim, tk: &Tick, st: &mut AiState, h: &mut HoldState, p: Pick, nt: &mut NavTick) {
+    let now = sim.tick;
+    if st.tpos.held != Some(p.idx) {
+        release(st, now);
+    }
+    let q = sim.positions.positions[p.idx as usize];
+    st.tpos.held = Some(p.idx);
+    st.tpos.at = now;
+    st.tpos.rescore_at = now + RESCORE;
+    st.tpos.until = now + FREE_AFTER;
+    st.tpos.covered = p.covered;
+    st.tpos.lean = p.lean;
+    st.tpos.hits = 0;
+    st.tpos.firing = false;
+    h.spot = q.pos;
+    h.goal = q.pos;
+    h.stance_mask = 0;
+    h.commit_until = now + super::HOLD_COMMIT;
+    h.blocked = 0;
+    let here = tk.u.soldier.pos;
+    let travel = nav::xz_dist(here, q.pos);
+    st.tpos.stand = q.pos;
+    if travel <= super::HOLD_ARRIVE || (!p.covered && travel <= NEAR_ENOUGH) {
+        if travel > super::HOLD_ARRIVE {
+            st.tpos.stand = here;
+        }
+        nt.tpos_ev |= EV_IN_PLACE;
+        arrive(sim, tk, st, h);
+    } else {
+        st.fight.mode = FightState::TAKE;
+        st.tpos.best = travel;
+        st.tpos.best_at = now;
+        // (On the way, `phase_until` is the walk's deadline.)
+        st.tpos.phase_until =
+            now + ((travel / TAKE_SPEED + TAKE_SLACK) * crate::TICK_HZ as f32) as u64;
+        super::route::retarget_board(sim, tk.me, st, q.pos, nt);
+    }
+}
+
+/// The walk to the position held ended short of it (its deadline, the
+/// mover's give-up, or [`ARRIVE_NEAR`] on a think): within [`NEAR_ENOUGH`]
+/// and a [`STEP`] of its height it is arrived where the bot stands (`true`),
+/// else the walk failed ([`failed`]).
+pub(super) fn cut_short(sim: &Sim, tk: &Tick, st: &mut AiState, h: &mut HoldState) -> bool {
+    let here = tk.u.soldier.pos;
+    let near = st
+        .tpos
+        .held
+        .and_then(|i| sim.positions.positions.get(i as usize))
+        .is_some_and(|q| {
+            nav::xz_dist(here, q.pos) <= NEAR_ENOUGH && (here.y - q.pos.y).abs() <= STEP
+        });
+    if near {
+        st.tpos.stand = here;
+        arrive(sim, tk, st, h);
+    } else {
+        failed(st, sim.tick);
+    }
+    near
+}
+
+/// The mover's walk ended at its goal: there, when it is within
+/// [`NEAR_ENOUGH`] and a [`STEP`] of the position held (`true`) - else the
+/// outcome is the walk's to the position before (a covered one taken on the
+/// think the bot arrived at an open one), and the walk goes on (a bot held
+/// 2.4 m under a ledge's point in its cycle, 17 reversals in 10 s: the maintainer's
+/// Kamino scene).
+pub(super) fn walk_arrived(sim: &Sim, tk: &Tick, st: &mut AiState, h: &mut HoldState) -> bool {
+    let here = tk.u.soldier.pos;
+    let near = st
+        .tpos
+        .held
+        .and_then(|i| sim.positions.positions.get(i as usize))
+        .is_some_and(|q| {
+            nav::xz_dist(here, q.pos) <= NEAR_ENOUGH && (here.y - q.pos.y).abs() <= STEP
+        });
+    if near {
+        st.tpos.stand = here;
+        arrive(sim, tk, st, h);
+    }
+    near
+}
+
+/// At the position: its cycle starts hidden (firing at once from one with no
+/// cover), and another is looked for after 5-12 s.
+pub(super) fn arrive(sim: &Sim, tk: &Tick, st: &mut AiState, h: &mut HoldState) {
+    let now = sim.tick;
+    st.fight.mode = FightState::COVER;
+    st.tpos.firing = !st.tpos.covered;
+    st.tpos.phase_until = now + span(tk.me, now, 1, if st.tpos.firing { FIRE } else { HIDE });
+    st.tpos.next_at = now + span(tk.me, now, 2, NEXT);
+    cycle(sim, tk, st, h, None);
+}
+
+/// The hide / fire cycle at the position: LOW cover crouched, then standing
+/// to fire; CORNER cover standing behind it, then a lean step out; no cover,
+/// firing in the bot's own stance (`crouches`, its fixed style).
+fn cycle(sim: &Sim, tk: &Tick, st: &mut AiState, h: &mut HoldState, aim: Option<Vec3>) {
+    use crate::commander::{MASK_CROUCH, MASK_STAND};
+    let now = sim.tick;
+    if st
+        .tpos
+        .held
+        .and_then(|i| sim.positions.positions.get(i as usize))
+        .is_none()
+    {
+        return;
+    }
+    if st.tpos.covered && now >= st.tpos.phase_until {
+        st.tpos.firing = !st.tpos.firing;
+        let w = if st.tpos.firing { FIRE } else { HIDE };
+        st.tpos.phase_until = now + span(tk.me, now, 1, w);
+    }
+    let at = st.tpos.stand;
+    h.spot = at;
+    h.goal = at;
+    h.stance_mask = match (st.tpos.covered, st.tpos.lean) {
+        (false, _) => h.stance_mask,
+        (true, 0) if st.tpos.firing => MASK_STAND,
+        (true, 0) => MASK_CROUCH,
+        (true, _) => MASK_STAND,
+    };
+    if let (true, Some(aim), true) = (st.tpos.covered && st.tpos.lean != 0, aim, st.tpos.firing) {
+        let eye = firing_eye(at, aim, st.tpos.lean);
+        h.goal = Vec3::new(eye.x, at.y, eye.z);
+    }
+}
+
+/// Card TPOS: the fight's position from the Tactician, this tick (`true`)
+/// — or `false` for the caller's own rule (FGHT's stand or circle: no table,
+/// a vehicle for a target, or nothing passed). Asked on the think; kept
+/// while reserved, covered from the target as it was, inside the band and
+/// not compromised (hit twice); another looked for 5-12 s after arriving.
+pub(super) fn fight(
+    sim: &Sim,
+    tk: &Tick,
+    st: &mut AiState,
+    e: &Unit,
+    h: &mut HoldState,
+    thinking: bool,
+    nt: &mut NavTick,
+) -> bool {
+    // The endgame (card HOLD's rule): a side down to its last few
+    // reinforcements ends the round only by kills, and nobody waits in a
+    // position any more (with positions, BF1 Tatooine 2's rounds ran 522-702
+    // s at 4 v 0 alive where main's end by 420).
+    let endgame = sim
+        .battle
+        .teams
+        .iter()
+        .any(|t| t.tickets() <= super::HOLD_ENDGAME);
+    if sim.positions.is_empty() || e.mount.is_some() || endgame {
+        if st.fight.mode == FightState::TAKE {
+            nt.tpos_ev |= EV_WALK_DROPPED;
+        }
+        if st.fight.tactician() {
+            release(st, sim.tick);
+        }
+        return false;
+    }
+    let now = sim.tick;
+    let on = st.fight.tactician() && st.tpos.held.is_some();
+    if !thinking {
+        return on;
+    }
+    let aim = e.soldier.pos;
+    let mut leaving = None;
+    let mut timer_only = false;
+    // On the way: this near, it is there where it stands; a walk not done by
+    // its deadline (a ledge it hops at, a way round that does not end) is
+    // there if near enough, else failed: left, and not asked again.
+    if on && st.fight.mode == FightState::TAKE {
+        let here = tk.u.soldier.pos;
+        let q = sim.positions.positions[st.tpos.held.unwrap_or(0) as usize];
+        let d = nav::xz_dist(here, q.pos);
+        if d + GAIN <= st.tpos.best {
+            st.tpos.best = d;
+            st.tpos.best_at = now;
+        }
+        let stalled = d <= OPEN_REACH && now > st.tpos.best_at + GAIN_TICKS;
+        let late = now > st.tpos.phase_until;
+        if d <= ARRIVE_NEAR && (here.y - q.pos.y).abs() <= STEP {
+            st.tpos.stand = here;
+            nt.tpos_ev |= EV_WALK_ARRIVED;
+            arrive(sim, tk, st, h);
+        } else if (late || stalled) && cut_short(sim, tk, st, h) {
+            nt.tpos_ev |= EV_WALK_NEAR;
+        } else if late || stalled {
+            nt.tpos_ev |= if late {
+                EV_WALK_DEADLINE
+            } else {
+                EV_WALK_STALLED
+            };
+            // (The bot's own fight stands where it is, not at the position.)
+            h.spot = here;
+            h.goal = here;
+            st.fight.mode = FightState::STAND;
+            return false;
+        }
+    }
+    if let Some(i) = st.tpos.held.filter(|_| on) {
+        let q = sim.positions.positions[i as usize];
+        let d = xz(aim - q.pos);
+        let (inner, outer) = band(tk);
+        let rescore = now >= st.tpos.rescore_at;
+        if rescore {
+            st.tpos.rescore_at = now + RESCORE;
+        }
+        let round = rescore && st.tpos.covered && !q.hides_toward(d);
+        let hit = st.tpos.hits >= 2;
+        let off_band = rescore && (d.length() < inner || d.length() > outer);
+        let timer = st.fight.mode == FightState::COVER && now >= st.tpos.next_at;
+        // At an open position a covered one is looked for every RETRY (ours:
+        // the open spot was kept 5-12 s while cover came within reach).
+        if !(round || hit || off_band || timer)
+            && !st.tpos.covered
+            && st.fight.mode == FightState::COVER
+            && now >= st.tpos.retry_at
+        {
+            st.tpos.retry_at = now + RETRY;
+            if let Some(p) = choose(sim, tk, st, e, Some((i, false)), true, nt) {
+                nt.tpos_ev |= EV_UPGRADE | EV_PICK_COVERED;
+                take(sim, tk, st, h, p, nt);
+                return true;
+            }
+        }
+        if !(round || hit || off_band || timer) {
+            st.tpos.until = now + FREE_AFTER;
+            if st.fight.mode == FightState::COVER {
+                cycle(sim, tk, st, h, Some(aim));
+            }
+            return true;
+        }
+        leaving = Some((i, round));
+        timer_only = !(round || hit || off_band);
+        nt.tpos_ev |= if round {
+            EV_LEAVE_ROUND
+        } else if hit {
+            EV_LEAVE_HIT
+        } else if off_band {
+            EV_LEAVE_BAND
+        } else {
+            EV_LEAVE_TIMER
+        };
+    }
+    if !on && now < st.tpos.retry_at {
+        return false;
+    }
+    // The 5-12 s timer takes another QUALIFYING position (the PS2's
+    // "another qualifying hint"): from cover, only another with cover.
+    let cover_only = timer_only && st.tpos.covered;
+    match choose(sim, tk, st, e, leaving, cover_only, nt) {
+        Some(p) => {
+            nt.tpos_ev |= if p.covered {
+                EV_PICK_COVERED
+            } else {
+                EV_PICK_OPEN
+            };
+            take(sim, tk, st, h, p, nt);
+            true
+        }
+        None if timer_only => {
+            nt.tpos_ev |= EV_PICK_NONE | EV_KEEP_TIMER;
+            st.tpos.until = now + FREE_AFTER;
+            st.tpos.next_at = now + span(tk.me, now, 2, NEXT);
+            cycle(sim, tk, st, h, Some(aim));
+            true
+        }
+        None => {
+            nt.tpos_ev |= EV_PICK_NONE;
+            release(st, now);
+            st.tpos.retry_at = now + RETRY;
+            false
+        }
+    }
+}
+
+/// A hit on a bot at its position: two and it is compromised (left at the
+/// next think); the tier's "move" share of hits leaves it at once (card
+/// REACT's row). One draw per burst ([`super::REACT_COOLDOWN`]).
+pub(super) fn hit(sim: &Sim, tk: &Tick, st: &mut AiState) {
+    st.dodge_until = sim.tick + super::REACT_COOLDOWN;
+    if st.fight.mode != FightState::COVER {
+        return;
+    }
+    st.tpos.hits = st.tpos.hits.saturating_add(1);
+    if unit_unit(tk.me.index, sim.tick, tk.me.gen, SALT_TPOS ^ 3) < tk.tier.react[2] {
+        st.tpos.hits = st.tpos.hits.max(2);
+    }
+}
+
+/// The write-back's grant (`Sim::step`, in unit-index order): a position
+/// taken this tick within [`SPACING`] of one a lower index took this tick
+/// is refused — the bot asks again at its next think.
+pub fn grant(table: &PositionTable, tick: u64, st: &mut AiState, granted: &mut Vec<Vec3>) {
+    let Some(q) = st
+        .tpos
+        .held
+        .filter(|_| st.tpos.at == tick)
+        .and_then(|i| table.positions.get(i as usize))
+    else {
+        return;
+    };
+    if granted.iter().any(|g| nav::xz_dist(*g, q.pos) < SPACING) {
+        st.tpos.held = None;
+        if st.fight.tactician() {
+            st.fight.mode = 0;
+        }
+        st.hold = None;
+    } else {
+        granted.push(q.pos);
+    }
+}
+
+/// B12 (`analysis/bot-design.md` 10): is unit `u` fighting at its position
+/// with cover from its target?
+pub fn covered_from_target(sim: &Sim, u: &Unit) -> bool {
+    let st = &u.ai;
+    if st.fight.mode != FightState::COVER {
+        return false;
+    }
+    let Some(q) = st
+        .tpos
+        .held
+        .and_then(|i| sim.positions.positions.get(i as usize))
+    else {
+        return false;
+    };
+    let Some(c) = st.target.and_then(|h| crate::perception::contact_of(st, h)) else {
+        return false;
+    };
+    nav::xz_dist(u.soldier.pos, q.pos) <= LEAN + 0.5 && q.shields_toward(xz(c.last_pos - q.pos))
+}
+
 impl Sim {
     /// Card TPOS: (re)build the position table ([`build`]) — once the
     /// posts are in, since the floors it stands on are walked from them.
@@ -423,18 +1355,4 @@ impl Sim {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_direction_falls_in_its_own_sector() {
-        assert_eq!(sector_bit(Vec2::new(1.0, 0.0)), 1);
-        assert_eq!(sector_bit(Vec2::new(0.0, 1.0)), 1 << 4);
-        assert_eq!(sector_bit(Vec2::new(-1.0, 0.0)), 1 << 8);
-        assert_eq!(sector_bit(Vec2::new(0.0, -1.0)), 1 << 12);
-        // Just under half a sector off still rounds to the sector.
-        let a = (0.49f32 / 16.0) * std::f32::consts::TAU;
-        assert_eq!(sector_bit(Vec2::new(a.cos(), a.sin())), 1);
-        assert_eq!(sector_bit(Vec2::ZERO), 0);
-    }
-}
+mod tests;

@@ -155,7 +155,7 @@ mod tests {
     }
 
     /// The same PCM encodes to the same bytes twice, and the tone survives
-    /// (Goertzel on the decode, as `bake/tests/beep.rs` does for the beep).
+    /// (Goertzel on the decode, as `bake/tests/suite/beep.rs` does for the beep).
     #[test]
     fn encode_is_reproducible() {
         if !have_ffmpeg() {

@@ -174,6 +174,24 @@ impl CollisionWorld {
         layers: Layers,
         hulls: HullFilter,
     ) -> Option<RayHit> {
+        self.ray_past(origin, dir, max_t, layers, hulls, [None; 2])
+    }
+
+    /// [`Self::ray_with`] that also passes through the bodies of the map
+    /// instances in `skip` ([`Body::instance`]): a building turret's camera
+    /// ray past its own building, as the PS2's excludes the turret's owner
+    /// entity (B1 `FUN_00223850` B1:138064-138065, BF2 `FUN_0026cea0`
+    /// B2:189959-189960; the hit filter `FUN_00162b60` passes a body whose
+    /// owner is on the list, B1:2474-2480).
+    pub fn ray_past(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_t: f32,
+        layers: Layers,
+        hulls: HullFilter,
+        skip: [Option<u32>; 2],
+    ) -> Option<RayHit> {
         if max_t <= 0.0 {
             return None;
         }
@@ -182,7 +200,9 @@ impl CollisionWorld {
         seg.add(origin + dir * max_t);
         let mut best: Option<(f32, &Body, Vec3)> = None;
         self.visit_xz(seg.min.x, seg.max.x, seg.min.z, seg.max.z, hulls, |body| {
-            if !body.layers.contains(layers) {
+            if !body.layers.contains(layers)
+                || (body.instance.is_some() && skip.contains(&body.instance))
+            {
                 return;
             }
             if !body.aabb.overlaps(&seg) || !body.aabb.hits_ray(origin, dir, max_t) {

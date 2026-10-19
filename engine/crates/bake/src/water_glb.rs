@@ -28,7 +28,7 @@
 //! took the whole 3x3 block: **17 / 32 / 2 cells where the disc marks
 //! 4 / 8 / 1** (BF1 NAB2, BF2 NAB2, BF2 DEA1, which drew no lattice cell at
 //! all), holes in the water beside every patch. Fixed 2026-09-17, pinned by
-//! `bake/tests/water_patch_cells.rs`. A patch's own triangles cover 13-96 %
+//! `bake/tests/suite/water_patch_cells.rs`. A patch's own triangles cover 13-96 %
 //! of the cell they replace (measured there) — the "3-24 %" in
 //! `mungefs::water`'s header is that area over the twice-as-wide box.
 //!

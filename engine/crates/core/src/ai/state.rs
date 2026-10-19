@@ -230,6 +230,18 @@ pub struct NavTick {
     /// 1 when this think withheld a shot it was on target for, because a
     /// friend stood in the line of fire (card FFLN).
     pub line_held: u32,
+    /// Card TPOS: this think asked the Tactician (1), and a candidate with
+    /// cover from the target passed its filters (2) - B12's ceiling.
+    pub tpos_query: u8,
+    /// Card TPOS: what this think's Tactician did, one bit per event
+    /// (`crate::ai::tactic::EV_*`: the query's answer, why a position was
+    /// left, how a walk to one ended) - the fight-time split's counters.
+    pub tpos_ev: u16,
+    /// Card TPOS: this think's query's candidates with cover from the
+    /// target, stage by stage (the sweep's `tfunnel` line: within the box,
+    /// on the storey, kept by the cap, each filter's rejects, passed, the
+    /// drop test's and the confirming ray's rejects, scored with no pick).
+    pub tpos_funnel: [u8; 14],
     /// Card UCALL: 1 when this think's tracker TOOK a target (the first, or
     /// another in place of the held one) - BF1's `AcquiredTargetSound` call.
     pub acquired: u8,
@@ -241,6 +253,10 @@ pub struct NavTick {
     /// reached the post - the trooper agent's two points where BF1's AI says
     /// "follow me" / "move out" (re-squad-orders.md 5).
     pub trooper: u8,
+    /// Card TURR: this think's turret business - 1..=5 the exit rule a
+    /// gunner left its turret by ([`crate::ai::man`]), [`NavTick::MAN_UNREACHED`]
+    /// a claimed turret its walk did not reach; 0 otherwise.
+    pub man: u8,
 }
 
 /// What a bot carries between ticks. Card SPL11: the fields are grouped by
@@ -293,6 +309,9 @@ pub struct AiState {
     /// Card FGHT: what that position is in a fight ([`FightState`]). Hashed
     /// only when not the default, after `mv`.
     pub fight: FightState,
+    /// Card TPOS: the Tactician's position ([`TposState`]). Hashed only when
+    /// not the default, after `fight`.
+    pub tpos: TposState,
     /// D13: the stance this unit wants to be in, as the CODE
     /// [`crate::commander::stance_of_code`] reads (1 Stand, 2 Crouch, 3 Prone)
     /// — **0 means "no wish"**, which is why the code and not the `Stance`
@@ -580,6 +599,30 @@ pub struct RideState {
     /// Card VDROP: at a hover's pilot seat, this tick's sticks and the
     /// hover's driving state moved on (`hover_drive`), for `Sim::ride`.
     pub hover: Option<HoverOut>,
+    /// Card TURR: the building turret closed to this bot until
+    /// `closed_until` - one it left, or its walk did not reach (`man`).
+    pub closed: Option<crate::vehicle::VehicleHandle>,
+    pub closed_until: u64,
+    /// Card TURR: in a building turret's seat, the gunner's clocks.
+    pub man: Option<ManState>,
+}
+
+/// Card TURR: what a bot in a building turret's seat carries (`man`): the
+/// ticks it sat down, last had a target the turret can hit and last had a
+/// purpose there, and the point it looks at with no target seen (the
+/// last known point of the enemy it can hit).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ManState {
+    pub seated: u64,
+    pub hittable: u64,
+    pub purpose: u64,
+    pub look: Option<Vec3>,
+    /// The point this tick's aimer chases (`gunner::aim`'s aim point, else
+    /// its idle point), which `Sim::seat_gun` takes in place of the camera
+    /// ray's hit: on the PS2 an AI seat's aimer is handed its wanted
+    /// direction by the AI's own aim (B1 `FUN_0026d748` calls `FUN_00236700`
+    /// when the seat has no player, B1:191963-191967; re-turret-draw 2.3).
+    pub aim: Option<Vec3>,
 }
 
 /// What a hover's driver hands `Sim::ride`: throttle, strafe and turn as
@@ -599,6 +642,8 @@ impl NavTick {
     pub const CLAIM_LOST: u8 = 3;
     pub const SET_OUT: u8 = 1;
     pub const ARRIVED: u8 = 2;
+    /// [`NavTick::man`]: a claimed turret the walk did not reach.
+    pub const MAN_UNREACHED: u8 = 6;
 }
 
 /// Card BNDS: what a bot that is OFF the playable level carries
@@ -668,6 +713,8 @@ pub enum Behaviour {
     /// Card SNPR: on its sniper's spot, held while its lane is busy
     /// (`super::snipe`; bot design 4.3's Overwatch role).
     Overwatch,
+    /// Card TURR: in a building turret's seat (`man::seated`).
+    Man,
 }
 
 impl Behaviour {
@@ -682,6 +729,7 @@ impl Behaviour {
             Behaviour::Guard => "guard",
             Behaviour::Board => "board",
             Behaviour::Ride => "ride",
+            Behaviour::Man => "man",
             Behaviour::Follow => "follow",
             Behaviour::Recover => "recover",
             Behaviour::Overwatch => "overwatch",
@@ -693,7 +741,11 @@ impl Behaviour {
     pub fn stands(self) -> bool {
         matches!(
             self,
-            Behaviour::Capture | Behaviour::Guard | Behaviour::Ride | Behaviour::Overwatch
+            Behaviour::Capture
+                | Behaviour::Guard
+                | Behaviour::Ride
+                | Behaviour::Overwatch
+                | Behaviour::Man
         )
     }
 }
@@ -908,16 +960,104 @@ impl FightState {
     /// Card REACT: on its way to the position a hit sent it to — walked as
     /// a ring point, by a stander too.
     pub const MOVE: u8 = 4;
+    /// Card TPOS: on its way to the position the Tactician gave it
+    /// ([`TposState`]), walked as a ring point.
+    pub const TAKE: u8 = 5;
+    /// Card TPOS: at that position, in its hide / fire cycle.
+    pub const COVER: u8 = 6;
 
-    /// Is the bot on its way to a point (a ring's, a reaction's)?
+    /// Is the bot on its way to a point (a ring's, a reaction's, a
+    /// position's)?
     pub fn walks(&self) -> bool {
-        matches!(self.mode, Self::WALK | Self::MOVE)
+        matches!(self.mode, Self::WALK | Self::MOVE | Self::TAKE)
+    }
+
+    /// Is the bot on a Tactician's position, on its way or there?
+    pub fn tactician(&self) -> bool {
+        matches!(self.mode, Self::TAKE | Self::COVER)
     }
 
     fn hash_into(&self, eat: &mut impl FnMut(&[u8])) {
         // Tag 8: after `MoverState`'s 6 and its round's 7.
         eat(&[8, self.mode]);
         eat(&self.pause_until.to_le_bytes());
+    }
+}
+
+/// Card TPOS: the position of the map's table (`Sim::positions`) the
+/// Tactician gave this bot (`ai::tactic`), its reservation and its hide /
+/// fire cycle. Hashed only when not the default, after `fight`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TposState {
+    /// The position held (a table index); `None` = none.
+    pub held: Option<u32>,
+    /// The tick it was granted (the write-back's tie rule, `tactic::grant`).
+    pub at: u64,
+    /// The reservation lasts to this tick: renewed every think it is held,
+    /// so a position is free [`crate::ai::tactic::FREE_AFTER`] after it is
+    /// left (the PS2's hint rule).
+    pub until: u64,
+    /// The position held before, reserved to its own `prev_until`.
+    pub prev: Option<u32>,
+    pub prev_until: u64,
+    /// The cycle: firing (else hidden), to `phase_until`.
+    pub firing: bool,
+    pub phase_until: u64,
+    /// Another position is looked for at this tick (5-12 s after arriving).
+    pub next_at: u64,
+    /// Hits taken at it: two and it is compromised.
+    pub hits: u8,
+    /// A CORNER position's lean side (+1 / -1 across the line to the
+    /// target; 0 = LOW cover or none).
+    pub lean: i8,
+    /// It had cover from the target when chosen.
+    pub covered: bool,
+    /// No query before this tick (a query that found nothing waits).
+    pub retry_at: u64,
+    /// The positions whose walks last failed, newest first: not asked for
+    /// again (one remembered let a bot fail two in turn, the maintainer's Kamino
+    /// scene).
+    pub bad: [Option<u32>; 4],
+    /// Where the bot stands for the position held: its point, or where the
+    /// walk there ended within [`crate::ai::tactic::NEAR_ENOUGH`] of it (a
+    /// point on a ledge's lip it cannot step onto, an open one a step off).
+    pub stand: Vec3,
+    /// On the way: the nearest (XZ m) the walk has been to the position, and
+    /// the tick it last came [`crate::ai::tactic::GAIN`] nearer.
+    pub best: f32,
+    pub best_at: u64,
+    /// The position's next re-score (the target round its cover, out of
+    /// the band): every 5 s, the PS2's.
+    pub rescore_at: u64,
+}
+
+impl TposState {
+    fn hash_into(&self, eat: &mut impl FnMut(&[u8])) {
+        // Tag 10: after `FightState`'s 8 and the round's 9.
+        eat(&[
+            10,
+            u8::from(self.firing) | u8::from(self.covered) << 1,
+            self.hits,
+            self.lean as u8,
+        ]);
+        for v in [self.held, self.prev].iter().chain(&self.bad) {
+            eat(&v.map_or(u32::MAX, |i| i).to_le_bytes());
+        }
+        for t in [
+            self.at,
+            self.until,
+            self.prev_until,
+            self.phase_until,
+            self.next_at,
+            self.retry_at,
+            self.rescore_at,
+        ] {
+            eat(&t.to_le_bytes());
+        }
+        for v in self.stand.to_array().into_iter().chain([self.best]) {
+            eat(&v.to_bits().to_le_bytes());
+        }
+        eat(&self.best_at.to_le_bytes());
     }
 }
 
@@ -1069,6 +1209,30 @@ impl RideState {
                 eat(&x.to_bits().to_le_bytes());
             }
         }
+        // Card TURR: only a bot a turret was closed to, or one in its seat.
+        if let Some(v) = self.closed {
+            eat(&[8]);
+            eat(&v.index.to_le_bytes());
+            eat(&v.gen.to_le_bytes());
+            eat(&self.closed_until.to_le_bytes());
+        }
+        if let Some(m) = self.man {
+            eat(&[9]);
+            for t in [m.seated, m.hittable, m.purpose] {
+                eat(&t.to_le_bytes());
+            }
+            if let Some(p) = m.look {
+                for v in [p.x, p.y, p.z] {
+                    eat(&v.to_bits().to_le_bytes());
+                }
+            }
+            if let Some(p) = m.aim {
+                eat(&[10]);
+                for v in [p.x, p.y, p.z] {
+                    eat(&v.to_bits().to_le_bytes());
+                }
+            }
+        }
     }
 }
 
@@ -1090,6 +1254,7 @@ impl Default for AiState {
             lost: None,
             hold: None,
             fight: FightState::default(),
+            tpos: TposState::default(),
             want_stance: 0,
             dodge_until: 0,
             unreachable_dwell: 0,
@@ -1214,6 +1379,9 @@ impl AiState {
         }
         if self.fight != FightState::default() {
             self.fight.hash_into(eat);
+        }
+        if self.tpos != TposState::default() {
+            self.tpos.hash_into(eat);
         }
         // Card STTAP: the trigger state, eaten once a single-shot weapon has
         // moved it — like the optional states above, a bot that never held

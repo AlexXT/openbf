@@ -4,14 +4,14 @@ title: Turrets with a purpose: a bot mans a turret that has a target it can hit 
 milestone: M3
 value: 5
 phase: build
-status: parked
+status: done
 deps: BOTD,DEFS,FOFG
 files: engine/crates/core/src/ai/ride.rs, engine/crates/core/src/ai/gunner.rs, engine/crates/core/src/ai/behave.rs, engine/crates/core/src/ai/man.rs (new), engine/crates/core/src/sim/guns.rs
 declares: sweep; sim; arena
 needs:
 effort: high
 branch: turr
-resume: 2026-10-16 18:25 build (lane 1): step A DONE on branch turr (79b5544, rebased on 87ad3b9; ci green 1633/0/46). Next: python3 scripts/gates.py --tree <repo parent>/openbf-wt/turr --target <ROOT>/engine/artifacts/lead_tmp/turr_target --out <ROOT>/engine/artifacts/lead_tmp/turr/gates --auto --detach (the 18:21 run was stopped by STOP before any row). Expect sweep MOVED (declared), sim / arena MOVED if a replay or arena_tat2 has a turret gunner (declared: a human's turret aim changed too - the camera ray passes his building, the barrel line meets the point). offgraph counts units on foot since FOFG. If only declared moves: land.py TURR. Kills a minute already measured: lead_tmp/turr/sw (kpm.py main_b<n> fin_b<n>): -2.0 / +1.1 / -2.1 %.
+resume: landed b19cdf94 2026-10-19
 created: 2026-10-03
 alpha: yes
 ---
@@ -111,3 +111,7 @@ The maintainer's annoyance 1 (2026-10-02): "If there is an empty turret, they'll
   maps, 3 blocks vs main: -2.0 / +1.1 / -2.1 % (main's own blocks 623.8 / 608.9 / 621.6); 11 control maps identical
   (`lead_tmp/turr/sw`). Scenes 6 new + 2 extended, 39 / 39 mutants killed (`lead_tmp/turr/mut/run4.txt`). The maintainer's Q56
   ("take the cost or hold") is moot: the cost is gone.
+- 2026-10-19 13:45 land (lane 2; report `reports/20261019_1345_land_TURR.md`): LANDED b19cdf9 on top of TPOS (ce8975d). The
+  branch was rebased by hand after TPOS merged (behave.rs: both sides' blocks kept; CRATES.md counts recommitted); ci 1659 / 0 / 46.
+  Rebased tree, 8 seeds: KAM1 seat share 6.81 %, 0 quiet long spells, 0 endgame ticks; MYG1 shots in 75 % of spells
+  (`lead_tmp/turr/land_c8`). Gates: only the declared sweep moved; fidelity PASS vs TPOS's landing.

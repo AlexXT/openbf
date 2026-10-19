@@ -124,14 +124,10 @@
 //! Card HOLD (the maintainer, 2026-10-01) — bots hold ground and fight, and not as
 //! statues ([`HoldState`], `behave`):
 //!
-//! - a bot that reaches a hub while it PERCEIVES an enemy within
-//!   [`HOLD_FIGHT`] takes a position there — an authored Cover / Snipe hint
-//!   within [`HOLD_HINT_RADIUS`] (with its stance), else a drawn point in the
-//!   hub, never one in water — and holds it for a drawn dwell, or until it
-//!   has been quiet for [`HOLD_QUIET`]; then it walks past a hub before it
-//!   may hold again. A DEFENDER also takes an authored position when any
-//!   enemy is within [`HOLD_NEAR`]. An enemy seen inside [`HOLD_RANGE`] is
-//!   fought from a position taken where the bot stands.
+//! - (card TPOS: the hold a bot took at a hub when it perceived an enemy -
+//!   a hint or a drawn hub point for a 10-24 s dwell - is gone; a fight's
+//!   position is the Tactician's, `ai::tactic`.) An enemy seen inside
+//!   [`HOLD_RANGE`] is fought from a position taken where the bot stands.
 //! - on its position it looks the way the nearest enemy is and is lively by
 //!   its tier's chances (`skill::Tier`): a SHUFFLE to a spot a couple of
 //!   metres off every few seconds, a STRAFE on a burst.
@@ -225,6 +221,7 @@ mod draw;
 mod gunner;
 mod gunner_foot;
 pub mod hover_drive;
+pub mod man;
 mod mover;
 mod ride;
 mod route;
@@ -242,13 +239,13 @@ pub use command::CmdState;
 pub use draw::{
     route_rand, stance_hold, unit_dir, unit_rand, unit_unit, SALT_BURST, SALT_CHARGE, SALT_DODGE,
     SALT_ERR_AXIS, SALT_ERR_DIR, SALT_FOLLOW, SALT_FORMATION, SALT_GRENADE, SALT_HOLD,
-    SALT_NEED_GUNNER, SALT_REACT, SALT_SHUFFLE, SALT_STANCE, SALT_STRAFE, SALT_TAP,
+    SALT_NEED_GUNNER, SALT_REACT, SALT_STANCE, SALT_TAP,
 };
 pub use gunner_foot::yaw_toward;
 pub use route::{first_leg, floor_walked};
 pub use state::{
     AiState, Behaviour, FightState, HoldState, LostState, MoverState, NavTick, RideState, Round,
-    Route, RouteSource, SnipeBook, SnipeState, StallState, SteerPick, Walk, WalkAsk,
+    Route, RouteSource, SnipeBook, SnipeState, StallState, SteerPick, TposState, Walk, WalkAsk,
 };
 pub use steer::{rotate_xz, way_ahead, Stop, StopKind};
 
@@ -528,18 +525,8 @@ pub const PIN_WALKED: f32 = 4.0;
 // stood only inside `HOLD_RANGE` of an enemy it saw. The rule is ours and
 // every constant PROVISIONAL; the per-tier liveliness is `skill::Tier`'s.
 // ---------------------------------------------------------------------------
-/// A hub is a place to hold when the bot PERCEIVES an enemy within
-/// [`HOLD_FIGHT`] of it (m): a long rifle shot. Farther off it closes in.
-pub const HOLD_FIGHT: f32 = 80.0;
-/// A DEFENDER also takes an authored Cover / Snipe position at a hub when any
-/// living enemy is within this of it (m), seen or not.
-pub const HOLD_NEAR: f32 = 120.0;
-/// A hold lasts between these many ticks (10–24 s), drawn at its start —
-/// unless it goes quiet first ([`HOLD_QUIET`]).
-pub const HOLD_DWELL_MIN: u64 = 10 * crate::TICK_HZ as u64;
-pub const HOLD_DWELL_MAX: u64 = 24 * crate::TICK_HZ as u64;
-/// No position is taken at a hub once either team is down to this many
-/// reinforcements: the endgame is for closing in.
+/// No Tactician's position (nor a sniper's spot) is taken once either team
+/// is down to this many reinforcements: the endgame is for closing in.
 pub const HOLD_ENDGAME: u32 = 10;
 /// A CLOSE hold — an enemy seen inside [`HOLD_RANGE`] — lasts this long past
 /// the last tick he was (ticks, 2 s).
@@ -547,11 +534,6 @@ pub const HOLD_CLOSE: u64 = 2 * crate::TICK_HZ as u64;
 /// A hold from which no enemy has been perceived for this long is given up
 /// (ticks, 4 s): the bot holds to FIGHT, and with nobody to fight it advances.
 pub const HOLD_QUIET: u64 = 6 * crate::TICK_HZ as u64;
-/// After a hold the bot walks past this many hubs before it may take another
-/// position: it ADVANCES between holds.
-pub const HOLD_SKIP_HUBS: u8 = 1;
-/// A Cover or Snipe hint within this of the hub is the position (m).
-pub const HOLD_HINT_RADIUS: f32 = 12.0;
 /// With no hint, a point within this of the hub's centre (m; the hub's own
 /// radius when that is smaller).
 pub const HOLD_SPOT_RADIUS: f32 = 5.0;
@@ -705,6 +687,43 @@ pub const HOVER_NEAREST: bool = false;
 /// Card VTAI: a bot pilot holds its throttle this long after a teammate
 /// claims one of its gunner seats, for the gunner to walk up and board.
 pub const GUNNER_WAIT: u64 = 8 * crate::TICK_HZ as u64;
+
+// ---------------------------------------------------------------------------
+// Card TURR (`analysis/bot-design.md` 6.1, D11; the maintainer's annoyance 1): a bot
+// mans a building turret only with a PURPOSE and gets out by five rules
+// (`man`). The PS2's own values are marked; the rest is OURS, PROVISIONAL.
+// ---------------------------------------------------------------------------
+/// The offer pass runs once in this many ticks (1 s).
+pub const MAN_OFFER_PERIOD: u64 = crate::TICK_HZ as u64;
+/// A free turret is offered to the nearest free bot within this (m): the
+/// PS2's offer scan, `DAT_00698454` = 50 m (re-soldier-ai 7.1).
+pub const MAN_SEEK: f32 = 50.0;
+/// The defence clause: a turret this near (XZ, m) to a post the team owns.
+pub const MAN_POST_NEAR: f32 = 40.0;
+/// ...with an enemy the team knows of this near the post (XZ, m).
+pub const MAN_SEEN_NEAR: f32 = 60.0;
+/// At most this many turrets within [`MAN_POST_NEAR`] of one post are manned
+/// or claimed by a team.
+pub const MAN_POST_CAP: usize = 2;
+/// Exit 1: this long (ticks, 10 s - the PS2's clock, re-soldier-ai 7.3)
+/// with no target the turret can hit.
+pub const MAN_NO_TARGET: u64 = 10 * crate::TICK_HZ as u64;
+/// Exit 2: this long seated (45 s)...
+pub const MAN_LONG: u64 = 45 * crate::TICK_HZ as u64;
+/// ...with no shot fired in the last this-many ticks (20 s).
+pub const MAN_NO_SHOT: u64 = 20 * crate::TICK_HZ as u64;
+/// Exit 3: the turret under this share of its health.
+pub const MAN_LOW_HEALTH: f32 = 0.3;
+/// Exit 4: the endgame - a team down to [`HOLD_ENDGAME`] tickets, or the
+/// gunner's own team down to this many living units.
+pub const MAN_ENDGAME_ALIVE: usize = 3;
+/// Exit 5: the purpose test has failed for this long (ticks, 10 s).
+pub const MAN_PURPOSE_LOST: u64 = 10 * crate::TICK_HZ as u64;
+/// After leaving, the turret is closed to that bot this long (20 s: the
+/// PS2's unboard cooldown, re-soldier-ai 7.3).
+pub const MAN_LEFT_CLOSED: u64 = 20 * crate::TICK_HZ as u64;
+/// A turret the bot's walk did not reach is closed to it this long (60 s).
+pub const MAN_UNREACHED_CLOSED: u64 = 60 * crate::TICK_HZ as u64;
 
 #[cfg(test)]
 mod tests {

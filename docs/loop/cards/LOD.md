@@ -2,7 +2,7 @@
 id: LOD
 title: The `modl` LOD switch rule: the port draws LOD0 forever (and discards the baked LOD chains); the PS2 switches to `LOWD` / `_low1` by some distance rule
 milestone: M1
-value: 4
+value: 5
 phase: build
 status: todo
 deps:
@@ -14,6 +14,7 @@ branch:
 resume: BUILD (re done 2026-10-16, analysis/re-lod.md section 7): per LOWD-bearing instance on a FarSceneRange>0 map draw the model with fragments cut past a per-pixel threshold t in [NearSceneRange b, c] (dithered = the b..c crossfade) and the LOWD (ManifestGeometry.lods 'LOWD', GLB already baked) with fragments cut nearer than t and past FarSceneRange - the shader already has per-instance cull / cull_near; vehicles' LOWD the same. Decide whether UTAS's bake::far_lowd extension is subsumed (the LOWD past c covers the UTA1 ring). Bar: lead_tmp/re/lod/tools/accept.py PASS at NAB1 station A + a mutation-checked unit test + UTA1 b000 pair + declared goldens.
 created: 2026-09-25
 alpha: yes
+first: 1
 ---
 
 ## Why
@@ -37,6 +38,7 @@ RE part DONE 2026-10-16 (`analysis/re-lod.md` [O], PCSX2 two-station + threshold
 4. The goldens that move are predicted from data first (instances with a LOWD past b in each golden's view), declared, viewed.
 
 ## Notes
+- 2026-10-19 (the maintainer's order, `first: 1`): the first speed item for weak hardware (Surface Pro 8, Intel Iris Xe). Far-draw cost is the likeliest big win after this; ISPD (`first: 2`) measures the rest on this machine's iGPU. Mind the file overlap: ISPD's slices wait for this card.
 - 2026-09-29 (UTAS, lane 2): most of the rule is now read — `analysis/re-far-lowd.md` §2 [O]. NEAR scene: not a distance,
   a per-level triangle BUDGET (`FUN_005ace40`: largest-on-screen first, the first mask level whose running count fits the
   queue's budget, a density skip, LOD 3 as the fallback). FAR scene (past `NearSceneRange[1]·S`, shown beyond `[2]`):

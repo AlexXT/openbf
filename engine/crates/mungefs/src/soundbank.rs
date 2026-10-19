@@ -39,7 +39,7 @@ pub struct SampleBank<'a> {
 /// A strict subset of [`find_banks_deep`], and DELIBERATELY not replaced by
 /// it (audit item M-R7): the deep walk descends `lvl_`/`SoundBankList`
 /// wrappers and can therefore return a DIFFERENT bank first. Its one caller,
-/// `bake::beep`, picks a bank by position, and `bake/tests/beep.rs` pins the
+/// `bake::beep`, picks a bank by position, and `bake/tests/suite/beep.rs` pins the
 /// result to a traced reference (rate 3,605 / 1,260 frames / 440.6 Hz), so
 /// swapping the walk is a behaviour change to be measured, not a cleanup.
 pub fn find_banks<'a>(inner: &'a [u8]) -> Vec<SampleBank<'a>> {

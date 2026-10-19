@@ -7,14 +7,16 @@
 //!   weapon sets picked by the weapon class's `AnimationBank`, with the
 //!   fallback table `DAT_00535598`. 979 slots; equal to PS2 memory.
 //! * [`bf2`] — BF2's sets, one per (skeleton family, weapon animation class)
-//!   the level's classes register (`FUN_00282f78`): 151 {upper, lower} pairs
-//!   filled along the two parent chains. Equal to PS2 memory over 176 battle
-//!   states.
+//!   the level's classes register (`FUN_00282f78`): the first 134 of a set's
+//!   151 {upper, lower} pairs (the last 17 are the melee combos), filled along
+//!   the two parent chains.
 //!
 //! Both are ports of the resolvers that were checked against save states
-//! (`engine/artifacts/lead_tmp/anim/sets_bf1.py`, `sets_bf2.py`); the keys in
-//! `tests/data/anim_sets_bf{1,2}.json` are what those scripts print, and
-//! `tests/anim_sets.rs` holds the port to them slot by slot. The rules are
+//! (`engine/artifacts/lead_tmp/anim/sets_bf1.py`, `sets_bf2.py`; the BF2 one
+//! over 176 battle states, `analysis/re-soldier-anim-layers.md`); the keys in
+//! `tests/data/anim_sets_bf{1,2}.json` are what those scripts print (BF2:
+//! three of the states), and `tests/suite/anim_sets.rs` holds the port to
+//! them slot by slot. The rules are
 //! not re-derived here: a change to one must be made against PS2 memory.
 //!
 //! [`SoldierSets`] is what the side bake writes beside each soldier

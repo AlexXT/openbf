@@ -1374,7 +1374,9 @@ fn no_rocket_leaves_with_a_friend_walking_into_its_line() {
     }
     assert_eq!(hits, 0, "rockets into the friend, of {shots}");
     assert_eq!(shots, 7, "every round it has, between his passes");
-    assert!(sim.nav_stats.line_held > 200, "{}", sim.nav_stats.line_held);
+    // (Card TPOS: 131 ticks once the strafe on a burst went - the step out
+    // of the line takes the bot out of it sooner.)
+    assert!(sim.nav_stats.line_held > 100, "{}", sim.nav_stats.line_held);
 }
 
 /// Card HVYW (OURS): a vehicle nothing the bot holds is for is left alone
@@ -1520,7 +1522,9 @@ fn a_bot_does_not_stand_for_a_throw_at_a_vehicle_it_cannot_make() {
 /// throw not yet in reach (the aim still rising), as on main. Three enemies
 /// 12 m and 20 m beside a bot that side-steps in its fight: on the tick the
 /// grenade comes up in a step the stick is let go (the step's 3.8 m/s is
-/// 0.6 that tick; walking on would keep 3.8 and throw on the move).
+/// 0.6 that tick; walking on would keep 3.8 and throw on the move). (Card
+/// TPOS: the strafe on a burst that made the steps went; the test makes
+/// them, a 3 m step aside every 1.5 s, as a position's lean step would.)
 #[test]
 fn a_bot_stands_for_a_throw_at_soldiers_from_the_tick_it_is_picked() {
     for d in [12.0, 20.0] {
@@ -1547,7 +1551,16 @@ fn a_bot_stands_for_a_throw_at_soldiers_from_the_tick_it_is_picked() {
         }
         let (mut live, mut fastest, mut from_a_step, mut throws) = (0, 0.0f32, 0, 0);
         let (mut prev, mut before) = (Vec3::ZERO, 0.0);
-        for _ in 0..12 * TICK_HZ {
+        for t in 0..12 * TICK_HZ {
+            let picked = sim
+                .unit(bot)
+                .is_some_and(|u| matches!(armed(&sim, u, &u.ai), Armed::Thrown(..)));
+            if t % 45 == 0 && !picked {
+                let side = if (t / 45) % 2 == 0 { 3.0 } else { -3.0 };
+                if let Some(h) = sim.unit_mut(bot).and_then(|u| u.ai.hold.as_mut()) {
+                    h.goal = h.spot + Vec3::X * side;
+                }
+            }
             sim.step(&[]);
             let u = sim.unit(bot).unwrap();
             let speed = crate::nav::xz_dist(u.soldier.pos, prev) / TICK_DT;

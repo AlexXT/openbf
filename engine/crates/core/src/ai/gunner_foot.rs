@@ -51,8 +51,6 @@ pub(super) enum AimRequest<'a> {
 /// What the gunner answers, for the behaviour's position rules.
 #[derive(Clone, Copy)]
 pub(super) struct GunReport {
-    /// A new burst was drawn this tick (D11).
-    pub new_burst: bool,
     /// Card FFLN: a friend stands in the line of fire at the seen enemy —
     /// the side to step to, away from him (+1 = the unit's right).
     pub line: Option<i8>,
@@ -255,10 +253,9 @@ pub(super) fn run(
     // produced a shot — `Unit.last_shot_tick` is written in `Sim::step`
     // phase 4, after `think` has already run for this tick — so a weapon
     // that is reloading, overheated or rate-limited costs the bot nothing.
-    let burst_was = st.burst;
     fire_discipline(sim, me, u, st, wc, &skill);
     // Card FFLN: a friend in the line of fire. The shot waits (below); the
-    // behaviour steps a holder aside.
+    // behaviour steps a holder with no Tactician's position aside.
     let line = enemy.and_then(|e| {
         let range = (e.capsule().center() - eye).length();
         // The cone a shot can leave in: the weapon's spread as it is now
@@ -361,7 +358,6 @@ pub(super) fn run(
         }
     };
     Some(GunReport {
-        new_burst: burst_was == 0 && st.burst > 0,
         line,
         range,
         no_throw,
@@ -1110,7 +1106,9 @@ mod tests {
         // / 0.861 / 0.861 / 0.750 - a bot hits a bot at arm's length
         // (`analysis/re-soldier-ai.md` 17: 0.64 of a PS2 rifle's shots
         // inside 10 m take health off its target, the port's 0.20 before).
-        assert!(rates[1] > 0.6 && rates[1] < 0.85, "8 m rate {}", rates[1]);
+        // Card TPOS: with no strafe on a burst the shooter stands still:
+        // 0.892 at 8 m.
+        assert!(rates[1] > 0.6 && rates[1] < 0.95, "8 m rate {}", rates[1]);
         assert!(rates[4] < 0.35, "40 m rate {}", rates[4]);
         for (b, h) in bots.iter().zip(&rates) {
             assert!(
@@ -1360,8 +1358,9 @@ mod tests {
     /// 14 m ahead, and a friend standing on the line between them or 4 m off
     /// it. On the line: no shot leaves while the friend is in the cone, no
     /// bolt of the bot's lands on the friend, the waiting is counted, and the
-    /// bot does not stay mute — it steps out of the line and fires. Off the
-    /// line: nothing is withheld.
+    /// bot does not stay mute — it steps out of the line and fires (a bot
+    /// with no Tactician's position, as here: card TPOS keeps the step for
+    /// them). Off the line: nothing is withheld.
     #[test]
     fn a_bot_does_not_fire_through_a_friend() {
         // Card FGHT: a shooter that keeps its place.

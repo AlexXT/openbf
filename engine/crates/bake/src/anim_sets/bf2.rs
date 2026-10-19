@@ -134,7 +134,7 @@ fn weapon_row(
     // No key on the chain (grenades, detpacks, the officers' buffs): the
     // weapon registers no set. [D] from PS2 memory, not read in the code:
     // a state's sets for a family whose other weapons carry no key
-    // (`tests/anim_sets.rs`, `hansolo`).
+    // (`tests/suite/anim_sets.rs`, `hansolo`).
     None
 }
 

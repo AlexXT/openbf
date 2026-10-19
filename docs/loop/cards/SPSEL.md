@@ -2,7 +2,7 @@
 id: SPSEL
 title: The player's spawn POST lives in the sim: the PS2's spawn-map pick (a push takes the own-team post with the lowest along + 0.25 x perp^2, then keep-or-nearest), the respawn at THAT post, and the class row's names from the disc's text - the class choice is already in core (Sim::spawn_choice); the post cursor is still UI-only and the sim picks the node itself
 milestone: M3
-value: 4
+value: 5
 phase: build
 status: todo
 deps: CWSP,BSPN
@@ -14,6 +14,7 @@ branch:
 resume:
 created: 2026-09-25
 alpha: yes
+first: 4
 ---
 
 ## Evidence

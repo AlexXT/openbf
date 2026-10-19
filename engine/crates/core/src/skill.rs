@@ -16,18 +16,20 @@
 //! | Hard | 20 | 1.0 | 1.25 | 0.2 (6) | 1.3 | 1.15 | 1.2 m | — |
 //! | Elite | 20 | 1.0 | 1.5 | 0.15 (5) | 1.6 | 1.3 | **0.5 m** | ×1.25 |
 //!
-//! Card HOLD adds how lively a bot is while it holds a position, as a chance
-//! per opportunity (ours, PROVISIONAL — the maintainer's to tune):
+//! Card HOLD adds how quickly a bot runs from a grenade, as a chance per
+//! landing (ours, PROVISIONAL — the maintainer's to tune; its shuffle and strafe went
+//! with card TPOS):
 //!
-//! | tier | shuffle (every ~3 s) | strafe (per burst) | grenade (per landing) | grenade delay s |
-//! |---|---|---|---|---|
-//! | Easy | 15 % | 10 % | 30 % | 1.1–2.1 |
-//! | Normal | 35 % | 30 % | 60 % | 0.6–1.3 |
-//! | Hard | 55 % | 50 % | 85 % | 0–0.8 |
-//! | Elite | 70 % | 65 % | 95 % | 0–0.8 |
+//! | tier | grenade (per landing) | grenade delay s |
+//! |---|---|---|
+//! | Easy | 30 % | 1.1–2.1 |
+//! | Normal | 60 % | 0.6–1.3 |
+//! | Hard | 85 % | 0–0.8 |
+//! | Elite | 95 % | 0–0.8 |
 //!
 //! Card REACT adds what a bot on a position (a hub's, a fight's) does when
-//! it is HIT — one draw per hit, 1.5 s apart at least (ours, PROVISIONAL —
+//! it is HIT (on a Tactician's position, card TPOS, the "moves" share
+//! leaves it at once and two hits leave it) — one draw per hit, 1.5 s apart at least (ours, PROVISIONAL —
 //! The maintainer's to tune; the PS2's attacker ignores the hit):
 //!
 //! | tier | stays | strafes 2.5 m | rolls aside | moves to a new position |
@@ -120,8 +122,6 @@ impl Difficulty {
                 human_damage: 1.0,
                 err_cap: None,
                 bleed_handicap: 1.0,
-                shuffle: 0.15,
-                strafe: 0.10,
                 react: [0.20, 0.05, 0.10],
                 grenade: 0.30,
                 grenade_delay: (33, 63),
@@ -133,8 +133,6 @@ impl Difficulty {
                 human_damage: 1.0,
                 err_cap: None,
                 bleed_handicap: 1.0,
-                shuffle: 0.35,
-                strafe: 0.30,
                 react: [0.30, 0.15, 0.20],
                 grenade: 0.60,
                 grenade_delay: (18, 39),
@@ -146,8 +144,6 @@ impl Difficulty {
                 human_damage: 1.15,
                 err_cap: None,
                 bleed_handicap: 1.0,
-                shuffle: 0.55,
-                strafe: 0.50,
                 react: [0.30, 0.20, 0.30],
                 grenade: 0.85,
                 grenade_delay: (0, 24),
@@ -161,8 +157,6 @@ impl Difficulty {
                 // tracked-position error cap than any skill level yields.
                 err_cap: Some(0.5),
                 bleed_handicap: 1.25,
-                shuffle: 0.70,
-                strafe: 0.65,
                 react: [0.30, 0.25, 0.35],
                 grenade: 0.95,
                 grenade_delay: (0, 24),
@@ -214,14 +208,9 @@ pub struct Tier {
     /// opposing team has none (the team handicap, a host option). 1.0 = none.
     /// PROVISIONAL.
     pub bleed_handicap: f32,
-    /// Card HOLD (the maintainer, 2026-10-01): how lively a bot is while it holds a
-    /// position and fights, each a CHANCE PER OPPORTUNITY (`crate::ai`
-    /// `HoldState`). All three are ours and PROVISIONAL — the feel of each
-    /// tier is the maintainer's to set. `shuffle`: every few seconds, to step to
-    /// another spot a couple of metres off.
-    pub shuffle: f32,
-    /// ...at the start of a burst, to strafe sideways while firing it.
-    pub strafe: f32,
+    /// (Card TPOS: card HOLD's `shuffle` and `strafe` chances went with the
+    /// shuffle and the strafe on a burst: a fighter's cycle and its next
+    /// position are the Tactician's, `crate::ai::tactic`.)
     /// Card REACT (the maintainer, 2026-10-07): what a bot on a position does about a
     /// HIT, one draw per hit outside the cooldown — the chances to STRAFE,
     /// to ROLL aside and to MOVE to a new position; the rest it stays

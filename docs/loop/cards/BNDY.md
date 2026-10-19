@@ -3,15 +3,15 @@ id: BNDY
 title: The map boundary: leaving the battlefield warns the player (HUD text + his team's 'leaving' line) and kills him after BF2's 6.5 s (BF1 10 s) - the port has no boundary at all; read the boundary data and the point test, then build it
 milestone: M3
 value: 4
-phase: re
+phase: build
 status: todo
 deps:
-files:
-declares:
+files: engine/crates/bake/src/map.rs, engine/crates/manifest/src/lib.rs, engine/crates/game/src/layout.rs, engine/crates/core/src/sim/boundary.rs, engine/crates/core/src/sim/state.rs, engine/crates/core/src/sim/step.rs, engine/crates/core/src/announcer.rs, engine/crates/ui/src/hud.rs
+declares: rebake=maps; sim; sweep; arena
 needs:
 effort:
 branch:
-resume: RE half done, stopped by STOP 18:19 (2026-10-16): read engine/artifacts/lead_tmp/bndy/DRAFT_re-boundary.md first (claims C1-C8, D1-D2, T1-T5 with citations; RAM check of all 32 maps already AGREE, cmpshapes.txt). Next: (1) the five re_check receipts (absence: no other writer of the boundary list head, no AI reader of the point test; B2 FUN_0034c4f0 a1 pass-through by mdis.py), (2) the RE workflow verifier on the claim list, (3) the live point test: tools/bnd_live.py <points/MAP.json> <ref/states/MAP_walk_*_b000.p2s> --death on NAB1, TAT1, YAV2, BF2 HOT1, UTA1, MYG1 (+ BF1 KAM1 for the non-convex points), (4) draw the shapes over the port's top-down sheets, (5) lift into analysis/re-boundary.md, then set phase=build with the acceptance rewritten (BF2 pair on HOT1: UTA1/MYG1/YAV2 have no boundary).
+resume: RE DONE 2026-10-19 (analysis/re-boundary.md d63b63f, [O]; PS2 296/296 points). Build in two commits: (A) bake the bnd_ path names into the manifest (first path of a name), resolve to shapes in layout.rs, core/src/sim/boundary.rs = the half-plane test + the per-unit timer (6.5 s, set and decremented in the first outside tick, kill below 0 with the driven vehicle, cheat spares, every unit) + acceptance 1-2 and 4; (B) the HUD text (Locl 0x3a1fed50, centred, T4 alpha spring) and the team's leaving line once per excursion with the allleaving / repleaving locks + acceptance 3. Start from re-boundary.md section 8.
 created: 2026-09-30
 alpha: yes
 ---
@@ -41,7 +41,30 @@ half of ANNC's trigger T6.
 - Who is tested: every unit or humans only; AI behaviour at the boundary (do bots turn back?).
 - The BF2 2.17 s case (which vehicles) and the soldier flag that forces the warning.
 
-## Acceptance
+## Acceptance (rewritten 2026-10-19 after the RE - `analysis/re-boundary.md`, d63b63f)
+RE half: DONE. The doc is [O] with a verifier workflow (19 claims, two readers each). Sheets for all 32 maps are in
+`engine/artifacts/lead_tmp/bndy/sheets/`. The PS2's verdict agreed with the transcription on 296 of 296 points on the
+six showcase maps plus BF1 KAM1 / HOT1, including 12 non-convex points the PS2 calls outside. BF1 YAV2, BF2 UTA1 and
+BF2 MYG1 have NO boundary.
+
+Build (the bars):
+1. **Point replay**: the port's built test, run through the BAKED manifest, gives the PS2's verdict on every row of
+   `engine/artifacts/lead_tmp/bndy/points/*.result.json` (404 rows: 296 + BF2 HOT1's second state). The rows are copied
+   into a test fixture, and the KAM1 / HOT1 non-convex points are among them. Mutation: a point-in-polygon test in place
+   of the half-planes must fail on those 12 points.
+2. **Timer unit test**, all at 30 Hz like the PS2's M2:
+   - outside at t0: the warning and the line once, at t0;
+   - the timer is set and decremented in the same tick, and the unit dies in the tick it goes negative (t0 + 6.5 s);
+   - back inside clears the timer, and the next excursion starts again from 6.5 s;
+   - an AI unit dies the same way, and the cheat spares the player;
+   - a map with no shapes never kills.
+3. **PS2 pair on BF2 HOT1** (UTA1 has no boundary): the port's player is held at s0e0_out3 (295.43, 190.01). The warning
+   starts in the first outside tick, and death comes within ±0.2 s of the PS2's 6.51 s after the first outside row
+   (`points/bf2_hot1.bf2_hot1_walk_cp0_cp5_b000.result.json`, `death`).
+4. **Sweep**: deaths by the new cause per map on 8 seeds, printed with their spots. BNDS keeps bots inside, so expect
+   few; a rise is read spot by spot before landing.
+
+Original acceptance (2026-09-30):
 - RE doc with [V]/[O] claims and the verifier run; per map, the boundary polygon drawn over the port's top-down sheet.
 - A PS2 check of the point test: for the six showcase maps, >= 20 sample points per map classified inside / outside by
   the PS2 (the live member timer after a RAM hold at each point, `walk_bf1.py` / `walk_bf2.py`'s hold) and by the
@@ -79,3 +102,21 @@ source before building. Decoder: `engine/artifacts/lead_tmp/fxc/tools/bnd.py`.
   not starfighters. The "soldier flag" bit 7 of +0x660 is the FLYER's, with no writer found.
 - RAM check done: all 32 baked maps' boundary edges in a save state = the transcription (271 edges, max 6.2e-5).
 - Draft and tools: `engine/artifacts/lead_tmp/bndy/` (DRAFT_re-boundary.md, tools/, cmpshapes.txt, points/).
+
+## Note (lane 2, 2026-10-19 16:00): RE DONE - `analysis/re-boundary.md` (d63b63f); the draft above is superseded
+Three of the draft's readings turned out wrong:
+1. Bit 7 of +0x660 has a writer: it is the BF2 flyer's FLY-HEIGHT flag, set when the flyer is below
+   MinPlayerFlyHeight or above MaxPlayerFlyHeight. Such a flyer counts as outside even inside the 2-D boundary, so on
+   UTA1 (29.5) and MYG1 (20) too. This is written as a note on card VFLY.
+2. The kill's third argument 1 makes the invincibility cheat SPARE the player, unlike a death region (re-kill-floor 1f).
+3. One BF2 AI flyer function (FUN_002faf90) reads the outside test, to refuse a placement point 300 m ahead. No
+   foot-soldier code reads it.
+
+Live results on the PS2:
+- AI members are tested on BF1 (NAB1, TAT1, KAM1, HOT1) and BF2 (HOT1, full battle).
+- Death comes at 10.0 s (BF1) and 6.51 s (BF2), with the timer set and decremented in the first outside update.
+- The BF1 KAM1 / HOT1 / YAV2 walk states hold no player soldier; their `*_spawn` states were used instead.
+- The point test agreed on 296 of 296 points (plus 108 of 108 on a second BF2 HOT1 state).
+
+The build is in two commits (resume:); the files include `sim/step.rs`, which card TEAM holds, so BNDY becomes
+eligible after TEAM lands.
