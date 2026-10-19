@@ -4,14 +4,14 @@ title: Windows build: scripts/pack.py makes dist/openbf.exe on Windows from the 
 milestone: M6
 value: 5
 phase: build
-status: todo
+status: done
 deps:
 files:
 declares:
 needs:
 effort:
 branch:
-resume:
+resume: landed 4120411 2026-10-18
 created: 2026-10-18
 ---
 

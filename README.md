@@ -34,7 +34,7 @@ Requirements on Linux:
 - ALSA and udev libraries (on Fedora: `alsa-lib-devel systemd-devel`; on Debian/Ubuntu: `libasound2-dev libudev-dev`)
 - A Vulkan-capable GPU and a game controller; there is no keyboard and mouse play
 
-### Windows (new, still being tested)
+### Windows
 
 The same command builds `dist\openbf.exe`. You need:
 - Rust (https://rustup.rs), with the Visual Studio C++ Build Tools that rustup offers to install
@@ -51,10 +51,10 @@ mkdir iso
 python scripts\pack.py
 dist\openbf.exe
 ```
-Your profile is saved in `%APPDATA%\openbf`. Please report anything that goes wrong on Windows.
+Your profile is saved in `%APPDATA%\openbf`.
 
 Disc images: `--iso1 <path>` and `--iso2 <path>` point the script at images stored somewhere else.
-It has been tested with the NTSC-U PS2 releases (SLUS-20898 and SLUS-21240).
+Tested and working on Linux and Windows, with the NTSC-U PS2 releases (SLUS-20898 and SLUS-21240).
 
 ## How it was made
 

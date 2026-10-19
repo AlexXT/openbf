@@ -15,8 +15,8 @@ recompiles and re-packs):
 The result plays from anywhere with nothing beside it. It holds the games' own
 content, so it is for your machine only: never upload or share it. Needs
 cargo, python3, bash and ffmpeg (the bake encodes speech to OGG); `strip` is
-used when present. Linux and Windows (card WIN: Git for Windows' bash runs the
-bake; the output is dist/openbf.exe).
+used when present. Tested on Linux and Windows (card WIN: Git for Windows' bash
+runs the bake; the output is dist/openbf.exe).
 """
 
 import argparse
