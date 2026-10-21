@@ -47,6 +47,7 @@ fn model() -> ui::hud::HudModel {
         map: None,
         squad: None,
         capture: None,
+        spawn: None,
     }
 }
 

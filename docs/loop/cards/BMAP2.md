@@ -37,3 +37,13 @@ plain diag(-1,1,-1) (within 0.01) is held in RAM as an axis-aligned box with the
 TAN1. It is in code as `minimap::bounds_of` (PROVISIONAL: the threshold is measured, not read) and the note was left
 unedited. Before building the Large / Spawn views on it: re-run that 16-map check, then correct 2.3 with a dated
 line and commit it (`loopctl.py commit-docs`). The planner did not edit the note: it had not re-measured the claim.
+- 2026-10-20 (card SSELB slice 2): the spawn map page is `ui::spawn_draw::SpawnPage::Map`, drawn in the HUD pass over a 0.51 veil with the tree OFF (`SpawnPage::keeps_tree` = false) and a placeholder post list at the map's slot. The PS2's legend is the tree's own `player1mapkey` group (`player1mapkey_spawnonly`: shown by `player1.map.spawn`, hidden by `player1.map.spawnLargeDisable`; texts `game.spawndisplay.commandpost`, `game.spawndisplay.cpchange`, `game.spawndisplay.spawndisplay.promptNext`). This card: return true from `keeps_tree` for Map (only the map + legend groups, not the tickets), fire `player1.map.spawn`, drop the placeholder list (`MAP_LIST`), and re-take golden `hot1_spawn_map.png`.
+- 2026-10-20 (card SSELB slice 5): the **Spawn view is drawn** (`ui::hud_map::MapView::Spawn`, `Ctx::map_spawn`, fed by
+  `game::minimap::MapStatic::spawn_model`): the whole-map square at PositionSpawn, Scale 0.9, BackdropSpawn 0.5,
+  NorthSpawn x5, the north turn (`turn_of`: NAB2, COR1 GCW, TAN1 180), the team's command walkers as posts, the pick's
+  `hud_icon_flash` ring; this card's NAB2 spawn acceptance (p1, p2, p4 within 3 px) is a test now
+  (`hud_map::tests::spawn_view_posts_land_where_the_ps2_frames_have_them`, plus Hoth's s3_after_auto). Still open
+  here: the Large view; HOT1's shield generator (post 5, `hud_dest_icon`) - missing on the spawn page too
+  (`lead_tmp/sselb/s5/r4/pair.png`); HOT1's cp7 at (-392.4, -94.1), which the port draws unnumbered and the PS2 does not
+  (its entity's +0x228 bit 3 clear, re-hud-map §3 - the port has no such flag yet); the PS2 also shows the enemy's
+  walkers? (only the Empire's two AT-ATs were up in the capture, both friendly).

@@ -609,7 +609,7 @@ mod tests {
     /// no filter: `NearSceneRange[2]` is where the PS2's near scene (and so
     /// its heightfield) ends, `FarSceneRange` where it culls far-scene draws
     /// (`analysis/re-fog.md` §2.5 [V]). The values are BF1 TAT1's, pinned by
-    /// `mungefs/tests/tat1_lvl.rs` against the disc bytes.
+    /// `mungefs/tests/suite/tat1_lvl.rs` against the disc bytes.
     #[test]
     fn the_scene_ranges_are_copied_through_unfiltered() {
         let mut sky = bf1_tat1_sky();

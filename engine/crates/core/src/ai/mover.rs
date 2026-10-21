@@ -288,6 +288,12 @@ pub(super) fn run(
                         m *= dist / step;
                     }
                 }
+                // Card TEAM: on its way, a step behind a team-mate walking
+                // ahead the same way (`team::follow_ease`) - not on the way
+                // to a position, back to the level or away from a grenade.
+                if holding.is_none() && ret.is_none() && !mv.flee {
+                    m *= super::team::follow_ease(sim, me, m);
+                }
                 // Card JITR: on the way to a held position a short step is
                 // WALKED, and a goal the steering cannot go straight at is
                 // given up for where the bot stands.
@@ -677,6 +683,43 @@ mod tests {
             // A draw per arrival: not one point for everybody.
             seen.dedup();
             assert!(seen.len() > 100, "{plinth}: {} points", seen.len());
+        }
+    }
+
+    /// Card TEAM: two bots of one team set out in file 0.8 m apart on the
+    /// L graph's two 40 m legs to the post: the one behind has fallen back
+    /// to a stride (`team::FOLLOW_GAP`) after 1.5 s and keeps it while both
+    /// walk, and both get there.
+    #[test]
+    fn a_file_of_two_walks_a_stride_apart() {
+        use crate::sim::PadState;
+        use crate::unit::{Controller, UnitSpec};
+        let (mut sim, a) = l_sim();
+        let b = sim
+            .spawn(&UnitSpec {
+                controller: Controller::Ai,
+                ..UnitSpec::trooper(0, Vec3::new(0.0, 0.0, 0.8))
+            })
+            .expect("spawned");
+        sim.unit_mut(b).expect("b").soldier.pos = Vec3::new(0.0, 0.0, 0.8);
+        let (mut walked, mut close) = (0, 0);
+        for t in 0..900 {
+            sim.step(&[PadState::default()]);
+            let (ua, ub) = (sim.unit(a).expect("a"), sim.unit(b).expect("b"));
+            let both = ua.soldier.vel.length() > 1.0 && ub.soldier.vel.length() > 1.0;
+            if t >= 45 && both {
+                walked += 1;
+                close += usize::from(nav::xz_dist(ua.soldier.pos, ub.soldier.pos) < 1.5);
+            }
+        }
+        assert!(walked > 150, "{walked} ticks of both walking");
+        assert_eq!(close, 0, "{close} of {walked} ticks within 1.5 m");
+        for h in [a, b] {
+            let p = sim.unit(h).expect("alive").soldier.pos;
+            assert!(
+                nav::xz_dist(p, sim.cps[0].def.pos) < 6.0,
+                "at the post: {p}"
+            );
         }
     }
 

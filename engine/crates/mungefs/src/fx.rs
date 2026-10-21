@@ -1,14 +1,16 @@
-//! `fx__` chunk, `Effect("Water")` and `Effect("HDR")`: how a map's water
-//! surface is painted, tiled and scrolled, and whether BF2 draws the map's
-//! self-lit segments glowing and blooms them ([`HdrConfig`]).
+//! `fx__` chunk, `Effect("Water")`, `Effect("HDR")`, `Effect("Lightning")`,
+//! `Effect("Precipitation")` and `Effect("Wind")`: how a map's water surface
+//! is painted, tiled and scrolled, whether BF2 draws the map's self-lit
+//! segments glowing and blooms them ([`HdrConfig`]), and the map's weather.
 //!
 //! Every LVL carries several `fx__` chunks (3–9 on the twelve water maps,
 //! measured) and each is a munged config tree ([`crate::config`]) of
 //! `Effect("<name>")` records — `ColorControl`, `Wind`, `Precipitation`,
 //! `Lightning`, `Water`, and more. **Only `Effect("Water")`,
-//! `Effect("HDR")`, `Effect("Lightning")` and its `LightningBolt` are decoded
-//! here** ([`LightningConfig`], card KSKY: the effect that darkens the sky
-//! dome between flashes).
+//! `Effect("HDR")`, `Effect("Lightning")` and its `LightningBolt`,
+//! `Effect("Precipitation")` and `Effect("Wind")` are decoded here**
+//! ([`LightningConfig`], card KSKY: the effect that darkens the sky dome
+//! between flashes).
 //! `Effect("Precipitation")` and `Effect("Wind")` are [`PrecipitationConfig`]
 //! and [`WindConfig`] (card WTHR, `analysis/re-weather.md`). Every other
 //! effect is unparsed (`ColorControl` is read by neither ELF); this module

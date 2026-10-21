@@ -62,7 +62,7 @@ pub use pickups::{
 };
 pub use round::scale_reinforcements;
 pub use seats::{ENTER_REACH, EXIT_RING};
-pub use spawn::SpawnWaves;
+pub use spawn::{SideChoice, SpawnStage, SpawnWaves};
 pub use state::{
     omni_radius_for, Call, Cheats, DeathCause, Event, Hazard, NavStats, Sim, HAZARD_RADIUS,
     LETHAL_LANDING_SPEED, OUTCOME_DRAW,

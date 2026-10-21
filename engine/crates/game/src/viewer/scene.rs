@@ -9,8 +9,8 @@
 
 use super::camera::instance_matrix;
 use super::look::{
-    apply_lighting, clear_color, far_cull, far_cull_from, lowres_enabled, lowres_range,
-    speckle_enabled, speckle_frames, speckle_look, water_look,
+    apply_lighting, clear_color, far_cull, far_cull_from, lod_bands, lod_enabled, lowres_enabled,
+    lowres_range, speckle_enabled, speckle_frames, speckle_look, water_look,
 };
 use super::upload::{
     compact_submesh, upload_cpu_texture_inner, upload_cpu_texture_scrolling, upload_submeshes,
@@ -251,6 +251,8 @@ struct PlacedModel<'a> {
     /// Metres nearer than which the draw is discarded — the far scene's
     /// reach, for a geometry's LOWD extension alone ([`upload_scene`]).
     near: Option<f32>,
+    /// Card LOD: this draw's side of the far scene's model / LOWD switch.
+    lod: Option<render::LodSwitch>,
 }
 
 type ModelPart = (
@@ -786,6 +788,9 @@ pub fn upload_scene(r: &mut Renderer, scene: &Scene) -> Result<SceneGpu> {
         .as_ref()
         .map_or(&[][..], |f| &f.path_props[..]);
     let mut placed: Vec<PlacedModel<'_>> = Vec::new();
+    let bands = lod_enabled()
+        .then(|| lod_bands(&scene.manifest.lighting))
+        .flatten();
     for (ii, inst) in scene
         .manifest
         .instances
@@ -798,6 +803,20 @@ pub fn upload_scene(r: &mut Renderer, scene: &Scene) -> Result<SceneGpu> {
             continue;
         };
         let world = ii < scene.manifest.instances.len();
+        // Card LOD (`analysis/re-lod.md` §4, §7 [O]): on a map with a far
+        // scene the PS2 draws a geometry that has a LOWD as its model to the
+        // near scene's end and as its LOWD past the far scene's reach; the
+        // two draws below share one dithered threshold per pixel between
+        // `NearSceneRange[1]` and `[2]` ([`render::LodSwitch`]). The PS2
+        // culls the LOWD at `FarSceneRange` by the OBJECT's sphere; the port
+        // gives it the map's model cull like every other draw (per fragment,
+        // off by default), since a per-fragment cut at `FarSceneRange` drops
+        // BF2 UTA1's far sinkhole wall, a ring whose sphere is near. A geometry with no LOWD is drawn as its
+        // model at every distance — the PS2 does not draw it past
+        // `NearSceneRange[2]`; the port keeps it, a named deviation (draw
+        // distance, re-lod §7.2). Path props are world instances of their
+        // class (re-foliage §9) and take the same rule.
+        let lowd = bands.and_then(|b| Some((scene.resolve_lowd(&inst.class)?, b)));
         placed.push(PlacedModel {
             model,
             matrix: instance_matrix(inst.rotation, inst.translation),
@@ -822,14 +841,28 @@ pub fn upload_scene(r: &mut Renderer, scene: &Scene) -> Result<SceneGpu> {
             color: None,
             fade: None,
             near: None,
+            lod: lowd.map(|(_, b)| b.sides().0),
         });
+        if let Some((lowd, b)) = lowd {
+            placed.push(PlacedModel {
+                model: lowd,
+                matrix: instance_matrix(inst.rotation, inst.translation),
+                door: None,
+                turret: None,
+                color: None,
+                fade: None,
+                near: None,
+                lod: Some(b.sides().1),
+            });
+            continue;
+        }
         // The far scene's LOWD extension (card UTAS, `analysis/re-far-lowd.md`
-        // §0/§6 [O]): the PS2 draws a geometry's LOWD in its far scene, which
-        // takes an object whose sphere reaches past `NearSceneRange[1]`
-        // (times the camera zoom, 1 here). The port draws LOD0 everywhere
-        // and adds only what LOD0 lacks — BF2 UTA1's far sinkhole wall —
-        // with the fragments nearer than `NearSceneRange[1]` discarded.
-        // A map with no `NearSceneRange` has no far scene to draw it in.
+        // §0/§6 [O]): what a geometry's LOWD draws beyond its LOD0 — BF2
+        // UTA1's far sinkhole wall — with the fragments nearer than
+        // `NearSceneRange[1]` discarded. The switch above draws the whole
+        // LOWD past the near scene and so covers it wherever it applies;
+        // this is left for a geometry the switch does not take (it is off,
+        // `OPENBF_LOD=0`, or its mesh did not load).
         let reach = scene.manifest.lighting.near_scene_range.map(|r| r[1]);
         if let (true, Some(far), Some(near)) = (world, scene.resolve_far(&inst.class), reach) {
             placed.push(PlacedModel {
@@ -840,6 +873,7 @@ pub fn upload_scene(r: &mut Renderer, scene: &Scene) -> Result<SceneGpu> {
                 color: None,
                 fade: None,
                 near: Some(near),
+                lod: None,
             });
         }
     }
@@ -855,6 +889,7 @@ pub fn upload_scene(r: &mut Renderer, scene: &Scene) -> Result<SceneGpu> {
                 color: Some(f.color),
                 fade: f.fade,
                 near: None,
+                lod: None,
             }),
     );
     // Card BPNT: each world model's sphere, in model space, for the local
@@ -897,6 +932,7 @@ pub fn upload_scene(r: &mut Renderer, scene: &Scene) -> Result<SceneGpu> {
         }
         let m = p.matrix;
         let far = cull.map(|c| c.world);
+        let lowd = matches!(p.lod, Some(l) if l.side == render::LodSide::Lowd);
         let rig = p.door.map(|(_, d)| d);
         let mut moving = Vec::new();
         let mut turning = Vec::new();
@@ -905,8 +941,9 @@ pub fn upload_scene(r: &mut Renderer, scene: &Scene) -> Result<SceneGpu> {
             let first = draws.len();
             // The specular second pass rides only a textured draw: its add is
             // weighted by the base texel's alpha. A far-scene draw (`p.near`)
-            // takes none: BF2's pass is the near scene's (`spec_cull`).
-            if let (Some(b), Some(sp), None) = (tex, spec, p.near) {
+            // takes none: BF2's pass is the near scene's (`spec_cull`). Nor
+            // does a LOWD (card LOD), drawn only in the far scene.
+            if let (Some(b), Some(sp), None, false) = (tex, spec, p.near, lowd) {
                 let rgb = sp.rgb_under(scene.manifest.lighting.sun_color);
                 // `light` too: `fs_spec` recomputes its base draw's colour.
                 draws.push(
@@ -914,6 +951,7 @@ pub fn upload_scene(r: &mut Renderer, scene: &Scene) -> Result<SceneGpu> {
                         .with_cull(spec_cull(scene, far))
                         .with_light(*light)
                         .with_fade(p.fade)
+                        .with_lod(p.lod)
                         .with_lit(lit),
                 );
             }
@@ -929,6 +967,7 @@ pub fn upload_scene(r: &mut Renderer, scene: &Scene) -> Result<SceneGpu> {
                 },
             }
             .with_cull_near(p.near)
+            .with_lod(p.lod)
             .with_light(*light)
             .with_fade(p.fade)
             .with_lit(lit);

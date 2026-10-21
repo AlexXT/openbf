@@ -38,6 +38,10 @@ pub const MEMORY_TICKS: u64 = 90;
 /// placeholder, no RE).
 pub const HEAR_RADIUS: f32 = 30.0;
 
+/// The unit grid's query is this much wider than the test it feeds (m): the
+/// grid measures the feet in XZ, the tests a body's centre in 3D (card TEAM).
+const NEAR_MARGIN: f32 = 1.0;
+
 /// The visibility factor of the view-distance shape (RE §5.1). The port has
 /// no concealment byte (RE §5.3), so it is 1.0 — PROVISIONAL.
 pub const VIS: f32 = 1.0;
@@ -63,6 +67,10 @@ pub struct Contact {
     pub seen_now: bool,
     /// The last record came from hearing, not sight.
     pub heard: bool,
+    /// Card TEAM: ...and from a FRIEND's sight ([`tell`]), not this unit's
+    /// own eyes or ears. A told record is aimed at; it does not keep the
+    /// unit on a position (`ai::behave`).
+    pub told: bool,
 }
 
 impl Contact {
@@ -76,7 +84,10 @@ impl Contact {
         for v in [self.last_pos.x, self.last_pos.y, self.last_pos.z] {
             eat(&v.to_bits().to_le_bytes());
         }
-        eat(&[self.seen_now as u8, self.heard as u8]);
+        eat(&[
+            self.seen_now as u8,
+            self.heard as u8 | (self.told as u8) << 1,
+        ]);
     }
 
     /// Age in seconds since the last record.
@@ -271,8 +282,17 @@ pub fn scan(sim: &Sim, me: UnitHandle, st: &mut AiState, tier: Tier) -> (u8, u8)
     // 2. Look. The cone and the view distance are cheap and cull first; the
     //    LOS ray is the cost driver, so it runs in ascending distance (unit
     //    index order on ties) and stops once six enemies are seen.
+    //    Card TEAM: the candidates are the unit grid's within the farthest
+    //    view distance (a standing body's), in unit-index order as before.
     let mut cand: Vec<(f32, u32, UnitHandle, Vec3)> = Vec::new();
-    for (h, o) in sim.alive_units() {
+    let mut near: Vec<u32> = Vec::new();
+    sim.units_within(
+        eye,
+        view_distance(Stance::Stand, tier.view_mult) + NEAR_MARGIN,
+        &mut near,
+    );
+    for &i in &near {
+        let (h, o) = (sim.handle(i as usize), &sim.units[i as usize]);
         if h == me || o.team == u.team {
             continue;
         }
@@ -316,8 +336,18 @@ pub fn scan(sim: &Sim, me: UnitHandle, st: &mut AiState, tier: Tier) -> (u8, u8)
 
     // 3. Listen (no cone, no LOS): a shot fired inside HEAR_RADIUS since the
     //    last think, and — at any range — whoever hit me.
+    //    Card TEAM: the grid's units within HEAR_RADIUS, and whoever hit me.
     let mut heard = 0u8;
-    for (h, o) in sim.alive_units() {
+    sim.units_within(eye, HEAR_RADIUS + NEAR_MARGIN, &mut near);
+    if let Some((s, _)) = u.last_hit {
+        if let Err(k) = near.binary_search(&s.index) {
+            if sim.units.get(s.index as usize).is_some_and(|o| o.alive) {
+                near.insert(k, s.index);
+            }
+        }
+    }
+    for &i in &near {
+        let (h, o) = (sim.handle(i as usize), &sim.units[i as usize]);
         if h == me || o.team == u.team {
             continue;
         }
@@ -328,13 +358,54 @@ pub fn scan(sim: &Sim, me: UnitHandle, st: &mut AiState, tier: Tier) -> (u8, u8)
         let hit_me = u
             .last_hit
             .is_some_and(|(s, t)| s == h && tick.checked_sub(t).is_some_and(|d| d < THINK_PERIOD));
-        if (shot || hit_me) && hear(st, h, tick, o.soldier.pos) {
+        if (shot || hit_me) && hear(st, h, tick, o.soldier.pos, false) {
             heard += 1;
         }
     }
 
     let held = st.contacts.iter().flatten().count() as u8;
     (held, heard)
+}
+
+/// Card TEAM: a friend this near passes on what it sees (m; the bot
+/// design's 4.1). OURS and PROVISIONAL.
+pub const TELL_RADIUS: f32 = 20.0;
+
+/// Card TEAM (`analysis/bot-design.md` 4.1, 4.3, section 7's column): an
+/// enemy that a friend within [`TELL_RADIUS`] saw at its last think is
+/// HEARD by unit `me` — recorded at the friend's last known point, its
+/// reaction counted from now, marked [`Contact::told`] — so it is aimed at
+/// while the bot walks its own way (a told record holds nobody on a
+/// position), and never fired at until `me` sees it ([`fireable`]). The
+/// bot's own record of the same enemy is never overwritten.
+/// Friends in unit-index order, their records in slot order; a tier without
+/// [`Tier::tell`] is told nothing. Runs after [`scan`] in the same think.
+/// Returns the records made or refreshed.
+pub fn tell(sim: &Sim, me: UnitHandle, st: &mut AiState, tier: Tier) -> u8 {
+    let Some(u) = sim.unit(me).filter(|_| tier.tell) else {
+        return 0;
+    };
+    let feet = u.soldier.pos;
+    let mut near: Vec<u32> = Vec::new();
+    sim.units_within(feet, TELL_RADIUS + NEAR_MARGIN, &mut near);
+    let mut told = 0u8;
+    for &i in &near {
+        let (h, o) = (sim.handle(i as usize), &sim.units[i as usize]);
+        if h == me
+            || o.team != u.team
+            || (o.soldier.pos - feet).length_squared() >= TELL_RADIUS * TELL_RADIUS
+        {
+            continue;
+        }
+        for c in o.ai.contacts.iter().flatten().filter(|c| c.seen_now) {
+            if sim.unit(c.handle).is_some_and(|e| e.team != u.team)
+                && hear(st, c.handle, sim.tick, c.last_pos, true)
+            {
+                told = told.saturating_add(1);
+            }
+        }
+    }
+    told
 }
 
 /// A NEW target restarts the aim tracker at the unit's own facing (brief D9)
@@ -364,6 +435,7 @@ fn slot_for(st: &mut AiState, h: UnitHandle, tick: u64, pos: Vec3) -> usize {
         last_pos: pos,
         seen_now: false,
         heard: false,
+        told: false,
     };
     let i = match st.contacts.iter().position(Option::is_none) {
         Some(i) => i,
@@ -382,14 +454,17 @@ fn see(st: &mut AiState, h: UnitHandle, tick: u64, pos: Vec3) {
         c.last_pos = pos;
         c.seen_now = true;
         c.heard = false;
+        c.told = false;
     }
 }
 
 /// Record a heard enemy. Returns `false` when the unit already has EYES on it
 /// this think — sight is the better record and hearing must not overwrite it
-/// (the design's "seen_now stays false" for a heard record).
-fn hear(st: &mut AiState, h: UnitHandle, tick: u64, pos: Vec3) -> bool {
-    if contact_of(st, h).is_some_and(|c| c.seen_now) {
+/// (the design's "seen_now stays false" for a heard record). Card TEAM: a
+/// `told` record (a friend's, [`tell`]) never overwrites one of the unit's
+/// own: its own memory of a target lapses as it would untold.
+fn hear(st: &mut AiState, h: UnitHandle, tick: u64, pos: Vec3, told: bool) -> bool {
+    if contact_of(st, h).is_some_and(|c| c.seen_now || told && !c.told) {
         return false;
     }
     let i = slot_for(st, h, tick, pos);
@@ -397,6 +472,7 @@ fn hear(st: &mut AiState, h: UnitHandle, tick: u64, pos: Vec3) -> bool {
         c.last_seen = tick;
         c.last_pos = pos;
         c.heard = true;
+        c.told = told;
     }
     true
 }
@@ -797,6 +873,212 @@ mod tests {
         let mut st = AiState::default();
         assert_eq!(scan(&s, a, &mut st, normal()), (1, 1), "hit from 80 m");
         assert!(contact_of(&st, e).unwrap().heard);
+    }
+
+    /// Card TEAM: a scene for passing contacts on - the watcher at the
+    /// origin facing -Z, an enemy 30 m behind it beyond a wall (it can
+    /// neither see nor hear it), and a friend at `friend` whose last think
+    /// saw the enemy (`seen` false: only remembered it).
+    fn told_scene(friend: Vec3, seen: bool) -> (Sim, UnitHandle, UnitHandle, UnitHandle) {
+        let (mut s, a) = watcher(31);
+        let e = enemy_at(&mut s, Vec3::new(0.0, 0.0, 30.0));
+        s.collision.push_body(Body::new(
+            Mat4::from_translation(Vec3::new(0.0, 5.0, 15.0)),
+            Shape::Box {
+                half: Vec3::new(5.0, 5.0, 0.5),
+            },
+        ));
+        let f = s
+            .spawn(&UnitSpec {
+                controller: Controller::Ai,
+                ..UnitSpec::trooper(0, friend)
+            })
+            .unwrap();
+        s.units[f.index as usize].ai.contacts[0] = Some(Contact {
+            handle: e,
+            first_seen: 0,
+            last_seen: 0,
+            last_pos: Vec3::new(0.0, 0.9, 30.0),
+            seen_now: seen,
+            heard: false,
+            told: false,
+        });
+        s.tick = 5;
+        (s, a, e, f)
+    }
+
+    /// Card TEAM (bot design 4.1): what a friend within 20 m sees is heard -
+    /// at the friend's point, its reaction counted from now - and nothing is
+    /// passed on from 20.5 m, from a memory, or at Easy.
+    fn telling() -> Tier {
+        assert!(normal().tell, "Normal tells (the design's column)");
+        normal()
+    }
+
+    #[test]
+    fn a_friend_within_twenty_metres_passes_on_what_it_sees() {
+        let told = |friend: Vec3, seen: bool, tier: Tier| {
+            let (s, a, e, _) = told_scene(friend, seen);
+            let mut st = AiState::default();
+            assert_eq!(scan(&s, a, &mut st, tier), (0, 0), "not seen, not heard");
+            let n = tell(&s, a, &mut st, tier);
+            (n, contact_of(&st, e))
+        };
+        let (n, c) = told(Vec3::new(15.0, 0.0, 0.0), true, telling());
+        let c = c.expect("told");
+        assert_eq!(n, 1);
+        assert!(c.heard && c.told && !c.seen_now, "heard, told, not seen");
+        assert_eq!(c.last_pos, Vec3::new(0.0, 0.9, 30.0), "the friend's point");
+        assert_eq!(c.first_seen, 5, "the reaction counts from the telling");
+        assert_eq!(
+            told(Vec3::new(19.5, 0.0, 0.0), true, telling()).0,
+            1,
+            "19.5 m"
+        );
+        assert_eq!(
+            told(Vec3::new(20.5, 0.0, 0.0), true, telling()),
+            (0, None),
+            "20.5 m"
+        );
+        assert_eq!(
+            told(Vec3::new(15.0, 0.0, 0.0), false, telling()),
+            (0, None),
+            "a memory"
+        );
+        // The design's column (section 7): every tier but Easy.
+        for (d, n) in [
+            (Difficulty::Easy, 0),
+            (Difficulty::Normal, 1),
+            (Difficulty::Hard, 1),
+            (Difficulty::Elite, 1),
+        ] {
+            assert_eq!(
+                told(Vec3::new(15.0, 0.0, 0.0), true, d.tier()).0,
+                n,
+                "{d:?}"
+            );
+        }
+    }
+
+    /// Card TEAM: a friend's telling never overwrites the unit's own record
+    /// of the enemy (its own memory lapses as it would untold), and sight
+    /// clears the told mark.
+    #[test]
+    fn a_told_record_never_overwrites_the_units_own() {
+        let (mut s, a, e, _) = told_scene(Vec3::new(15.0, 0.0, 0.0), true);
+        let own = Contact {
+            handle: e,
+            first_seen: 1,
+            last_seen: 2,
+            last_pos: Vec3::new(3.0, 0.0, 28.0),
+            seen_now: false,
+            heard: true,
+            told: false,
+        };
+        let mut st = AiState::default();
+        st.contacts[0] = Some(own);
+        assert_eq!(tell(&s, a, &mut st, telling()), 0, "its own record stands");
+        assert_eq!(contact_of(&st, e), Some(own));
+        // Its own memory lapses; then the friend's sight is told.
+        s.tick = 2 + MEMORY_TICKS + 1;
+        scan(&s, a, &mut st, telling());
+        assert_eq!(contact_of(&st, e), None, "forgotten");
+        assert_eq!(tell(&s, a, &mut st, telling()), 1);
+        assert!(contact_of(&st, e).is_some_and(|c| c.told));
+        // Seen, it is the unit's own again.
+        see(&mut st, e, s.tick + 1, Vec3::new(0.0, 0.9, 30.0));
+        assert!(contact_of(&st, e).is_some_and(|c| c.seen_now && !c.told && !c.heard));
+    }
+
+    /// Card TEAM: a told enemy keeps nobody on a position. A bot hiding at a
+    /// covered position (`COVER`), or holding one with time left on it,
+    /// whose target only a friend sees lets it go - after `HOLD_CLOSE`, or
+    /// once it has been quiet for `HOLD_QUIET`; the same bot with a record
+    /// of its OWN (the control: told by hand each tick, as its ears would)
+    /// keeps it the whole 10 s.
+    #[test]
+    fn a_told_enemy_keeps_nobody_on_a_position() {
+        use crate::ai::{FightState, HoldState, HOLD_CLOSE};
+        let kept = |own: bool, cover: bool| {
+            let (mut s, a, e, f) = told_scene(Vec3::new(15.0, 0.0, 0.0), true);
+            let mut st = AiState {
+                hold: Some(HoldState {
+                    until: 5 + if cover {
+                        HOLD_CLOSE
+                    } else {
+                        20 * crate::TICK_HZ as u64
+                    },
+                    last_contact: 5,
+                    ..HoldState::default()
+                }),
+                ..AiState::default()
+            };
+            st.fight.mode = if cover { FightState::COVER } else { 0 };
+            if cover {
+                // (At COVER a bot holds a position of the table, where it
+                // stands: card TPOSR runs the Tactician on its own record.)
+                use crate::ai::tactic::{Position, PositionTable, Source};
+                let q = Position {
+                    pos: s.units[a.index as usize].soldier.pos,
+                    source: Source::Edge,
+                    facing: glam::Vec2::ZERO,
+                    stance: 0,
+                    stance2: 0,
+                    hub: u16::MAX,
+                    low: 0,
+                    corner: 0,
+                    shut: 0,
+                    tall: 0,
+                };
+                s.positions = PositionTable::index(vec![q], Default::default());
+                st.tpos.held = Some(0);
+            }
+            for t in 5..5 + 10 * crate::TICK_HZ as u64 {
+                s.tick = t;
+                if let Some(c) = s.units[f.index as usize].ai.contacts[0].as_mut() {
+                    c.seen_now = true;
+                    c.last_seen = t;
+                }
+                if own {
+                    st.contacts[0] = Some(Contact {
+                        handle: e,
+                        first_seen: 5,
+                        last_seen: t,
+                        last_pos: Vec3::new(0.0, 0.9, 30.0),
+                        seen_now: false,
+                        heard: true,
+                        told: false,
+                    });
+                }
+                think(&s, a, &mut st);
+            }
+            assert_eq!(st.target, Some(e), "own {own}: the enemy is the target");
+            st.hold.is_some_and(|h| s.tick < h.until)
+        };
+        for cover in [true, false] {
+            assert!(kept(true, cover), "cover {cover}: its own record keeps it");
+            assert!(!kept(false, cover), "cover {cover}: a friend's does not");
+        }
+    }
+
+    /// Card TEAM: a told enemy becomes the target and is aimed at, and is
+    /// never fired at while the bot cannot see it, however long it is told.
+    #[test]
+    fn a_told_enemy_is_aimed_at_and_never_fired_at_unseen() {
+        let (mut s, a, e, f) = told_scene(Vec3::new(15.0, 0.0, 0.0), true);
+        let mut st = AiState::default();
+        for t in 5..5 + 4 * THINK_PERIOD * 10 {
+            s.tick = t;
+            if let Some(c) = s.units[f.index as usize].ai.contacts[0].as_mut() {
+                c.seen_now = true;
+                c.last_seen = t;
+            }
+            let (pad, _) = think(&s, a, &mut st);
+            assert_eq!(pad.buttons & buttons::FIRE, 0, "no shot at tick {t}");
+        }
+        assert_eq!(st.target, Some(e), "the told enemy is the target");
+        let c = contact_of(&st, e).expect("still held");
+        assert!(c.heard && !c.seen_now);
     }
 
     /// Target choice (decision 3): the current target is kept until a rival

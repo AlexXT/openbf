@@ -11,3 +11,5 @@ core/src/commander.rs queued split: card SPL7 (1,618 when filed, 2,508 at cleans
 core/src/ai/behave.rs queued split: card SPL13 (1,973 when SPL11 made it; past 2,000 through DEFS / CLSE2 / REACT)
 game/src/sounds.rs queued split: card SPL8 (2,402 at cleanse 17)
 core/src/sim/step.rs queued split: card SPL12 (2,018 at cleanse 17)
+core/src/sim/spawn.rs queued split: card SPL12 (1,561 when filed, 2,758 at cleanse 19)
+game/src/soldier_vis.rs queued split: card SPL14 (2,071 at cleanse 19)

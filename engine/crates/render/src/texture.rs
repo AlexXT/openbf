@@ -7,7 +7,6 @@
 //! `create_terrain_sampler`), with Repeat addressing because game textures tile.
 
 use crate::RenderError;
-use wgpu::util::DeviceExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SamplerMode {
@@ -124,19 +123,22 @@ impl GpuTexture {
         };
         // U and W stay REPEAT unconditionally; only V is described by the
         // desc — see [`WrapV`].
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: desc.label,
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: match desc.wrap_v {
-                WrapV::Repeat => wgpu::AddressMode::Repeat,
-                WrapV::ClampToEdge => wgpu::AddressMode::ClampToEdge,
+        let sampler = crate::made::sampler(
+            device,
+            &wgpu::SamplerDescriptor {
+                label: desc.label,
+                address_mode_u: wgpu::AddressMode::Repeat,
+                address_mode_v: match desc.wrap_v {
+                    WrapV::Repeat => wgpu::AddressMode::Repeat,
+                    WrapV::ClampToEdge => wgpu::AddressMode::ClampToEdge,
+                },
+                address_mode_w: wgpu::AddressMode::Repeat,
+                mag_filter: filter,
+                min_filter: filter,
+                mipmap_filter: filter,
+                ..Default::default()
             },
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: filter,
-            min_filter: filter,
-            mipmap_filter: filter,
-            ..Default::default()
-        });
+        );
 
         // MaterialParams {
         //   detail: [detail_scale, detail_strength, RESERVED, pad],
@@ -168,38 +170,44 @@ impl GpuTexture {
                 desc.uv_scale[1],
             ],
         };
-        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: desc.label,
-            contents: bytemuck::cast_slice(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let params_buf = crate::made::buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: desc.label,
+                contents: bytemuck::cast_slice(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            },
+        );
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: desc.label,
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    // No detail map: bind the base view (never sampled, but
-                    // WebGPU requires every binding to be filled).
-                    resource: wgpu::BindingResource::TextureView(
-                        detail_view.as_ref().unwrap_or(&view),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let bind_group = crate::made::bind_group(
+            device,
+            &wgpu::BindGroupDescriptor {
+                label: desc.label,
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        // No detail map: bind the base view (never sampled, but
+                        // WebGPU requires every binding to be filled).
+                        resource: wgpu::BindingResource::TextureView(
+                            detail_view.as_ref().unwrap_or(&view),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            },
+        );
 
         Ok(Self { bind_group })
     }
@@ -236,20 +244,23 @@ pub(crate) fn upload_levels(
     } else {
         wgpu::TextureFormat::Rgba8Unorm
     };
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label,
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
+    let texture = crate::made::texture(
+        device,
+        &wgpu::TextureDescriptor {
+            label,
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mips.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
         },
-        mip_level_count: mips.len() as u32,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
+    );
 
     for (i, level) in mips.iter().enumerate() {
         let (w, h) = (mip_extent(width, i as u32), mip_extent(height, i as u32));

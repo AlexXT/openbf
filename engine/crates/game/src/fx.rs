@@ -53,11 +53,9 @@ use std::sync::Arc;
 pub const BF1_IMPACT: &str = "ord_explosion";
 pub const BF2_IMPACT: &str = "com_sfx_ord_exp";
 
-/// How far an ordnance's explosion sits off the hit, metres: B1
-/// FUN_00272d70 detonates at hit + 0.2·v (DAT_005182a8 = 0.2). PROVISIONAL
-/// [H]: v is the handler's fourth argument, unidentified (a normal is
-/// likely); the port backs off along the bolt.
-const EXPLOSION_OFFSET: f32 = 0.2;
+// How far an ordnance's explosion sits off the hit (the sim's blast sits
+// there too).
+use core::weapon::EXPLOSION_OFFSET;
 
 /// PROVISIONAL sizes (m) and lifetimes (s).
 const IMPACT_SIZE: f32 = 0.45;
@@ -356,6 +354,30 @@ impl LiveEffect {
     }
 }
 
+/// Effect sheet `name` (lowercase) from the first of `dirs` that holds it,
+/// uploaded once into `cache`; None (once, with a line) when none does.
+fn sheet(
+    r: &mut Renderer,
+    dirs: &[std::path::PathBuf],
+    cache: &mut HashMap<String, Option<TextureHandle>>,
+    name: &str,
+) -> Option<TextureHandle> {
+    if let Some(t) = cache.get(name) {
+        return *t;
+    }
+    let t = dirs.iter().find_map(|d| {
+        crate::viewer::upload_texture_file(r, d, name).unwrap_or_else(|e| {
+            eprintln!("effect texture {name}: {e:#}");
+            None
+        })
+    });
+    if t.is_none() {
+        eprintln!("effect texture {name}: in no layer (drawn as nothing)");
+    }
+    cache.insert(name.to_owned(), t);
+    t
+}
+
 /// The game's effects: the particle effects running and the placeholder
 /// puffs. `ingest` once per sim tick, `update` once per rendered frame.
 #[derive(Default)]
@@ -491,6 +513,34 @@ impl Fx {
         &self.live
     }
 
+    /// Upload every sheet the library's effects can draw (card HITCH): at the
+    /// battle's load, so no effect's first spawn reads a file and makes a
+    /// texture inside a frame. Returns how many were wanted.
+    pub fn preload(&mut self, r: &mut Renderer) -> usize {
+        let Some(lib) = &self.library else {
+            return 0;
+        };
+        let mut names: Vec<String> = Vec::new();
+        for def in lib.effects.values() {
+            let mut next: Vec<&FxEmitter> = def.emitters.iter().collect();
+            while let Some(em) = next.pop() {
+                if let Some(n) = em.geometry.texture.as_deref() {
+                    let n = n.to_ascii_lowercase();
+                    if !names.contains(&n) {
+                        names.push(n);
+                    }
+                }
+                next.extend(em.sibling.as_deref());
+                next.extend(em.geometry.child.as_deref());
+            }
+        }
+        names.sort();
+        for n in &names {
+            sheet(r, &lib.texture_dirs, &mut self.textures, n);
+        }
+        names.len()
+    }
+
     /// The rifle impact of this library's game (see the module doc).
     fn impact_name(&self) -> &'static str {
         match self.library.as_ref().map(|l| l.era) {
@@ -512,22 +562,7 @@ impl Fx {
         if let Some(lib) = &self.library {
             let cache = &mut self.textures;
             let dirs = &lib.texture_dirs;
-            let mut texture = |name: &str| -> Option<TextureHandle> {
-                if let Some(t) = cache.get(name) {
-                    return *t;
-                }
-                let t = dirs.iter().find_map(|d| {
-                    crate::viewer::upload_texture_file(r, d, name).unwrap_or_else(|e| {
-                        eprintln!("effect texture {name}: {e:#}");
-                        None
-                    })
-                });
-                if t.is_none() {
-                    eprintln!("effect texture {name}: in no layer (drawn as nothing)");
-                }
-                cache.insert(name.to_owned(), t);
-                t
-            };
+            let mut texture = |name: &str| sheet(r, dirs, cache, name);
             for e in &self.live {
                 e.draws(
                     lib.era,
@@ -749,6 +784,7 @@ impl Fx {
                     // and no near edge either — that is the `LOWR` sheet's
                     // alone (`viewer::lowres_range`).
                     cull_near: None,
+                    lod: None,
                     light: render::LightPath::Lit,
                     fade: None,
                     lit: None,

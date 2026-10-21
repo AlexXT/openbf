@@ -51,7 +51,10 @@ v . XFRM . Bind(PRNT)) the pinned ring sits at y 1.105..1.226 m (pelvis 1.159) a
 ## 2. Who wears it [V][O]
 
 - The `gmod` chunk (the geometry's LOD table) carries the list: FUN_001c59e8 reads INFO = u32, f32, **u32 count
-  (<= 8), count cloth names** into +0x54 / +0x58.. of the geometry object (table 0x684530) (B2:72347-72404).
+  (8 slots), count cloth names** into +0x54 / +0x58.. of the geometry object (table 0x684530) (B2:72347-72404).
+  Correction (cleanse 19, 2026-10-20): the 8 is the size of the slot array, not a check. B2:72386-72393 stores all
+  `count` names, and B2:72395-72400 zero-fills the slots from `count` up to 8. A count over 8 runs into the fields
+  after the slots. The port's reader returns no list for a count over 8, which is its own choice (`mungefs::entity`).
 - At spawn FUN_00234a68 walks that list of the soldier's geometry object (E+0x160): for each name, the class with that
   name (the global class list, +0x14) is instantiated through its vtable +0x10 into **E+0x10a4 + 4i**; a name the
   class lookup does not find leaves its slot 0, nothing drawn (B2:149930-149990). The instance finds its ClothData by the CLASS

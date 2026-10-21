@@ -230,6 +230,7 @@ mod stall;
 mod state;
 mod steer;
 pub mod tactic;
+pub mod team;
 pub mod walker_drive;
 
 pub use arsenal::vehicle_bonus;
@@ -241,15 +242,17 @@ pub use draw::{
     SALT_ERR_AXIS, SALT_ERR_DIR, SALT_FOLLOW, SALT_FORMATION, SALT_GRENADE, SALT_HOLD,
     SALT_NEED_GUNNER, SALT_REACT, SALT_STANCE, SALT_TAP,
 };
+pub(crate) use gunner_foot::release_blasts_own_side;
 pub use gunner_foot::yaw_toward;
 pub use route::{first_leg, floor_walked};
 pub use state::{
-    AiState, Behaviour, FightState, HoldState, LostState, MoverState, NavTick, RideState, Round,
-    Route, RouteSource, SnipeBook, SnipeState, StallState, SteerPick, TposState, Walk, WalkAsk,
+    AiState, Behaviour, FightState, FlankState, HoldState, LostState, MoverState, NavTick,
+    RideState, RoleState, Round, Route, RouteSource, SnipeBook, SnipeState, StallState, SteerPick,
+    TposState, Walk, WalkAsk,
 };
 pub use steer::{rotate_xz, way_ahead, Stop, StopKind};
 
-pub(crate) use ride::{board_reach, claim_seat};
+pub(crate) use ride::{claim_seat, in_reach};
 pub(crate) use route::{hub_on_level, mover, plan_leg, start_hub};
 
 // ---------------------------------------------------------------------------
@@ -670,6 +673,19 @@ pub const BOARD_GIVEUP: u64 = 30 * crate::TICK_HZ as u64;
 /// claimer walking at an AT-AT's origin slid on its hull 8.1-9.7 m from it,
 /// 0.1-1.7 m short, until its claim ran out.
 pub const BOARD_SLACK: f32 = 2.0;
+/// Card TBRD: the PS2's board agent asks to enter when the bot's body sphere
+/// and the vehicle's are this close (m, 3-D): BF2 1.5 (`FUN_002c42d8`, `lui
+/// 0x3fc0` at 0x2c4564), BF1 0.5 (`FUN_00244848`, `lui 0x3f00` at 0x244a4c;
+/// analysis/re-soldier-ai.md 7.2, 7.5). The port applies it to building
+/// turrets; a vehicle keeps the player's reach and [`BOARD_SLACK`].
+pub const BOARD_PAD_BF2: f32 = 1.5;
+pub const BOARD_PAD_BF1: f32 = 0.5;
+/// Card TBRD, OURS: a bot whose body's centre is this far (m) above or below
+/// a building turret's origin, inside its reach in XZ, is on another floor
+/// and gives its claim up (`ride::on_another_floor`): over a soldier's
+/// height, under the 2.4 m that BF1 Bespin's balcony gun turrets stand
+/// over the walk below them.
+pub const OTHER_FLOOR: f32 = 2.0;
 /// After a dismount or a failed claim, no new claim for this many ticks.
 pub const BOARD_BLOCK: u64 = 30 * crate::TICK_HZ as u64;
 /// A driver whose route stuck run reaches this many ticks gets out and walks.

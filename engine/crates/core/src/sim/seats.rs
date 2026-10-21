@@ -189,7 +189,7 @@ impl Sim {
     /// Step 1c, for the bots (card VAI): the request each think left in
     /// `AiState::ride` — a seated bot gets out; one on foot enters its
     /// claim's pilot seat when the vehicle is still within
-    /// `ai::board_reach` and CanEnter still gives it (the PS2's AI enters
+    /// `ai::in_reach` and CanEnter still gives it (the PS2's AI enters
     /// through the same Enter slot, re-vehicles §5). A bot that changed
     /// place re-plans on its next think; a failed entry blocks new claims
     /// for `ai::BOARD_BLOCK`.
@@ -222,10 +222,7 @@ impl Sim {
                 r.block_until = self.tick + crate::ai::BOARD_BLOCK;
                 true
             } else if let Some(vh) = r.board.take() {
-                let pos = self.units[i].soldier.pos;
-                let near = self.vehicle(vh).is_some_and(|v| {
-                    crate::nav::xz_dist(pos, v.pos) <= crate::ai::board_reach(self, vh)
-                });
+                let near = crate::ai::in_reach(self, &self.units[i], vh);
                 let seat = crate::ai::claim_seat(self, h, vh).filter(|_| near);
                 let entered = seat.is_some_and(|k| self.enter_vehicle(h, vh, k));
                 if entered {

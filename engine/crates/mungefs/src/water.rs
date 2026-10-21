@@ -42,7 +42,7 @@
 //! 696379-696396), and on all 14 shipped chunks the bit-3 cell count equals
 //! the `LPTC` count exactly (BF1 NAB2 4 = 4, BF2 NAB2 8 = 8, BF2 DEA1 1 = 1,
 //! eleven 0 = 0) — pinned by `bit_three_cells_match_the_patch_count` in
-//! `tests/fx_lvl.rs`. See [`Water::has_patch`] and [`Water::patch_cells`].
+//! `tests/suite/fx_lvl.rs`. See [`Water::has_patch`] and [`Water::patch_cells`].
 //!
 //! The PS2's own wet test is `nibble != 0` (539348-539356) where this reads
 //! bit 0. The two agree on every shipped chunk, because no nibble is ever 8

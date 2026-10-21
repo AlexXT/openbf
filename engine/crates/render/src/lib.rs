@@ -68,11 +68,13 @@ mod draw;
 mod filter;
 mod frame;
 mod frustum;
+mod gpu_timer;
 mod grass;
 pub mod hud;
 mod leaf;
 mod light_beam;
 mod lighting;
+pub mod made;
 mod mesh;
 mod particles;
 mod pipelines;
@@ -86,7 +88,9 @@ pub use bolt::{BoltDraw, RibbonVertex};
 pub use camera::Camera;
 pub use capture::{encode_png, encode_png_rgb};
 pub use device::HEADLESS_FORMAT;
-pub use draw::{DrawCmd, DrawLayer, Fade, LightPath, SkinnedDrawCmd};
+pub use draw::{
+    fragment_kept, DrawCmd, DrawLayer, Fade, LightPath, LodSide, LodSwitch, SkinnedDrawCmd,
+};
 pub use filter::{box_side, FrameFilter};
 pub use frame::{FrameStats, OverlayFn};
 pub use grass::{sprite_quad, sway, GrassClass, GrassPatch, GrassSprite, ViewAxes};
@@ -266,6 +270,13 @@ pub struct Renderer {
     /// that moves when culling or batching changes is DRAW CALLS, not the
     /// length of the draw list.
     frame_stats: FrameStats,
+    /// GPU time per section of the frame, when `OPENBF_GPU_TIMING=1` and the
+    /// adapter has timestamp queries (`gpu_timer.rs`); read by
+    /// [`Renderer::gpu_sections`].
+    gpu_timer: Option<gpu_timer::GpuTimer>,
+    /// CPU ms the last `render_frame` waited to acquire the window's frame
+    /// (the vsync / frame-latency wait); 0 headless.
+    acquire_ms: f64,
     /// Frustum culling on/off. On by default; `--no-cull` in the bench turns
     /// it off so the two can be compared on the same scene.
     pub cull: bool,

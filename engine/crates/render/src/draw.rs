@@ -185,6 +185,10 @@ pub struct DrawCmd {
     /// Same per-fragment radial test as [`DrawCmd::cull`], and the same
     /// deviation from the ELF's planar frustum.
     pub cull_near: Option<f32>,
+    /// The far scene's model / LOWD switch (card LOD), or `None` — every draw
+    /// but a LOWD-bearing world model and its LOWD on a map with a far scene
+    /// ([`LodSwitch`]).
+    pub lod: Option<LodSwitch>,
     /// How the shader lights this draw ([`LightPath`]); `Lit` unless the
     /// caller asks for another.
     pub light: LightPath,
@@ -197,6 +201,65 @@ pub struct DrawCmd {
     /// and `PrelitAdd` paths add the lights; the two prelit ones skip the
     /// Static lights.
     pub lit: Option<LitSphere>,
+}
+
+/// Which side of the far scene's switch a draw is ([`LodSwitch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LodSide {
+    /// The geometry's own model: drawn nearer than the switch.
+    Model,
+    /// Its `LOWD`: drawn past the switch.
+    Lowd,
+}
+
+/// The far scene's model / LOWD switch (card LOD, `analysis/re-lod.md` §4,
+/// §7 [O]): on a map with a far scene the PS2 draws a geometry that has a
+/// `LOWD` as its model in the near scene, which ends at `NearSceneRange[2]`
+/// (`fade_end`), and as its LOWD in the far scene, composited per pixel
+/// through a depth ramp from `NearSceneRange[1]` (`fade_begin`). The port has
+/// one depth buffer, so the two draws share ONE threshold per pixel,
+/// `t = mix(fade_begin, fade_end, u)` with `u` the 4×4 ordered dither: the
+/// model keeps the fragments nearer than `t`, the LOWD those past it, and the
+/// two never overlap. The dither stands for the ramp (the PS2 blends it, on
+/// its Z-buffer's high byte rather than in metres) — a stated deviation, as
+/// [`Fade`]'s. The LOWD's own far end is the draw's [`DrawCmd::cull`] (the
+/// game gives it the map's model cull: the PS2 culls it at `FarSceneRange`
+/// by the object's sphere, not per fragment).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LodSwitch {
+    pub fade_begin: f32,
+    pub fade_end: f32,
+    pub side: LodSide,
+}
+
+/// A draw's cull bands as the shader reads them, `(cull, cull_near)`, each
+/// `[lo, hi]` metres (`mesh::Instance`): a plain cull is a band of width 0,
+/// and a [`LodSwitch`] puts its band on the model's far edge (never past the
+/// draw's own cull) or on the LOWD's near edge.
+pub(crate) fn instance_cull(d: &DrawCmd) -> ([f32; 2], [f32; 2]) {
+    let far = d.cull.unwrap_or(crate::mesh::NO_CULL);
+    let near = d.cull_near.unwrap_or(crate::mesh::NO_CULL_NEAR);
+    match d.lod {
+        Some(LodSwitch {
+            fade_begin,
+            fade_end,
+            side: LodSide::Model,
+        }) => ([fade_begin.min(far), fade_end.min(far)], [near, near]),
+        Some(LodSwitch {
+            fade_begin,
+            fade_end,
+            side: LodSide::Lowd,
+        }) => ([far, far], [fade_begin.max(near), fade_end.max(near)]),
+        None => ([far, far], [near, near]),
+    }
+}
+
+/// The shader's `far_cull` distance test (`shader.wgsl`), for the tests: is
+/// a fragment `dist` metres from the eye, at a pixel whose dither value is
+/// `u` (0..1), kept by these bands?
+pub fn fragment_kept(cull: [f32; 2], cull_near: [f32; 2], dist: f32, u: f32) -> bool {
+    let lerp = |b: [f32; 2]| b[0] + (b[1] - b[0]) * u;
+    !(dist > lerp(cull) || dist < lerp(cull_near))
 }
 
 /// The terrain foliage's per-instance fade (analysis/re-foliage.md §6, [O]):
@@ -224,6 +287,7 @@ impl DrawCmd {
             layer: DrawLayer::Opaque,
             cull: None,
             cull_near: None,
+            lod: None,
             light: LightPath::Lit,
             fade: None,
             lit: None,
@@ -261,6 +325,12 @@ impl DrawCmd {
             cull_near: metres,
             ..self
         }
+    }
+
+    /// Put this draw on one side of the far scene's model / LOWD switch. See
+    /// [`DrawCmd::lod`].
+    pub fn with_lod(self, lod: Option<LodSwitch>) -> Self {
+        Self { lod, ..self }
     }
 
     /// As [`DrawCmd::textured`], alpha-tested by the mask pipeline (`MASK_CUTOFF`).
@@ -347,6 +417,7 @@ impl DrawCmd {
             layer: DrawLayer::Opaque,
             cull: None,
             cull_near: None,
+            lod: None,
             light: LightPath::Lit,
             fade: None,
             lit: None,
@@ -399,5 +470,83 @@ impl SkinnedDrawCmd {
             layer: DrawLayer::Spec,
             ..self.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod lod_tests {
+    use super::*;
+    use crate::mesh::{NO_CULL, NO_CULL_NEAR};
+
+    fn cmd(cull: Option<f32>, lod: Option<LodSwitch>) -> DrawCmd {
+        DrawCmd::flat(MeshHandle::default(), [1.0; 4], Mat4::IDENTITY)
+            .with_cull(cull)
+            .with_lod(lod)
+    }
+
+    fn switch(side: LodSide) -> Option<LodSwitch> {
+        Some(LodSwitch {
+            fade_begin: 100.0,
+            fade_end: 130.0,
+            side,
+        })
+    }
+
+    /// The 16 values of the shader's 4×4 dither (`bayer4`).
+    fn dithers() -> impl Iterator<Item = f32> {
+        (0..16).map(|v| (v as f32 + 0.5) / 16.0)
+    }
+
+    #[test]
+    fn a_plain_draw_keeps_its_one_edge() {
+        assert_eq!(
+            instance_cull(&cmd(None, None)),
+            ([NO_CULL; 2], [NO_CULL_NEAR; 2])
+        );
+        assert_eq!(
+            instance_cull(&cmd(Some(500.0), None)),
+            ([500.0; 2], [NO_CULL_NEAR; 2])
+        );
+    }
+
+    /// Card LOD's pick, per fragment: the model nearer than the pixel's
+    /// threshold, the LOWD past it, the threshold inside [b, c], exactly one
+    /// of the two at every distance and dither, nothing past the LOWD's cull.
+    #[test]
+    fn model_nearer_than_the_threshold_lowd_past_it() {
+        let (mc, mn) = instance_cull(&cmd(None, switch(LodSide::Model)));
+        let (lc, ln) = instance_cull(&cmd(Some(1000.0), switch(LodSide::Lowd)));
+        assert_eq!((mc, mn), ([100.0, 130.0], [NO_CULL_NEAR; 2]));
+        assert_eq!((lc, ln), ([1000.0; 2], [100.0, 130.0]));
+        for u in dithers() {
+            let mut switched = None;
+            for d in (0..1200).map(|m| m as f32 + 0.25) {
+                let model = fragment_kept(mc, mn, d, u);
+                let lowd = fragment_kept(lc, ln, d, u);
+                if d < 1000.0 {
+                    assert!(model != lowd, "exactly one side at {d} m, u {u}");
+                } else {
+                    assert!(!model && !lowd, "nothing past FarSceneRange at {d} m");
+                }
+                if lowd && switched.is_none() {
+                    switched = Some(d);
+                }
+                assert!(!(model && switched.is_some()), "no model past the switch");
+            }
+            let t = switched.expect("the LOWD takes over");
+            assert!((100.0..=131.0).contains(&t), "threshold {t} inside [b, c]");
+        }
+        // Across the dither the band is a crossfade, not one edge.
+        let at = |u| fragment_kept(mc, mn, 115.0, u);
+        assert!(dithers().any(at) && !dithers().all(at));
+    }
+
+    /// The model never draws past its own cull, whatever the band.
+    #[test]
+    fn the_models_cull_bounds_its_band() {
+        let (c, _) = instance_cull(&cmd(Some(110.0), switch(LodSide::Model)));
+        assert_eq!(c, [100.0, 110.0]);
+        let (c, _) = instance_cull(&cmd(Some(50.0), switch(LodSide::Model)));
+        assert_eq!(c, [50.0, 50.0]);
     }
 }

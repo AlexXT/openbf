@@ -11,9 +11,13 @@
 //! its rim, units beyond it are hidden. The backdrop is the map's image over
 //! the whole-map square, cut to the `map_mask` disc.
 //!
-//! Not drawn yet (the card's `resume:`): the Large and Spawn views, the
-//! Lua markers, the PostSelect ring, the vehicle / turret direction mesh and
-//! the Target element's world markers.
+//! The Spawn view (card SSELB, §1-§3) is the spawn map page's: the
+//! whole-map square at `PositionSpawn`, no heading turn, the picked post's
+//! `hud_icon_flash` ring; `ui::spawn_draw` draws it through [`Ctx::map_spawn`].
+//!
+//! Not drawn yet (card BMAP2's `resume:`): the Large view, the Lua markers,
+//! the vehicle / turret direction mesh and the Target element's world
+//! markers.
 //!
 //! `[ours]`: the mask is a 64-texel disc with a one-texel soft rim; the port
 //! draws the disc as a fan with that rim instead of a second texture stage.
@@ -38,6 +42,18 @@ const NORTH_SCALE: f32 = 2.0;
 /// `[H]` the post number's font: the layout's `PostTextSmall` names none.
 const NUMBER_FONT: &str = "gamefont_tiny";
 const NUMBER_DROP: f32 = 4.0;
+/// The Spawn view (§1 [V], the layout's `PositionSpawn`, `BackdropSpawn`,
+/// `NorthSpawn`): the backdrop's side (0.65 screen heights, RAM ± 145.6),
+/// the element's place in viewport fractions, the backdrop's alpha and the
+/// pointer's Scale (its Position −0.325 = the backdrop's top edge).
+pub const SPAWN_BACKDROP: f32 = 0.65 * FRAME_H;
+pub const POSITION_SPAWN: [f32; 2] = [0.303257, 0.477156];
+const SPAWN_BACKDROP_ALPHA: f32 = 0.5;
+const SPAWN_NORTH_SCALE: f32 = 5.0;
+/// The picked post's ring (§3 [V] D:401694): `hud_icon_flash` at the
+/// post's MapScale × 2, in the Map's +0xc3cc friend blue.
+const RING: &str = "hud_icon_flash";
+const RING_SCALE: f32 = 2.0;
 /// The disc's fan and the mask's soft rim as a share of the radius
 /// (one texel of the 64-texel `map_mask`).
 const FAN: usize = 64;
@@ -48,6 +64,18 @@ const RIM: f32 = 1.0 / 32.0;
 pub const FRIEND: [u8; 3] = [1, 86, 213];
 pub const ENEMY: [u8; 3] = [200, 100, 100];
 pub const NEUTRAL: [u8; 3] = [192, 192, 192];
+
+/// Which of the Map element's views is up (§1: Small, Large, Spawn).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MapView {
+    /// The minimap: eye-centred, heading-up, the class's view radius.
+    #[default]
+    Small,
+    /// The spawn map page: the whole-map square (Spawn copies Large's
+    /// centre and radius, §2.3 D:402078), turned by the mission's north
+    /// angle only (§2.2), no units (they need a controlled entity, §3).
+    Spawn,
+}
 
 /// One sprite on the map.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -87,6 +115,12 @@ pub struct MapModel {
     pub radius: f32,
     pub posts: Vec<MapIcon>,
     pub units: Vec<MapIcon>,
+    pub view: MapView,
+    /// The Large / Spawn group's turn, radians: the mission's
+    /// `SetMapNorthAngle` with or without its flag (§2.2 [M]).
+    pub turn: f32,
+    /// The picked post on the Spawn view (an index into `posts`): its ring.
+    pub select: Option<usize>,
 }
 
 /// θ of a horizontal forward (x, z): the PS2's atan2(−back.x, back.z)
@@ -130,10 +164,35 @@ pub fn post_color(owner: [u8; 3], capturing: Option<[u8; 3]>, clock: f32) -> [u8
 }
 
 impl MapModel {
+    /// This model as the spawn map page shows it: centred on the whole-map
+    /// square at its radius (signed: TAN1's mirrors), the ring on `select`.
+    pub fn spawn_view(self, select: Option<usize>) -> Self {
+        Self {
+            eye: self.centre,
+            radius: self.extent,
+            heading: 0.0,
+            units: Vec::new(),
+            view: MapView::Spawn,
+            select,
+            ..self
+        }
+    }
+
+    /// The backdrop's side in frame pixels for this view.
+    pub fn side(&self) -> f32 {
+        match self.view {
+            MapView::Small => BACKDROP,
+            MapView::Spawn => SPAWN_BACKDROP,
+        }
+    }
+
     /// (u, v) of a world point in the unit square and its squared distance
     /// from the centre BEFORE the clamp (`FUN_003a5228` §2.1 [V][O]); beyond
     /// the circle the point is pulled onto the rim (`clamp`) or `None`.
     pub fn place(&self, p: [f32; 2], clamp: bool) -> Option<([f32; 2], f32)> {
+        if self.radius == 0.0 {
+            return None;
+        }
         let k = 0.5 / self.radius;
         let (mut u, mut v) = ((p[0] - self.eye[0]) * k, (p[1] - self.eye[1]) * k);
         let d2 = u * u + v * v;
@@ -156,15 +215,19 @@ impl MapModel {
     }
 
     /// The element's group matrix under `base` (its Position and Scale): the
-    /// rotation that puts the camera's forward up (§2.2 [V][O]).
+    /// rotation that puts the camera's forward up on the Small view, the
+    /// mission's north angle on the Spawn view (§2.2 [V][O]).
     pub fn group(&self, base: &Mat4) -> Mat4 {
-        *base * Mat4::from_rotation_z(-self.heading)
+        match self.view {
+            MapView::Small => *base * Mat4::from_rotation_z(-self.heading),
+            MapView::Spawn => *base * Mat4::from_rotation_z(self.turn),
+        }
     }
 
     /// Where a post's icon centre lands in the group (frame pixels before
     /// the group matrix).
     pub fn local(&self, uv: [f32; 2]) -> Vec3 {
-        Vec3::new(uv[0] * BACKDROP, uv[1] * BACKDROP, 0.0)
+        Vec3::new(uv[0] * self.side(), uv[1] * self.side(), 0.0)
     }
 }
 
@@ -179,12 +242,27 @@ pub fn window_point(hud: &Hud, world: [f32; 2], clamp: bool, size: [f32; 2]) -> 
         .map(|r| &hud.elems[*r])
         .find(|e| e.kind == Kind::Map)?;
     let (uv, _) = map.place(world, clamp)?;
-    let p = map.group(&e.local()).transform_point3(map.local(uv));
+    let (base, fx) = match map.view {
+        MapView::Small => (e.local(), e.pos.x / FRAME_W),
+        MapView::Spawn => (spawn_base(e), POSITION_SPAWN[0]),
+    };
+    let p = map.group(&base).transform_point3(map.local(uv));
     let sc = frame_scale(size);
     Some([
-        OVERFILL[0].0 * 4.0 / 3.0 * size[1] + anchor_shift(e.pos.x / FRAME_W, size) + sc[0] * p.x,
+        OVERFILL[0].0 * 4.0 / 3.0 * size[1] + anchor_shift(fx, size) + sc[0] * p.x,
         OVERFILL[1].0 * size[1] + sc[1] * p.y,
     ])
+}
+
+/// The Spawn view's place × the element's Scale (the view switch's matrix,
+/// §2.2 [V] `FUN_003a80e8`; RAM on Hoth's spawn map: diag 0.9 at
+/// (155.27, 213.77)).
+fn spawn_base(e: &Elem) -> Mat4 {
+    Mat4::from_translation(Vec3::new(
+        POSITION_SPAWN[0] * FRAME_W,
+        POSITION_SPAWN[1] * FRAME_H,
+        0.0,
+    )) * Mat4::from_scale(e.scale)
 }
 
 impl Ctx<'_> {
@@ -194,10 +272,57 @@ impl Ctx<'_> {
         let Some(map) = hud.map.as_ref() else {
             return;
         };
-        if map.radius <= 0.0 {
+        if map.view != MapView::Small || map.radius <= 0.0 {
             return;
         }
         let base = *parent * e.local();
+        self.map_view(i, e, map, &base, s, alpha);
+    }
+
+    /// The Spawn view (card SSELB): the Map element's own sprites at
+    /// `PositionSpawn`, whatever its fader says (the page is the switch).
+    pub(crate) fn map_spawn(&mut self, size: [f32; 2]) {
+        let hud = self.hud;
+        let Some(map) = hud
+            .map
+            .as_ref()
+            .filter(|m| m.view == MapView::Spawn && m.radius != 0.0)
+        else {
+            return;
+        };
+        let Some(i) = hud
+            .roots
+            .iter()
+            .copied()
+            .find(|r| hud.elems[*r].kind == Kind::Map)
+        else {
+            return;
+        };
+        let e = &hud.elems[i];
+        let s = Screen {
+            origin: [
+                OVERFILL[0].0 * 4.0 / 3.0 * size[1] + anchor_shift(POSITION_SPAWN[0], size),
+                OVERFILL[1].0 * size[1],
+            ],
+            scale: frame_scale(size),
+        };
+        self.map_view(i, e, map, &spawn_base(e), &s, e.alpha);
+    }
+
+    /// One view of the map under `base` (the view's Position × the
+    /// element's Scale).
+    #[allow(clippy::too_many_arguments)]
+    fn map_view(
+        &mut self,
+        i: usize,
+        e: &Elem,
+        map: &MapModel,
+        base: &Mat4,
+        s: &Screen,
+        alpha: f32,
+    ) {
+        let small = map.view == MapView::Small;
+        let base = *base;
         let group = map.group(&base);
 
         // Back to front: the backdrop (z 255), the FOV mesh, posts (128),
@@ -206,31 +331,57 @@ impl Ctx<'_> {
         // eye undimmed by the mesh's dark part ([M] HOT1 / TAN1 walkabout
         // cp frames), so it goes under the sprites.
         if let (Some(image), true) = (map.image.as_deref(), map.extent != 0.0) {
-            self.disc(i, map, &group, s, image, alpha * BACKDROP_ALPHA);
+            let a = if small {
+                BACKDROP_ALPHA
+            } else {
+                SPAWN_BACKDROP_ALPHA
+            };
+            self.disc(i, map, &group, s, image, alpha * a);
         }
         // The wedge: at the eye, up (§3 [V] `FUN_003a5650`). `hud_map_fov`
         // lies in its own XZ plane, +Z the view's way: stood up so +Z is the
         // frame's up ([D] the mesh's bounds; the PS2 frames show the dark
         // part below and beside the wedge).
-        let fov = base
-            * Mat4::from_scale(Vec3::splat(FOV_SCALE))
-            * mesh_frame()
-            * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-        self.mesh(i, "hud_map_fov", &fov, s, color([255.0; 3], alpha), false);
+        // The Spawn view has no controlled entity: no wedge.
+        if small {
+            let fov = base
+                * Mat4::from_scale(Vec3::splat(FOV_SCALE))
+                * mesh_frame()
+                * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+            self.mesh(i, "hud_map_fov", &fov, s, color([255.0; 3], alpha), false);
+        }
+        // A fixed post stays upright on screen; a walker's turns.
+        let upright = if small { map.heading } else { -map.turn };
         for p in &map.posts {
             let Some((uv, _)) = map.place(p.pos, true) else {
                 continue;
             };
-            // A fixed post stays upright on screen; a walker's turns.
-            let turn = p.heading.unwrap_or(map.heading);
+            let turn = p.heading.unwrap_or(upright);
             self.icon_at(i, &group, s, map.local(uv), turn, p, alpha);
         }
+        // The picked post's ring on the Spawn view (§3 [V]).
+        if let Some(p) = map.select.and_then(|k| map.posts.get(k)).filter(|_| !small) {
+            if let Some((uv, _)) = map.place(p.pos, true) {
+                let ring = MapIcon {
+                    texture: RING.into(),
+                    scale: p.scale * RING_SCALE,
+                    color: FRIEND,
+                    ..MapIcon::default()
+                };
+                self.icon_at(i, &group, s, map.local(uv), upright, &ring, alpha);
+            }
+        }
         // The pointer sits on the backdrop's top edge — the image's −Z side —
-        // and turns with the group.
+        // and turns with the group (on the Small view also by its own flag).
+        let (own_turn, scale) = if small {
+            (map.north, NORTH_SCALE)
+        } else {
+            (0.0, SPAWN_NORTH_SCALE)
+        };
         let north = group
-            * Mat4::from_rotation_z(map.north)
-            * Mat4::from_translation(Vec3::new(0.0, -BACKDROP * 0.5, 0.0));
-        let h = ICON * NORTH_SCALE * 0.5;
+            * Mat4::from_rotation_z(own_turn)
+            * Mat4::from_translation(Vec3::new(0.0, -map.side() * 0.5, 0.0));
+        let h = ICON * scale * 0.5;
         self.quad(
             i,
             &north,
@@ -250,8 +401,13 @@ impl Ctx<'_> {
                 let (Some(n), Some((uv, d2))) = (p.number, map.place(p.pos, true)) else {
                     continue;
                 };
-                // Fades out toward the rim (§3 [V] D:401671).
-                let a = alpha * (1.0 - 4.0 * d2);
+                // Fades out toward the rim on the Small view (§3 [V]
+                // D:401671).
+                let a = if small {
+                    alpha * (1.0 - 4.0 * d2)
+                } else {
+                    alpha
+                };
                 if a <= 0.0 {
                     continue;
                 }
@@ -403,6 +559,75 @@ mod tests {
                     (got[a] - want[a]).abs() <= 3.0,
                     "{world:?}: {got:?}, the PS2 frame has {want:?}"
                 );
+            }
+        }
+    }
+
+    /// The Spawn view (card SSELB): the posts' ink centres in the PS2's own
+    /// spawn map frames (640 × 480) from their RAM positions - Hoth after
+    /// Auto Assign (`lead_tmp/ssel/t1_hot1/s3_after_auto`: square centre
+    /// (−239.55, −109.15), R 400, north 0; four posts and the AT-AT walker
+    /// post 7) and NAB2 (`pcsx2/ref/states/bf2_nab2_cw_cis_spawnmap`: centre
+    /// (1.32, 31.48), R 218.47, the group turned by its north angle 180°,
+    /// re-hud-map §7's posts p1, p2, p4).
+    #[test]
+    fn spawn_view_posts_land_where_the_ps2_frames_have_them() {
+        let o = crate::hud_draw::OVERFILL;
+        let base = Mat4::from_translation(Vec3::new(
+            POSITION_SPAWN[0] * 512.0,
+            POSITION_SPAWN[1] * 448.0,
+            0.0,
+        )) * Mat4::from_scale(Vec3::splat(0.9));
+        for (centre, extent, turn, posts) in [
+            (
+                [-239.551, -109.148],
+                400.0,
+                0.0,
+                vec![
+                    ([16.307, -15.772], [299.3, 263.8]),
+                    ([-213.014, 192.011], [204.2, 340.5]),
+                    ([-325.971, -52.213], [157.3, 250.8]),
+                    ([-516.6, -104.889], [77.5, 231.0]),
+                    ([169.965, 65.158], [347.0, 286.7]),
+                ],
+            ),
+            (
+                [1.3195, 31.4788],
+                218.4686,
+                std::f32::consts::PI,
+                vec![
+                    ([0.0, -112.0], [194.0, 326.1]),
+                    ([135.9, -34.56], [91.1, 273.8]),
+                    ([0.0, 32.0], [194.3, 229.2]),
+                ],
+            ),
+        ] {
+            let map = MapModel {
+                centre,
+                extent,
+                turn,
+                // The Small view's eye and radius are replaced.
+                eye: [5.0, 5.0],
+                radius: 50.0,
+                heading: 1.0,
+                ..Default::default()
+            }
+            .spawn_view(Some(0));
+            assert_eq!((map.view, map.select), (MapView::Spawn, Some(0)));
+            let group = map.group(&base);
+            for (world, want) in posts {
+                let (uv, _) = map.place(world, true).unwrap();
+                let p = group.transform_point3(map.local(uv));
+                let got = [
+                    (o[0].0 + o[0].1 * p.x / 512.0) * 640.0,
+                    (o[1].0 + o[1].1 * p.y / 448.0) * 480.0,
+                ];
+                for a in 0..2 {
+                    assert!(
+                        (got[a] - want[a]).abs() <= 3.0,
+                        "{world:?}: {got:?}, the PS2 frame has {want:?}"
+                    );
+                }
             }
         }
     }

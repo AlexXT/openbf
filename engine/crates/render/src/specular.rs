@@ -85,34 +85,40 @@ impl Renderer {
             false,
             Some("specular table"),
         )?;
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("specular table"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-        self.spec_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("specular bg"),
-            layout: &self.spec_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.spec_buf.as_entire_binding(),
-                },
-            ],
-        }));
+        let sampler = crate::made::sampler(
+            &self.device,
+            &wgpu::SamplerDescriptor {
+                label: Some("specular table"),
+                address_mode_u: wgpu::AddressMode::Repeat,
+                address_mode_v: wgpu::AddressMode::Repeat,
+                address_mode_w: wgpu::AddressMode::Repeat,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::FilterMode::Nearest,
+                ..Default::default()
+            },
+        );
+        self.spec_bg = Some(crate::made::bind_group(
+            &self.device,
+            &wgpu::BindGroupDescriptor {
+                label: Some("specular bg"),
+                layout: &self.spec_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.spec_buf.as_entire_binding(),
+                    },
+                ],
+            },
+        ));
         Ok(())
     }
 }

@@ -72,6 +72,9 @@ pub struct MapStatic {
     pub bounds: Option<([f32; 2], f32)>,
     /// The Small view's north pointer turn, radians.
     pub north: f32,
+    /// The Large / Spawn view's turn: the mission's north angle, flag or
+    /// not.
+    pub turn: f32,
     /// Per post name: icon and number.
     pub posts: HashMap<String, (ClassIcon, Option<u32>)>,
     /// Per team: the soldiers' icon.
@@ -107,6 +110,27 @@ fn north_of(map: &str, era: Option<&str>) -> f32 {
         ("naboo2", _) | ("cor1", Some("gcw")) => std::f32::consts::PI,
         _ => 0.0,
     }
+}
+
+/// The Large / Spawn group's turn (re-hud-map §2.2 [M]): every mission's
+/// `SetMapNorthAngle`, the flag aside - TAN1's 180 too.
+fn turn_of(map: &str, era: Option<&str>) -> f32 {
+    match map {
+        "tan1" => std::f32::consts::PI,
+        _ => north_of(map, era),
+    }
+}
+
+/// Per post instance name (lower case): its `HUDIndex`, the number the map
+/// prints. The scene's mode layer is merged into the base by now.
+fn post_numbers(m: &Manifest) -> HashMap<String, u32> {
+    m.instances
+        .iter()
+        .filter_map(|i| {
+            let n = i.props.iter().find(|(k, _)| *k == HUD_INDEX)?;
+            Some((i.name.to_ascii_lowercase(), n.1.trim().parse().ok()?))
+        })
+        .collect()
 }
 
 fn mapbounds(m: &Manifest) -> Option<&ManifestRegion> {
@@ -170,15 +194,7 @@ impl MapStatic {
             }
         }
         let layout = crate::layout::MapLayout::from_manifest(m);
-        // The scene's mode layer is merged into the base by now.
-        let numbers: HashMap<String, u32> = m
-            .instances
-            .iter()
-            .filter_map(|i| {
-                let n = i.props.iter().find(|(k, _)| *k == HUD_INDEX)?;
-                Some((i.name.to_ascii_lowercase(), n.1.trim().parse().ok()?))
-            })
-            .collect();
+        let numbers = post_numbers(m);
         let posts = layout
             .cps
             .iter()
@@ -215,6 +231,7 @@ impl MapStatic {
             sheet_dir,
             bounds: mapbounds(m).map(bounds_of),
             north: north_of(&m.map.to_ascii_lowercase(), era),
+            turn: turn_of(&m.map.to_ascii_lowercase(), era),
             posts,
             soldiers,
             vehicles: vehicle_classes
@@ -359,12 +376,57 @@ impl MapStatic {
             centre,
             extent,
             north: self.north,
+            turn: self.turn,
             eye,
             heading: heading(fwd),
             radius: view_radius(view, (vel.x * vel.x + vel.z * vel.z).sqrt()),
             posts,
             units,
+            ..MapModel::default()
         }
+    }
+
+    /// The spawn map page's minimap (card SSELB, re-hud-map §1-§3): the
+    /// Spawn view of [`MapStatic::model`]'s posts plus the team's live
+    /// command walkers - each a post on the PS2 (Hoth's AT-ATs: `atat_icon`
+    /// 3.5 [M]) - and the ring on the slot's pick (`Sim::spawn_post_selected`).
+    pub fn spawn_model(&self, walk: &WalkSim, slot: usize) -> MapModel {
+        let sim = &walk.sim;
+        let me = &sim.units[walk.player.index as usize];
+        let mut map = self.model(walk);
+        let pick = sim.spawn_post_selected(slot);
+        let mut select = match pick {
+            Some(core::unit::SpawnPost::Post(i)) => Some(usize::from(i)),
+            _ => None,
+        };
+        for (post, pos) in sim.player_spawn_posts(me.team) {
+            let core::unit::SpawnPost::Walker(h) = post else {
+                continue;
+            };
+            let Some((icon, texture)) = sim
+                .vehicle(h)
+                .and_then(|v| self.vehicles.get(v.class as usize))
+                .and_then(|c| Some((c, c.texture.clone()?)))
+            else {
+                continue;
+            };
+            let heading = sim.vehicle(h).map(|v| {
+                let f = v.rot * Vec3::Z;
+                heading([f.x, f.z])
+            });
+            if pick == Some(post) {
+                select = Some(map.posts.len());
+            }
+            map.posts.push(MapIcon {
+                pos: [pos.x, pos.z],
+                texture,
+                scale: icon.scale,
+                color: FRIEND,
+                heading,
+                number: None,
+            });
+        }
+        map.spawn_view(select)
     }
 }
 
@@ -416,7 +478,20 @@ pub fn still(scene: &crate::assets::Scene, eye: Vec3, yaw: f32) -> MapModel {
         radius: 50.0,
         posts,
         units: Vec::new(),
+        ..MapModel::default()
     }
+}
+
+/// [`still`]'s posts on the spawn map page (card SSELB's golden): the
+/// Spawn view with each post's number and the ring on post `select`.
+pub fn spawn_still(scene: &crate::assets::Scene, select: Option<usize>) -> MapModel {
+    let numbers = post_numbers(&scene.manifest);
+    let layout = crate::layout::MapLayout::from_manifest(&scene.manifest);
+    let mut map = still(scene, Vec3::ZERO, 0.0);
+    for (p, cp) in map.posts.iter_mut().zip(&layout.cps) {
+        p.number = numbers.get(&cp.name.to_ascii_lowercase()).copied();
+    }
+    map.spawn_view(select)
 }
 
 #[cfg(test)]
@@ -465,5 +540,30 @@ mod tests {
         assert_eq!(north_of("cor1", Some("gcw")), std::f32::consts::PI);
         assert_eq!(north_of("cor1", Some("cw")), 0.0);
         assert_eq!(north_of("tan1", Some("gcw")), 0.0);
+        // The Large / Spawn group turns by the angle, flag or not.
+        assert_eq!(turn_of("tan1", Some("gcw")), std::f32::consts::PI);
+        assert_eq!(turn_of("naboo2", None), std::f32::consts::PI);
+        assert_eq!(turn_of("hoth", None), 0.0);
+    }
+
+    /// The spawn map page's model: the whole-map square, the mission's
+    /// turn, no units, no ring before a pick.
+    #[test]
+    fn the_spawn_model_is_the_whole_map() {
+        let w = WalkSim::new(3, Vec3::ZERO, None);
+        let st = MapStatic {
+            bounds: Some(([10.0, -20.0], 300.0)),
+            turn: std::f32::consts::PI,
+            soldiers: vec![ClassIcon::of(&ClassDb::default(), "x"); 2],
+            ..MapStatic::default()
+        };
+        let m = st.spawn_model(&w, 0);
+        assert_eq!(m.view, ui::hud_map::MapView::Spawn);
+        assert_eq!(
+            (m.eye, m.radius, m.turn),
+            ([10.0, -20.0], 300.0, std::f32::consts::PI)
+        );
+        assert!(m.units.is_empty());
+        assert_eq!(m.select, None, "no pick yet");
     }
 }

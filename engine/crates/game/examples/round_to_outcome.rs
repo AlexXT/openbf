@@ -155,6 +155,27 @@
 //! teamfire <key>: kills K team T self S bolt_hits H friend_hits F line_held L
 //! ```
 //!
+//! ...and the team board's roles (card TEAM): Cover roles given, and the
+//! AI seconds spent with one and on a sniper's spot (Overwatch):
+//!
+//! ```text
+//! roles <key>: cover_given N cover_s C overwatch_s O
+//! ```
+//!
+//! ...and the flank routes (card FLNK): the ordered post pairs with an
+//! authored main route, those with a flank route, the Flank roles given and
+//! the AI seconds with one, how the roles ended (A the last leg into the
+//! post, D a death, T another objective, O anything else) and the stalled
+//! bots recycled while holding one, the legs
+//! walked along a flank route, the soldier hubs
+//! no AI soldier on foot stood at
+//! (feet within max(radius, 3 m), every 8 ticks; SAIR's `hubuse.py` rule;
+//! bar B11) and each route's share this match (`from>to:share`):
+//!
+//! ```text
+//! flank <key>: pairs P routes R given G flank_s S ends A/D/T/O stalled S legs L hubs_never N of H (X %) shares a>b:0.21,...
+//! ```
+//!
 //! ...and, when a team came to stand clamped (no reinforcement beyond its
 //! living units) at 3 alive or fewer, the endgame (card STEND): how long
 //! the round went on from there and how that team's last units died:
@@ -331,7 +352,12 @@
 //! `ANIM_CENSUS=1` (card ANIML) runs every soldier's animator beside the
 //! round (no renderer) and prints `game::animator::census`'s lines: the shots
 //! fired on the move that show the shoot clip over a movement clip, and per
-//! weapon set how often the upper body plays a clip of its own.
+//! weapon set how often the upper body plays a clip of its own. It also
+//! counts what every soldier on foot holds (card WHELD): `hands:` lines of
+//! unit-ticks by player / bot, the slot in hand (the class's primary, another
+//! channel-0 slot, channel 1) and the model drawn for it
+//! (`soldier_vis::weapon_in_hand`, `DrawPlan::weapon_in_slot`; `hidden` = a
+//! thrown weapon's `HideOnFire`, `-` = a slot without a model).
 //!
 //! ## Unit samples — `UNIT_SAMPLES`
 //! `UNIT_SAMPLES=<dir>` writes `<dir>/<key>_s<seed>.csv`: every alive unit
@@ -513,6 +539,56 @@ struct Fire {
 }
 
 /// [`Fire`]'s row of a unit.
+/// Card WHELD, under `ANIM_CENSUS`: unit-ticks on foot by who, the slot in
+/// hand and the model drawn for it.
+struct Hands {
+    plan: game::soldier_vis::DrawPlan,
+    ticks: std::collections::BTreeMap<String, u64>,
+}
+
+impl Hands {
+    fn new(teams: &[game::walk::TeamTemplate; 2]) -> Self {
+        Self {
+            plan: game::soldier_vis::DrawPlan::of(teams),
+            ticks: Default::default(),
+        }
+    }
+
+    fn observe(&mut self, sim: &core::sim::Sim) {
+        for u in sim.units.iter().filter(|u| u.alive && u.mount.is_none()) {
+            let hand = game::soldier_vis::weapon_in_hand(u, &sim.weapon_classes);
+            let team = usize::from(u.team.min(1));
+            let class = usize::from(u.spec.class);
+            let slot = if u.active_channel == 1 {
+                "ch1"
+            } else if hand.slot == u.spec.weapon_slot {
+                "primary"
+            } else {
+                "other"
+            };
+            let model = if hand.hidden {
+                "hidden"
+            } else {
+                self.plan
+                    .weapon_in_slot(team, class, hand.slot)
+                    .unwrap_or("-")
+            };
+            let who = if u.is_player { "player" } else { "bot" };
+            *self
+                .ticks
+                .entry(format!("{who} {slot} {model}"))
+                .or_default() += 1;
+        }
+    }
+
+    fn report(&self, key: &str) -> String {
+        self.ticks
+            .iter()
+            .map(|(k, n)| format!("{key:10} hands: {k} {n}\n"))
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct FireUnit {
     gen: u32,
@@ -890,7 +966,14 @@ fn deaths_on() -> bool {
 /// floor, a landing under the map, a lost bot's recycle (card KFLR), a
 /// stalled bot's (card RCYC).
 #[derive(Default)]
-struct Deaths([[u32; 9]; 2], Option<Clamp>);
+struct Deaths([[u32; 9]; 2], Option<Clamp>, Vec<bool>);
+
+/// Card FLNK: the hubs' visit test runs every this many ticks (4 Hz at
+/// 30 ticks a second, about the PS2 samples' rate).
+const HUB_VISIT_EVERY: u64 = 8;
+/// ...and a hub is visited by AI feet within max(its radius, this) of its
+/// centre, XZ (SAIR's `hubuse.py` rule).
+const HUB_VISIT_MIN_R: f32 = 3.0;
 
 /// The endgame (card STEND): the first tick a team stood CLAMPED — no
 /// reinforcement beyond its living units — at [`CLAMP_ALIVE`] alive or
@@ -908,6 +991,23 @@ const CLAMP_ALIVE: u32 = 3;
 impl Deaths {
     fn observe(&mut self, sim: &core::sim::Sim) {
         use core::sim::{DeathCause, Event};
+        // Card FLNK: which hubs an AI soldier on foot has stood at.
+        if let Some(g) = sim
+            .nav
+            .as_ref()
+            .filter(|_| sim.tick.is_multiple_of(HUB_VISIT_EVERY))
+        {
+            self.2.resize(g.hubs.len(), false);
+            for u in &sim.units {
+                if !u.alive || u.mount.is_some() || u.controller != core::unit::Controller::Ai {
+                    continue;
+                }
+                for (h, seen) in g.hubs.iter().zip(self.2.iter_mut()) {
+                    *seen |=
+                        core::nav::xz_dist(h.pos, u.soldier.pos) < h.radius.max(HUB_VISIT_MIN_R);
+                }
+            }
+        }
         if self.1.is_none() && sim.outcome.is_none() {
             let low = |t: usize| sim.battle.teams[t].tickets() <= CLAMP_ALIVE;
             if low(0) || low(1) {
@@ -992,6 +1092,56 @@ impl Deaths {
             "teamfire {key}: kills {} team {} self {} bolt_hits {} friend_hits {} line_held {}",
             n.unit_kills, n.team_kills, n.self_kills, n.bolt_hits, n.friend_hits, n.line_held
         );
+        // Card TEAM: the team board's roles.
+        let hz = core::TICK_HZ as f32;
+        let _ = writeln!(
+            text,
+            "roles {key}: cover_given {} cover_s {:.0} overwatch_s {:.0}",
+            n.cover_given,
+            n.cover_ticks as f32 / hz,
+            n.overwatch_ticks as f32 / hz
+        );
+        // Card FLNK: the flank table, this match's shares, the roles given
+        // and the soldier hubs (on a soldier arc) no AI soldier stood at.
+        if let Some(g) = sim.nav.as_ref() {
+            let soldier: Vec<bool> = (0..g.hubs.len())
+                .map(|h| {
+                    g.arcs
+                        .iter()
+                        .any(|a| a.type_mask & 1 != 0 && a.touches(h as u16))
+                })
+                .collect();
+            let total = soldier.iter().filter(|&&s| s).count();
+            let never = soldier
+                .iter()
+                .enumerate()
+                .filter(|&(h, &s)| s && !self.2.get(h).copied().unwrap_or(false))
+                .count();
+            let shares: Vec<String> = sim
+                .flank
+                .routes
+                .iter()
+                .map(|r| format!("{}>{}:{:.2}", r.from, r.to, r.share))
+                .collect();
+            let _ = writeln!(
+                text,
+                "flank {key}: pairs {} routes {} given {} flank_s {:.0} ends {}/{}/{}/{} stalled {} legs {} hubs_never {} of {} ({:.1} %) shares {}",
+                sim.flank.pairs,
+                sim.flank.routes.len(),
+                n.flank_given,
+                n.flank_ticks as f32 / hz,
+                n.flank_ends[0],
+                n.flank_ends[1],
+                n.flank_ends[2],
+                n.flank_ends[3],
+                n.flank_stalled,
+                n.flank_legs,
+                never,
+                total,
+                100.0 * never as f32 / total.max(1) as f32,
+                shares.join(",")
+            );
+        }
         if let Some(c) = &self.1 {
             let _ = writeln!(
                 text,
@@ -1102,6 +1252,156 @@ impl Recycles {
                     sim.level_at(p),
                 );
             }
+        }
+    }
+}
+
+/// Card TBRD's census (`BOARD_CENSUS=1`): a `BOARD` line on stderr for every
+/// AI that takes a seat - the vehicle's kind and class, and from the unit's
+/// last tick on foot the XZ metres to the vehicle's origin, the 3-D metres
+/// from its body's centre to the origin, the vehicle's sphere radius, the
+/// soldier's sphere radius and the gap left between the two spheres (the
+/// PS2's board agent enters at a gap under 1.5 m, BF1 0.5 m); a `MISS` line
+/// for every turret claim that ended with the unit on foot (the least gap
+/// its walk came to, the XZ metres and height there, the claim's seconds);
+/// and at the start a `TURRET` line per building turret (its building's
+/// bodies, their farthest XZ corner and height span about its origin).
+/// Read-only.
+/// [`BoardCensus`]'s unit on its last tick: (generation, mounted, feet,
+/// body centre, body radius).
+type OnFoot = (u32, bool, glam::Vec3, glam::Vec3, f32);
+/// [`BoardCensus`]'s open turret claim: (generation, turret, the least gap,
+/// the XZ metres and height over the origin there, the first tick).
+type TurretClaim = (u32, core::vehicle::VehicleHandle, f32, f32, f32, u64);
+
+#[derive(Default)]
+struct BoardCensus {
+    /// Per unit index, its last tick.
+    last: Vec<Option<OnFoot>>,
+    /// Per unit index, its open claim on a turret.
+    claim: Vec<Option<TurretClaim>>,
+}
+
+impl BoardCensus {
+    fn observe(&mut self, sim: &core::sim::Sim, map: &str, classes: &[String]) {
+        if self.last.is_empty() {
+            for v in sim.vehicles.iter().filter(|v| v.instance.is_some()) {
+                let bs: Vec<_> = sim
+                    .collision
+                    .bodies()
+                    .iter()
+                    .filter(|b| b.instance == v.instance)
+                    .collect();
+                let mut far = 0.0f32;
+                let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+                for b in &bs {
+                    for x in [b.aabb.min.x, b.aabb.max.x] {
+                        for z in [b.aabb.min.z, b.aabb.max.z] {
+                            far = far.max(glam::Vec2::new(x - v.pos.x, z - v.pos.z).length());
+                        }
+                    }
+                    lo = lo.min(b.aabb.min.y - v.pos.y);
+                    hi = hi.max(b.aabb.max.y - v.pos.y);
+                }
+                eprintln!(
+                    "TURRET {map} {} bodies {} farxz {far:.2} y {lo:.2}..{hi:.2}",
+                    classes.get(v.class as usize).map_or("?", String::as_str),
+                    bs.len()
+                );
+            }
+        }
+        if self.last.len() < sim.units.len() {
+            self.last.resize(sim.units.len(), None);
+        }
+        for (i, u) in sim.units.iter().enumerate() {
+            if !u.alive || u.controller != core::unit::Controller::Ai {
+                self.last[i] = None;
+                continue;
+            }
+            let prev = self.last[i].filter(|p| p.0 == u.gen && !p.1);
+            if let (Some(m), Some((_, _, feet, centre, rs))) = (u.mount, prev) {
+                if let Some(v) = sim.vehicle(m.vehicle) {
+                    let r = sim
+                        .seat_setup
+                        .get(v.class as usize)
+                        .and_then(|s| s.as_ref())
+                        .map_or(0.0, |s| s.radius);
+                    let d3 = centre.distance(v.pos);
+                    let (bc, bw) = sim
+                        .blast_setup
+                        .get(v.class as usize)
+                        .and_then(|s| s.as_ref())
+                        .map_or((glam::Vec3::ZERO, 0.0), |b| {
+                            (b.sphere_centre, b.sphere_radius)
+                        });
+                    eprintln!(
+                        "BOARD {map} {:?} {} seat {} bw {bw:.2} bc {:.2} xz {:.2} d3 {:.2} r {:.2} rs {:.2} gap {:.2}",
+                        v.kind,
+                        classes.get(v.class as usize).map_or("?", String::as_str),
+                        m.seat,
+                        bc.length(),
+                        core::nav::xz_dist(feet, v.pos),
+                        d3,
+                        r,
+                        rs,
+                        d3 - r - rs
+                    );
+                }
+            }
+            let cap = u.capsule();
+            // A `MISS` line for a turret claim that ended with the unit on
+            // foot: the nearest its walk came.
+            if self.claim.len() < sim.units.len() {
+                self.claim.resize(sim.units.len(), None);
+            }
+            let now = (u.mount.is_none())
+                .then(|| u.ai.ride.and_then(|r| r.board))
+                .flatten()
+                .filter(|&vh| core::ai::man::is_turret(sim, vh));
+            if let Some(c) = self.claim[i].filter(|c| Some(c.1) != now || c.0 != u.gen) {
+                if u.mount.is_none() && c.0 == u.gen {
+                    let cls = sim
+                        .vehicle(c.1)
+                        .and_then(|v| classes.get(v.class as usize))
+                        .map_or("?", String::as_str);
+                    eprintln!(
+                        "MISS {map} {cls} gap {:.2} xz {:.2} dy {:.2} secs {:.1}",
+                        c.2,
+                        c.3,
+                        c.4,
+                        (sim.tick - c.5) as f32 / core::TICK_HZ as f32
+                    );
+                }
+                self.claim[i] = None;
+            }
+            if let Some(vh) = now {
+                if let Some(v) = sim.vehicle(vh) {
+                    let r = sim
+                        .seat_setup
+                        .get(v.class as usize)
+                        .and_then(|s| s.as_ref())
+                        .map_or(0.0, |s| s.radius);
+                    let gap = cap.center().distance(v.pos) - r - cap.radius.max(cap.height * 0.5);
+                    let c = self.claim[i].get_or_insert((u.gen, vh, f32::MAX, 0.0, 0.0, sim.tick));
+                    if gap < c.2 {
+                        *c = (
+                            u.gen,
+                            vh,
+                            gap,
+                            core::nav::xz_dist(u.soldier.pos, v.pos),
+                            u.soldier.pos.y - v.pos.y,
+                            c.5,
+                        );
+                    }
+                }
+            }
+            self.last[i] = Some((
+                u.gen,
+                u.mount.is_some(),
+                u.soldier.pos,
+                cap.center(),
+                cap.radius.max(cap.height * 0.5),
+            ));
         }
     }
 }
@@ -3290,9 +3590,15 @@ fn run_map(
                             weapon_geometry: c.weapon_geometry.clone(),
                             weapon_hud: c.weapon_hud.clone(),
                             held_hud: Vec::new(),
+                            held_models: c
+                                .held
+                                .iter()
+                                .map(|h| (h.slot, h.geometry.clone()))
+                                .collect(),
                             foley_class: c.foley_class,
                             cries: c.cries.clone(),
                             anim: c.anim.clone(),
+                            skins: c.skins.clone(),
                         })
                         .collect(),
                 }
@@ -3412,7 +3718,8 @@ fn run_map(
             &scene.manifest.source_game,
             &w.teams,
         );
-        (vis, game::animator::census::Census::default())
+        let hands = Hands::new(&w.teams);
+        (vis, game::animator::census::Census::default(), hands)
     });
     let mut recycles = (census.is_some() || deaths.is_some()).then(Recycles::default);
     let mut shares = census.is_some().then(Shares::default);
@@ -3502,9 +3809,13 @@ fn run_map(
         .vehicles
         .iter()
         .any(|v| v.kind == core::vehicle::VehicleKind::Turret);
+    let mut board_census = std::env::var_os("BOARD_CENSUS").map(|_| BoardCensus::default());
     while t < max_ticks && w.sim.outcome.is_none() {
         w.step_tick(&idle);
         t += 1;
+        if let Some(b) = board_census.as_mut() {
+            b.observe(&w.sim, key, &vehicle_classes);
+        }
         if has_turrets {
             turret_census.observe(&w.sim);
         }
@@ -3654,8 +3965,9 @@ fn run_map(
         if let Some(s) = shots.as_mut() {
             s.observe(&w.sim);
         }
-        if let Some((vis, c)) = anim.as_mut() {
+        if let Some((vis, c, h)) = anim.as_mut() {
             vis.update_with(&w, core::TICK_DT, Some(c));
+            h.observe(&w.sim);
         }
         if let Some(r) = recycles.as_mut() {
             r.observe(key, seed, &w.sim);
@@ -3900,7 +4212,7 @@ fn run_map(
         let s = &w.sim.nav_stats;
         outln!(
             out,
-            "    friendly fire: kills {}  team_kills {} ({:.1} %)  self {}  bolt_hits {}  friend_hits {} ({:.1} %)  line_held {:.0} s",
+            "    friendly fire: kills {}  team_kills {} ({:.1} %)  self {}  bolt_hits {}  friend_hits {} ({:.1} %)  line_held {:.0} s  blast_held {}",
             s.unit_kills,
             s.team_kills,
             100.0 * s.team_kills as f32 / s.unit_kills.max(1) as f32,
@@ -3909,6 +4221,7 @@ fn run_map(
             s.friend_hits,
             100.0 * s.friend_hits as f32 / s.bolt_hits.max(1) as f32,
             s.line_held as f32 / core::TICK_HZ as f32,
+            s.blast_holds,
         );
         outln!(
             out,
@@ -4249,8 +4562,9 @@ fn run_map(
     if let Some(s) = shots.as_mut() {
         census.push_str(&s.line(key, &w.sim));
     }
-    if let Some((_, c)) = &anim {
+    if let Some((_, c, h)) = &anim {
         census.push_str(&c.report(key));
+        census.push_str(&h.report(key));
     }
     if let Some(r) = &recycles {
         census.push_str(&r.0);

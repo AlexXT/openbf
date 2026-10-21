@@ -14,7 +14,8 @@
 //! `border_3_pieces`, `opaque_black`, `stats_kills`, `btn_directional_pad`,
 //! `btn_directional_pad_lr`, `optionl`, `optionr` (COMMON) and `white` (CORE)
 //! — `re-hud.md` §1.2 — plus COMMON's `points`, which the layouts name only
-//! as an element's own name (`Bitmap("points")`): a small spare sheet. The
+//! as an element's own name (`Bitmap("points")`): a small spare sheet, and
+//! the spawn screens' button pieces and pad icons ([`SCREEN_SHEETS`]). The
 //! side-LVL `hud_*` meshes (`hud_cis_trishot`, …) are not baked here: they
 //! belong with the side weapons (card BHUD2).
 //!
@@ -36,6 +37,23 @@ use std::path::Path;
 const SHEET_SOURCES: [&str; 2] = ["COMMON.LVL", "CORE.LVL"];
 /// The sibling LVL holding the fonts.
 const FONT_SOURCE: &str = "CORE.LVL";
+
+/// The sheets the spawn screens' shell widgets draw that no layout names
+/// (card SSELB, `analysis/re-bf2-shell.md` §1, §3.2, §3.4): the vertical
+/// button stack's eight 64x64 pieces and the help lines' pad icons, Cross
+/// (`btna`) and Triangle (`btnb`), all in COMMON.LVL.
+pub const SCREEN_SHEETS: [&str; 10] = [
+    "bf2_buttons_topleft",
+    "bf2_buttons_title_center",
+    "bf2_buttons_topright",
+    "bf2_buttons_midleft",
+    "bf2_buttons_items_center",
+    "bf2_buttons_midright",
+    "bf2_buttons_botleft",
+    "bf2_buttons_botright",
+    "btna",
+    "btnb",
+];
 
 fn node(n: &ConfigNode) -> HudNode {
     HudNode {
@@ -148,6 +166,7 @@ pub fn bake_hud(lvl_path: &str, outdir: &str) -> Result<Option<HudIndex>> {
     for l in &layouts {
         strings(&l.nodes, &mut wanted);
     }
+    wanted.extend(SCREEN_SHEETS.map(str::to_owned));
     for c in content.iter().filter(|c| &c.tag == b"tex_") {
         if let Some(n) = c.child_str(b"NAME") {
             wanted.remove(&n.to_ascii_lowercase());
@@ -291,7 +310,10 @@ mod tests {
             "opaque_black",
             "stats_kills",
             "white",
-        ] {
+        ]
+        .into_iter()
+        .chain(SCREEN_SHEETS)
+        {
             assert!(sheets.contains(&want), "{want} missing from {sheets:?}");
         }
         assert!(sheets.iter().any(|s| s.starts_with("btn_directional_pad")));

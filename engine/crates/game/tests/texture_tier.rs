@@ -221,8 +221,9 @@ fn tier2_stems(dir: &Path) -> Vec<String> {
 
 /// Every texture name the soldier/weapon path would ask for under `side`:
 /// the skinned materials of `soldiers/*.glb` and the static materials of
-/// `weapons/*.glb`, lowercased exactly as the two call sites lowercase them.
-fn side_material_names(side: &Path) -> std::collections::BTreeSet<String> {
+/// `weapons/*.glb`, lowercased exactly as the two call sites lowercase them,
+/// and with `overrides` the class skins `soldiers/*.skins.ron` name (card USKN).
+fn side_material_names(side: &Path, overrides: bool) -> std::collections::BTreeSet<String> {
     let mut names = std::collections::BTreeSet::new();
     for e in std::fs::read_dir(side.join("soldiers"))
         .into_iter()
@@ -230,6 +231,15 @@ fn side_material_names(side: &Path) -> std::collections::BTreeSet<String> {
         .flatten()
     {
         let p = e.path();
+        // A class's override texture (card USKN) is asked for by name.
+        if p.to_string_lossy().ends_with(".skins.ron") {
+            if overrides {
+                let skins: manifest::SoldierSkins =
+                    ron::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+                names.extend(skins.overrides);
+            }
+            continue;
+        }
         if p.extension().is_none_or(|x| x != "glb") {
             continue;
         }
@@ -300,10 +310,38 @@ fn the_side_tier2_files_are_textures_the_soldier_path_asks_for() {
     }
     // Pinned: the PC install's `side/rep.lvl` + `side/cis.lvl` gave 21 of the
     // 26 wanted textures (T2S report, measured on the shipped tree); card
-    // HUDW's REP and CIS pistol sheets added two.
-    assert_eq!(stems.len(), 23, "side_bf2 tier-2 stems: {stems:?}");
+    // HUDW's REP and CIS pistol sheets added two. Card USKN's class skins
+    // add six (the battle droid's blue / camo / green / orange / red, the
+    // sharpshooter's red) once the side is baked with them.
+    let skins: Vec<String> = std::fs::read_dir(side.join("soldiers"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".skins.ron"))
+        .flat_map(|p| {
+            let s: manifest::SoldierSkins =
+                ron::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            s.overrides
+        })
+        .collect();
+    // An override that is also a model's own sheet (the ARC trooper's
+    // `rep_inf_arc_blue`, a pair that changes nothing) is not a new stem.
+    let own = side_material_names(&side, false);
+    let skin_stems = stems
+        .iter()
+        .filter(|s| skins.contains(s) && !own.contains(*s))
+        .count();
+    assert_eq!(
+        stems.len() - skin_stems,
+        23,
+        "side_bf2 tier-2 stems: {stems:?}"
+    );
+    if !skins.is_empty() {
+        assert_eq!(skin_stems, 6, "side_bf2 class-skin tier-2 stems: {stems:?}");
+    }
 
-    let names = side_material_names(&side);
+    let names = side_material_names(&side, true);
     for stem in &stems {
         assert!(
             names.contains(stem),

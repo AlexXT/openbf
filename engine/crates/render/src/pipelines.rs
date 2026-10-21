@@ -113,42 +113,54 @@ impl Renderer {
             }],
         });
 
-        let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("globals"),
-            size: std::mem::size_of::<Globals>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let globals_buf = crate::made::buffer(
+            &device,
+            &wgpu::BufferDescriptor {
+                label: Some("globals"),
+                size: std::mem::size_of::<Globals>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        );
         // Zero-filled: no light until a frame files one.
-        let points_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("point lights"),
-            size: crate::point_light::POINT_TABLE_BYTES,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globals bg"),
-            layout: &globals_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: points_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let points_buf = crate::made::buffer(
+            &device,
+            &wgpu::BufferDescriptor {
+                label: Some("point lights"),
+                size: crate::point_light::POINT_TABLE_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        );
+        let globals_bg = crate::made::bind_group(
+            &device,
+            &wgpu::BindGroupDescriptor {
+                label: Some("globals bg"),
+                layout: &globals_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: globals_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: points_buf.as_entire_binding(),
+                    },
+                ],
+            },
+        );
 
         // `shader.wgsl` is the world's module; the pipelines below pick entry
         // points out of it. The grass, the bolts and the terrain light pass
         // each build their own from it plus their file. Attribution and the
         // shape they share: [`PipelineDesc`].
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("map shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
+        let shader = crate::made::shader_module(
+            &device,
+            wgpu::ShaderModuleDescriptor {
+                label: Some("map shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            },
+        );
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("map pipeline layout"),
             bind_group_layouts: &[&globals_bgl, &texture_bgl],
@@ -418,12 +430,15 @@ impl Renderer {
         // over compositing with the depth test on and the depth write OFF —
         // the sprites and the patches arrive far to near. PROVISIONAL: the
         // PS2's GS state for them is not read (re-foliage §7 [H]).
-        let grass_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("grass shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                concat!(include_str!("shader.wgsl"), include_str!("grass.wgsl")).into(),
-            ),
-        });
+        let grass_shader = crate::made::shader_module(
+            &device,
+            wgpu::ShaderModuleDescriptor {
+                label: Some("grass shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    concat!(include_str!("shader.wgsl"), include_str!("grass.wgsl")).into(),
+                ),
+            },
+        );
         let grass_vb = [
             crate::grass::GrassVertex::layout(),
             crate::grass::GrassInstance::layout(),
@@ -440,17 +455,20 @@ impl Renderer {
         // ribbons; GS TEST 0x51001 = depth tested, no depth write
         // (re-bolt §3.3). The core is ALPHA 0x44 (source-over), the glow 0x48
         // (`fs_bolt_glow` writes Cs·As for the shared additive blend).
-        let bolt_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("bolt shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                concat!(
-                    include_str!("shader.wgsl"),
-                    include_str!("grass.wgsl"),
-                    include_str!("bolt.wgsl")
-                )
-                .into(),
-            ),
-        });
+        let bolt_shader = crate::made::shader_module(
+            &device,
+            wgpu::ShaderModuleDescriptor {
+                label: Some("bolt shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    concat!(
+                        include_str!("shader.wgsl"),
+                        include_str!("grass.wgsl"),
+                        include_str!("bolt.wgsl")
+                    )
+                    .into(),
+                ),
+            },
+        );
         let bolt_core_pipeline = PipelineDesc {
             vs: "vs_grass",
             fs: "fs_bolt_core",
@@ -479,16 +497,19 @@ impl Renderer {
             bind_group_layouts: &[&globals_bgl, &terrain_light_bgl],
             push_constant_ranges: &[],
         });
-        let terrain_light_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("terrain light shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                concat!(
-                    include_str!("shader.wgsl"),
-                    include_str!("terrain_light.wgsl")
-                )
-                .into(),
-            ),
-        });
+        let terrain_light_shader = crate::made::shader_module(
+            &device,
+            wgpu::ShaderModuleDescriptor {
+                label: Some("terrain light shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    concat!(
+                        include_str!("shader.wgsl"),
+                        include_str!("terrain_light.wgsl")
+                    )
+                    .into(),
+                ),
+            },
+        );
         let terrain_light_pipeline = PipelineDesc {
             vs: "vs_terrain_light",
             fs: "fs_terrain_light",
@@ -498,12 +519,15 @@ impl Renderer {
             ..PipelineDesc::world("terrain light pipeline", &terrain_light_layout, &vb)
         }
         .build(&device, &terrain_light_shader, format);
-        let spec_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("specular params"),
-            size: std::mem::size_of::<crate::specular::SpecParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let spec_buf = crate::made::buffer(
+            &device,
+            &wgpu::BufferDescriptor {
+                label: Some("specular params"),
+                size: std::mem::size_of::<crate::specular::SpecParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        );
 
         let copyable = match &target {
             Target::Window { config, .. } => config.usage.contains(wgpu::TextureUsages::COPY_SRC),
@@ -542,6 +566,7 @@ impl Renderer {
         let (palette_buf, palette_bg) =
             create_palette_buffer(&device, &palette_bgl, palette_capacity);
         let skinned_instance_buf = create_instance_buffer(&device, palette_capacity);
+        let gpu_timer = crate::gpu_timer::GpuTimer::new(&device, &queue);
 
         Ok(Self {
             format,
@@ -575,6 +600,8 @@ impl Renderer {
             sky_pipelines,
             sky: Vec::new(),
             frame_stats: FrameStats::default(),
+            gpu_timer,
+            acquire_ms: 0.0,
             cull: true,
             skinned_pipeline,
             skinned_blend_pipeline,
@@ -682,41 +709,44 @@ impl<'a> PipelineDesc<'a> {
         shader: &wgpu::ShaderModule,
         format: wgpu::TextureFormat,
     ) -> wgpu::RenderPipeline {
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(self.label),
-            layout: Some(self.layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some(self.vs),
-                buffers: self.buffers,
-                compilation_options: Default::default(),
+        crate::made::render_pipeline(
+            device,
+            &wgpu::RenderPipelineDescriptor {
+                label: Some(self.label),
+                layout: Some(self.layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some(self.vs),
+                    buffers: self.buffers,
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some(self.fs),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: self.blend,
+                        write_mask: FRAME_WRITES,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    // No culling for v0: baked map geometry has mixed winding.
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: self.depth_write,
+                    depth_compare: self.depth_compare,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: Some(self.fs),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: self.blend,
-                    write_mask: FRAME_WRITES,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                // No culling for v0: baked map geometry has mixed winding.
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: self.depth_write,
-                depth_compare: self.depth_compare,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        })
+        )
     }
 }

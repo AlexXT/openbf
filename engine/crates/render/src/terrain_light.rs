@@ -138,16 +138,19 @@ impl Renderer {
             false,
             Some("com_sfx_omniproj"),
         )?;
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("com_sfx_omniproj"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
+        let sampler = crate::made::sampler(
+            &self.device,
+            &wgpu::SamplerDescriptor {
+                label: Some("com_sfx_omniproj"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::FilterMode::Nearest,
+                ..Default::default()
+            },
+        );
         self.terrain_lights.omniproj = Some((view, sampler));
         Ok(())
     }
@@ -179,30 +182,36 @@ impl Renderer {
         let bytes: &[u8] = bytemuck::cast_slice(&words);
         let t = &mut self.terrain_lights;
         if t.params_buf.is_none() {
-            t.params_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("terrain light params"),
-                size: bytes.len() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
+            t.params_buf = Some(crate::made::buffer(
+                &self.device,
+                &wgpu::BufferDescriptor {
+                    label: Some("terrain light params"),
+                    size: bytes.len() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+            ));
         }
         let buf = t.params_buf.as_ref().expect("made above");
         self.queue.write_buffer(buf, 0, bytes);
         if !matches!(&t.dest, Some((_, _, dw, dh)) if (*dw, *dh) == (w, h)) {
-            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("terrain light destination"),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
+            let tex = crate::made::texture(
+                &self.device,
+                &wgpu::TextureDescriptor {
+                    label: Some("terrain light destination"),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.format,
+                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
                 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.format,
-                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
+            );
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
             t.dest = Some((tex, view, w, h));
             t.bg = None;
@@ -211,28 +220,31 @@ impl Renderer {
             let (Some((ov, os)), Some((_, dv, _, _))) = (&t.omniproj, &t.dest) else {
                 return;
             };
-            t.bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("terrain light bg"),
-                layout: &self.terrain_light_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(ov),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(os),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(dv),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: buf.as_entire_binding(),
-                    },
-                ],
-            }));
+            t.bg = Some(crate::made::bind_group(
+                &self.device,
+                &wgpu::BindGroupDescriptor {
+                    label: Some("terrain light bg"),
+                    layout: &self.terrain_light_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(ov),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(os),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(dv),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: buf.as_entire_binding(),
+                        },
+                    ],
+                },
+            ));
         }
     }
 

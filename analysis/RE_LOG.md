@@ -5338,3 +5338,91 @@ check's numbers reproduced and its logic marked PARTLY (folded into the text).
   +-200, set per mission, e.g. UTA1 29.5, MYG1 20): a human flyer above the ceiling counts as outside (card VFLY).
   Workflow verifier (6 agents, every claim to two readers): 16 / 19 SUPPORTED by both, 2 PARTLY by both (narrowed),
   1 NOT SUPPORTED by both (rewritten), none overturned.
+
+## 2026-10-19 (loop lane 2, card GUNWT) — the AI driver's wait for a gunner, the need-gunner call's two sources, the answerers' boarding → `analysis/re-driver-wait.md` [O]
+
+- [O] BF1: every AI pilot of a walker / hover / flyer gets a new controller whose +0x280 window is now + 4.0 s
+  (`FUN_002623c8`); the 7th agent check pushes goal 4 inside it -> `UnitWaitSecondaryAgent` (vtable 0x537300, update
+  `FUN_0024d0f0` - decompiled, the card's "hole" was the empty exit): the vehicle stands; done when every seat is
+  occupied, or past the window with no live kind-1 team boarding claim (claims restamped each think, dead 3 s after
+  the last); MOVE OUT / AT EASE sets the window to now - 2. [M] 15 live waits in 396 BF1 states, window - clock
+  -1.91..+2.53 s, the ones past it held by claims aged 0.0-0.9 s.
+- [O] The need-gunner call (0.3) has TWO sources: the wait's entry, and every set-out of a SEATED trooper agent
+  (`FUN_002613f8` turns its FOLLOW into type 4; [M] 551 of 1,756 live seated drivers run the trooper agent). The
+  issuer's only gate is "seated" ([M] 9,800 on foot / 1,755 seated, `FUN_00260f38`): no seat test, a full vehicle
+  calls too. Every friendly AI on foot within 30 m answers and gets a board goal; free seats = seat count - live
+  claims - human-held seats; a boarder gives up when the vehicle's +0x48 vector reaches 2 m/s [H: the velocity].
+- [O] BF2 twin: the same wait (4.001 s from the agent, claims, full seats), no call, and a hold of up to 15 s while
+  the human player is on foot within 12 m, or within 150 m facing the vehicle (30 deg) - before the seat test; [M]
+  +0x130 >= 0 is the player alone in all 179 BF2 states. Corrects `re-squad-orders.md` 5 / 9b. Card GUNWT -> build
+  (steps A / B), new card GUNWH (the BF2 hold). Workflow verifier (6 agents; absence and twin claims to two readers):
+  29 claims, 24 SUPPORTED by every reader, 5 PARTLY (narrowed), 0 NOT SUPPORTED; the readers split on 4.
+
+## 2026-10-20 (loop lane 2, card SSEL) — the start-of-level and respawn flow: side select, spawn map, class select, the death camera → `analysis/re-spawn-flow.md` [O]
+
+- [O] BF2 PS2 order: side select (Lua `ifs_sideselect`: team 1, team 2, Auto Assign; Spectate hidden offline) -> spawn
+  map -> class select -> spawn; after a death the death camera for 4.0 s, then spawn map -> class -> spawn (no side select
+  again). One state machine per viewport (`FUN_00398000`, SD+0x18: 0 side, 2 map, 3 class, 4 class while alive, 5
+  accepted). The side select is an Instant Action screen ("can switch sides" `DAT_00600b4e`).
+- [O] Auto Assign offline keeps the player's team (team 1 at the start): no team call; [L] team 1 on Hoth, Kamino, Naboo
+  and in 37 of 37 side-select states. The coin flip `FUN_0036fc40` runs only in Galactic Conquest. The highlighted
+  team's first class stands in the backdrop as a preview.
+- [O] The human spawns 0.10-0.13 s after X on the class, waits for no spawn wave, and never spawns without the accept
+  (the port today: wave + automatic). Backdrops: the mission's `AddCameraShot` views at the level start (a new random
+  one per screen), the death view at a respawn, dimmed ~0.51. [L] Death camera: last yaw kept, pulls back to ~5.2 m /
+  4.1 m above the feet at -32 deg in ~0.6 s, 65 deg FOV; spawn map at +4.07 s. Killer turn not captured [H].
+- Live runs: `lead_tmp/ssel/ssel_live.py` (one row per game update). Workflow verifier (7 agents, absence claims to two
+  readers): 33 claims, 35 verdicts, 26 SUPPORTED, 9 PARTLY (narrowed), 0 NOT SUPPORTED; the second reader overturned one
+  sub-claim. Build cards SSELA (sim gate + side choice), SSELB (the screens), SSELC (death camera).
+- [O] Second pass (same day, lane 2; corrects the death-camera line above): the death camera is its own object (BF2
+  vtable 0x617d78, update `FUN_001bc188`, §6.5). Phase 1 looks at the body + 0.8 m from 6.22 m along a line fixed at the
+  death (1 m back / 1.5 m up, 5 m past it), eased by t = timer / 1.0; after an ENEMY kill, from 1.5 s, phase 2 moves
+  onto the body and looks at the killer (`E+0x190`, his member record; his unit's or vehicle's +0xd0 = feet + 1.70 m),
+  following him. Suicides (no killer) and hero classes (none passed) stay in phase 1. It sets no base FOV: tan 0.40237
+  = one 65 -> 48 deg ease step of the player camera (CFOVM's FEL1 state). [L] 10 enemy kills on Kamino with 16 AI a side
+  (phase 2 in all 7 with rows), 3 suicides, 1 explosion kill. Workflow verifier: 21 verdicts, 17 SUPPORTED, 4 PARTLY
+  (narrowed), 0 NOT SUPPORTED; the second reader overturned none.
+
+## 2026-10-20 (loop lane 1, card BSHL) — the BF2 PS2 shell: screens, flow, stack look, movie, loading screen → `analysis/re-bf2-shell.md` [O]
+
+- [O] Read from the disc's own compiled shell scripts (SHELL.LVL 92 + COMMON.LVL 42 Lua 5.0 chunks) and PCSX2 frames,
+  never PC layouts. Flow: legal / logos -> Press START (only Start) -> profile -> Main Menu (Singleplayer, Multiplayer,
+  Splitscreen, Options) -> Singleplayer -> Instant Action screen -> Session Options -> LAUNCH -> BF2 loading screen.
+- [O] One vertical-button stack style: `interface_util`'s PS2 palette and pads, `gamefont_large`, rows font + 6, gutter
+  4 (measured pitch 31.97 units); a `bDimmed` button is grey 110 and focus skips it - the PS2's own disabled style,
+  which settles the port's greyed-out Multiplayer. [M] labels 1.087 x the font advances across, bar = label + 134.2,
+  left-justified stacks' edge at x 34.4 units; the Lua left-justify formula does not reproduce it [H].
+- [O] The background is a movie, not art: SHELL.MVS (34 MPEG-2 512x448 segments; `shell_main` 0-1, `shell_sub_left`
+  2-9, silent; 10-31 carry PSS audio). The shell screen is 512 x 448, safe 0.9, aspect 0.875 (`FUN_00580b08`). The IA
+  screen has no movie: `iface_instant_action`'s top 448 rows. The 30 s title idle plays the attract MOVIE: the engine
+  sets `gMovieAttractMode` from a constant 1 byte, so `ScriptCB_LaunchDemo` is not reached on the PS2.
+- [O] Loading: LOAD.LVL's `load` config (tips `level.common.tips.1..54`, `loadtipsbox_pieces`, `loading` dots); the
+  port draws only the still and a caption. Two verifier workflows (8 agents, absence / flag claims to two readers):
+  40 claims, 31 SUPPORTED, 9 PARTLY (narrowed), 0 NOT SUPPORTED; the second readers overturned none. Build cards
+  BSHLA (title + stacks + bake), BSHLB (the IA screen), LDBF2 (the loading screen).
+
+## 2026-10-20 (loop lane 2, card SSELB slice 4) — the class select's line-up ring → `analysis/re-spawn-flow.md` §4.1 [O]
+
+- [O] Six places on a ring (`DAT_006a5080`, `FUN_0039bcb0`), place 2 the pick, place 5 unseen (colour 0 0 0 1); a
+  soldier's place = lerp of two places x 150 + (100, 350, -452) (`FUN_0039a5f8`); a step slides the ring one place in
+  1/3 s (`SD+0x3c += dt x 3`, `FUN_0039a980`), a step during a slide is dropped. One opus verifier: C1-C7 SUPPORTED, C8
+  PARTLY (wording). The UI scene's perspective is fitted to the Hoth frame [M]; built in `game/src/spawn_preview.rs`.
+
+## 2026-10-20 (loop lane 1, card PWST) — health, ammo and vehicle droids (`powerupstation`): reach, rate, team, animation, sounds, tips → `analysis/re-powerup-station.md` [O]
+
+- [O] A station gives once every `PowerupDelay` s (its own clock, the remainder kept) to every unit whose feet are
+  strictly inside the 3-D sphere of its instance `Radius` (5.0 m; vehicle droids 15.0): the class's amount for the
+  unit's health type, to the cap - BF1 +15 health / 1.0 s, BF2 +25 / 1.0 s, ammo +1 clip to every weapon / 2.0 s, BF1
+  vehicle droid +400 / +1 clip to vehicles. No team test (both games; every disc station Team 0); only while the
+  building state is 0 (not destroyed, not unbuilt); BF2 refuses the SetHeroClass hero's health. B1 `FUN_002a9750`,
+  B2 `FUN_003674c0`.
+- [O] Measured live (`lead_tmp/pwst/ps2/heal_live.py`): BF1 NAB1 75 -> 300 in 15 steps of +15 every 1.001 s, served at
+  4.56 m, not at 5.43 m; ammo 0 -> 4/3/1 (+1 / 2.0 s, caps max - 1); BF2 HOT1 100 -> 400 in 12 x +25, served at 4.60 m,
+  not at 5.34 m. Census: 106 stations on the six showcase maps, 967 on all 32, every one `Radius`, none `EffectRegion`.
+- [O] No bot seeks a station: the type ids and the entity kind code (B1 17, B2 18) are read only by HUD tooltips and
+  network replication. Feedback: `PowerupSound` per served unit at the station; BF1 tooltip 10 "THIS IS A RE-SUPPLY
+  DROID" (7 / 8 / 9 for a broken one); BF2 hints 15 / 16 / 17. The animation (idle 135-225 deg turns, gonk wobble, FX-7
+  arms +-0.15 rad and socket +-pi at 1 Hz while serving) is code-driven bones; the models split into rigid parts.
+- Two verifier workflows (7 agents; absence / twin claims to two readers): 28 claims, 22 SUPPORTED + 2 S/S, 4 PARTLY
+  (fixed: the kind code, three BF2 differences, a citation); the second readers overturned one (B2 bots), and the
+  revised bots claim then held with both. Build: card PWST phase build; tips on card TIPS.

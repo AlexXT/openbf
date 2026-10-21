@@ -168,7 +168,9 @@ impl Sim {
         // D12 (OURS, PROVISIONAL, as in `resolve_bolt`): a bot's damage into
         // a human enemy carries the tier's multiplier.
         let mult = if self.human_damage_on && victim_is_player && !attacker_is_player && !friendly {
-            self.difficulty.tier().human_damage
+            team.map_or(self.difficulty, |t| self.difficulty_of(t))
+                .tier()
+                .human_damage
         } else {
             1.0
         };

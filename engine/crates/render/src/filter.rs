@@ -12,10 +12,14 @@
 //! filtered frame within mean |d| 1.6–3.9.
 //!
 //! The port runs it at native resolution: the low-pass is a box of
-//! `height/224` pixels centred on each pixel ([`box_side`]). Like the
-//! terrain light pass (`terrain_light.rs`) it reads a COPY of the frame,
-//! encodes to display units by hand, and writes the colour over the target
-//! (`FRAME_WRITES`: the alpha plane stays as the scene left it). A window whose surface cannot be copied draws no filter
+//! `height/224` pixels centred on each pixel ([`box_side`]), averaged in two
+//! 1-D passes (card ISPF): the row means into a 10-bit target, then the
+//! column means - n linear samples a pixel, two texels each, not n² loads;
+//! the same mean to the 8-bit result's rounding. Like the terrain light pass
+//! (`terrain_light.rs`) it reads a COPY of the frame - in display units,
+//! through a view without the sRGB suffix - and writes the colour over the
+//! target (`FRAME_WRITES`: the alpha plane stays as the scene left it). A
+//! window whose surface cannot be copied draws no filter
 //! (said once on stderr).
 
 use crate::Renderer;
@@ -48,90 +52,169 @@ fn params(f: &FrameFilter, height: u32) -> [f32; 4] {
     ]
 }
 
+/// The format of the row pass's target: display units, row means of
+/// 8-bit bytes held within 1/8 of a byte by 10 bits a channel - half the
+/// bytes of a half-float target, which the iGPU's bandwidth shows.
+const ROWS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgb10a2Unorm;
+
+/// A texture binding the shader reads with `textureLoad`.
+fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// The frame's copy and the row pass's target for one target size.
+struct FilterDest {
+    copy: wgpu::Texture,
+    rows_view: wgpu::TextureView,
+    /// Pass 1 reads the copy's display bytes; pass 2 the rows and the copy.
+    rows_bg: wgpu::BindGroup,
+    bg: wgpu::BindGroup,
+    w: u32,
+    h: u32,
+}
+
 /// The pass's per-renderer state.
 pub(crate) struct FilterState {
     pub filter: Option<FrameFilter>,
+    rows_pipeline: wgpu::RenderPipeline,
     pipeline: wgpu::RenderPipeline,
+    rows_bgl: wgpu::BindGroupLayout,
     bgl: wgpu::BindGroupLayout,
     params_buf: wgpu::Buffer,
-    /// The frame's copy the shader reads, its size, and the bind group.
-    dest: Option<(wgpu::Texture, wgpu::BindGroup, u32, u32)>,
+    /// Two texels a sample (`box_sum` in the shader).
+    sampler: wgpu::Sampler,
+    dest: Option<FilterDest>,
     copyable: bool,
     warned: bool,
 }
 
 impl FilterState {
     pub(crate) fn new(device: &wgpu::Device, format: wgpu::TextureFormat, copyable: bool) -> Self {
+        let params_entry = wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let sampler_entry = wgpu::BindGroupLayoutEntry {
+            binding: 4,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let rows_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("frame filter rows bgl"),
+            entries: &[params_entry, tex_entry(2), sampler_entry],
+        });
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame filter bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                tex_entry(0),
+                params_entry,
+                tex_entry(2),
+                tex_entry(3),
+                sampler_entry,
             ],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("frame filter layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("frame filter shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("filter.wgsl").into()),
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("frame filter pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_filter"),
-                buffers: &[],
-                compilation_options: Default::default(),
+        let sampler = crate::made::sampler(
+            device,
+            &wgpu::SamplerDescriptor {
+                label: Some("frame filter pair sampler"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_filter"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: crate::pipelines::FRAME_WRITES,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frame filter params"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        );
+        let shader = crate::made::shader_module(
+            device,
+            wgpu::ShaderModuleDescriptor {
+                label: Some("frame filter shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("filter.wgsl").into()),
+            },
+        );
+        let build = |label: &str,
+                     bgl: &wgpu::BindGroupLayout,
+                     fs: &str,
+                     format: wgpu::TextureFormat,
+                     write_mask: wgpu::ColorWrites| {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[bgl],
+                push_constant_ranges: &[],
+            });
+            crate::made::render_pipeline(
+                device,
+                &wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_filter"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some(fs),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: None,
+                            write_mask,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                },
+            )
+        };
+        let rows_pipeline = build(
+            "frame filter rows pipeline",
+            &rows_bgl,
+            "fs_filter_rows",
+            ROWS_FORMAT,
+            wgpu::ColorWrites::COLOR,
+        );
+        let pipeline = build(
+            "frame filter pipeline",
+            &bgl,
+            "fs_filter",
+            format,
+            crate::pipelines::FRAME_WRITES,
+        );
+        let params_buf = crate::made::buffer(
+            device,
+            &wgpu::BufferDescriptor {
+                label: Some("frame filter params"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        );
         Self {
             filter: None,
+            rows_pipeline,
             pipeline,
+            rows_bgl,
             bgl,
             params_buf,
+            sampler,
             dest: None,
             copyable,
             warned: false,
@@ -166,42 +249,108 @@ impl Renderer {
         let Some(p) = f.filter else { return };
         self.queue
             .write_buffer(&f.params_buf, 0, bytemuck::cast_slice(&params(&p, h)));
-        if matches!(&f.dest, Some((_, _, dw, dh)) if (*dw, *dh) == (w, h)) {
+        if matches!(&f.dest, Some(d) if (d.w, d.h) == (w, h)) {
             return;
         }
-        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frame filter source"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
+        let size = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        // The copy carries a view without the sRGB suffix: `textureLoad`
+        // through it returns the display bytes as stored.
+        let display = self.format.remove_srgb_suffix();
+        let copy = crate::made::texture(
+            &self.device,
+            &wgpu::TextureDescriptor {
+                label: Some("frame filter source"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[display],
             },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.format,
-            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+        );
+        let rows = crate::made::texture(
+            &self.device,
+            &wgpu::TextureDescriptor {
+                label: Some("frame filter rows"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: ROWS_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+        );
+        let frame_view = copy.create_view(&wgpu::TextureViewDescriptor::default());
+        let disp_view = copy.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(display),
+            ..Default::default()
         });
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frame filter bg"),
-            layout: &f.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: f.params_buf.as_entire_binding(),
-                },
-            ],
+        let rows_view = rows.create_view(&wgpu::TextureViewDescriptor::default());
+        let params = || wgpu::BindGroupEntry {
+            binding: 1,
+            resource: f.params_buf.as_entire_binding(),
+        };
+        let sampler = || wgpu::BindGroupEntry {
+            binding: 4,
+            resource: wgpu::BindingResource::Sampler(&f.sampler),
+        };
+        let rows_bg = crate::made::bind_group(
+            &self.device,
+            &wgpu::BindGroupDescriptor {
+                label: Some("frame filter rows bg"),
+                layout: &f.rows_bgl,
+                entries: &[
+                    params(),
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&disp_view),
+                    },
+                    sampler(),
+                ],
+            },
+        );
+        let bg = crate::made::bind_group(
+            &self.device,
+            &wgpu::BindGroupDescriptor {
+                label: Some("frame filter bg"),
+                layout: &f.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&frame_view),
+                    },
+                    params(),
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&disp_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&rows_view),
+                    },
+                    sampler(),
+                ],
+            },
+        );
+        f.dest = Some(FilterDest {
+            copy,
+            rows_view,
+            rows_bg,
+            bg,
+            w,
+            h,
         });
-        f.dest = Some((tex, bg, w, h));
     }
 
-    /// Copy `src` (the finished 3D frame) and draw the filter over `view`.
+    /// Copy `src` (the finished 3D frame) and draw the filter over `view`:
+    /// the row means, then the column means with the threshold and gain.
     pub(crate) fn filter_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -209,37 +358,53 @@ impl Renderer {
         view: &wgpu::TextureView,
     ) -> u32 {
         let f = &self.filter;
-        let Some((dest, bg, w, h)) = &f.dest else {
+        let Some(d) = &f.dest else {
             return 0;
         };
         encoder.copy_texture_to_texture(
             src.as_image_copy(),
-            dest.as_image_copy(),
+            d.copy.as_image_copy(),
             wgpu::Extent3d {
-                width: *w,
-                height: *h,
+                width: d.w,
+                height: d.h,
                 depth_or_array_layers: 1,
             },
         );
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("frame filter pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        pass.set_pipeline(&f.pipeline);
-        pass.set_bind_group(0, bg, &[]);
-        pass.draw(0..3, 0..1);
-        1
+        let passes: [(
+            &wgpu::TextureView,
+            &wgpu::RenderPipeline,
+            &wgpu::BindGroup,
+            &str,
+        ); 2] = [
+            (
+                &d.rows_view,
+                &f.rows_pipeline,
+                &d.rows_bg,
+                "frame filter rows pass",
+            ),
+            (view, &f.pipeline, &d.bg, "frame filter pass"),
+        ];
+        for (target, pipeline, bg, label) in passes {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        2
     }
 }
 

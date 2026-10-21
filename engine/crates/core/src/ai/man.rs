@@ -148,7 +148,7 @@ pub fn hittable(
 ) -> Option<Vec3> {
     let v = sim.vehicle(vh)?;
     let wc = sim.weapon_classes.get(g.weapons.first()?.class)?;
-    let view = sim.difficulty.tier().view_mult;
+    let view = sim.difficulty_of(team).tier().view_mult;
     let (pivot, inv) = (v.pos + v.rot * g.pivot, v.rot.inverse());
     // (distance, index, point, muzzle, the target's mount and its building)
     type Cand = (f32, u32, Vec3, Vec3, Option<(VehicleHandle, Option<u32>)>);

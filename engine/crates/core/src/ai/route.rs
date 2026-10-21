@@ -880,9 +880,35 @@ pub(crate) fn plan_leg(
     let floor = |h: u16| hub_has_floor(sim, g, h, pos.y) && !trap(h);
     let table = |exclude: Option<u16>| g.next_hop(cur, dest, m, arrival_arc, exclude, r);
     let bfs = |on_floor: &dyn Fn(u16) -> bool| g.route_bfs(cur, dest, m, on_floor);
-    let hop = match table(None) {
-        Some(h) => Some((h, RouteSource::Table)),
-        None => match bfs(&|_| true) {
+    let dead = |arc: u16| walker && sim.arc_unwalkable(arc, cur);
+    // Card FLNK: a soldier on foot with the Flank role (`team::board`) takes
+    // the next hub of its flank route while it stands on one of the route's
+    // hubs, and off them the port's BFS toward the route's nearest hub
+    // (`FlankTable::join`); the hop passes the tests below, else the
+    // authored route.
+    let flank = st
+        .flank
+        .route
+        .filter(|_| walker && st.flank.to == dest)
+        .and_then(|k| {
+            let k = usize::from(k);
+            sim.flank.next(k, cur).or_else(|| {
+                let (mut hops, mut queue) = (Vec::new(), Vec::new());
+                g.hop_distances_into(cur, m, &mut hops, &mut queue);
+                let j = sim.flank.join(k, &hops)?;
+                g.route_bfs(cur, j, m, &floor)
+            })
+        })
+        .filter(|&(a, n)| {
+            g.arcs.get(usize::from(a)).is_some_and(|x| x.allows(m)) && floor(n) && !dead(a)
+        });
+    let hop = match (flank, table(None)) {
+        (Some(h), _) => {
+            nt.flank += 1;
+            Some((h, RouteSource::Flank))
+        }
+        (None, Some(h)) => Some((h, RouteSource::Table)),
+        (None, None) => match bfs(&|_| true) {
             Some(h) => {
                 nt.bfs += 1;
                 Some((h, RouteSource::Bfs))
@@ -900,7 +926,6 @@ pub(crate) fn plan_leg(
     // (open air on its line, a far end 8 m up, card TGAP: a wall) is
     // rejected the same way, and so is a hop into a hub a soldier is
     // trapped in (`trap`).
-    let dead = |arc: u16| walker && sim.arc_unwalkable(arc, cur);
     let hop = match hop {
         Some(((arc, next), _)) if !floor(next) || dead(arc) => {
             nt.level_rejected += 1;
@@ -1117,6 +1142,19 @@ fn retarget_to_post(
     };
     match cur.filter(|&c| g.reachable(c, dest, ty)) {
         Some(c) => {
+            // Card FLNK: the hub an attack on foot is planned from (a flanker
+            // re-planned on its way keeps its start).
+            if defend || u.mount.is_some() {
+                st.flank = super::FlankState::default();
+            } else if st.flank.to != dest {
+                st.flank = super::FlankState {
+                    from: c,
+                    to: dest,
+                    ..Default::default()
+                };
+            } else if st.flank.route.is_none() {
+                st.flank.from = c;
+            }
             st.route = plan_leg(sim, st, me, c, dest, None, nt);
             if let (Some(p), Some(mut r)) = (spot, st.route) {
                 if r.is_last() && post.nav_hub == Some(r.dest_hub) {

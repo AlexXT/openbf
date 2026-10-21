@@ -164,9 +164,11 @@ fn team_templates(
                         weapon_geometry: c.weapon_geometry.clone(),
                         weapon_hud: c.weapon_hud.clone(),
                         held_hud: c.held.iter().map(|h| (h.slot, h.hud.clone())).collect(),
+                        held_models: c.held.iter().map(|h| (h.slot, h.geometry.clone())).collect(),
                         foley_class: c.foley_class,
                         cries: c.cries.clone(),
                         anim: c.anim.clone(),
+                        skins: c.skins.clone(),
                     });
                 }
                 sim.classes[team] = table;
@@ -195,6 +197,31 @@ fn team_templates(
             [t.clone(), t]
         }
     }
+}
+
+/// Card SSELA: the shell battle's player starts behind the spawn screens -
+/// off the field until it accepts a side, a post and a class, and back after
+/// a death only through the spawn map and the class accept
+/// (`Sim::open_spawn_screens`). Every shell battle is Instant Action, where
+/// the PS2 offers the side select ("can switch sides", re-spawn-flow §1), so
+/// the screens open on it; the side the player accepts is the player's team
+/// (`mission::pick`'s `player_team` only orders the armies). The CLI walk,
+/// the headless tools and the golden scenes keep the auto-accept spawn;
+/// `OPENBF_SPAWN_SCREENS=0` turns the screens off here too. The screens
+/// stand over the mission's camera shots until the first spawn (card SSELB,
+/// `game::spawn_backdrop`).
+pub(super) fn open_spawn_screens(walk: &mut WalkSim, mission: Option<&game::mission::MissionDef>) {
+    if std::env::var("OPENBF_SPAWN_SCREENS").is_ok_and(|v| v == "0") {
+        return;
+    }
+    if !walk.sim.open_spawn_screens(0, true) {
+        eprintln!("spawn screens: slot 0 holds no live unit; the respawn stays automatic");
+        return;
+    }
+    walk.backdrop = mission.and_then(|m| {
+        game::spawn_backdrop::Backdrop::new(m.camera_shots(), game::spawn_backdrop::LCG_RESEED)
+    });
+    walk.follow_backdrop();
 }
 
 /// Build the walk/battle sim for a loaded scene per the CLI flags.
@@ -382,6 +409,8 @@ pub(super) fn hud_model(
     let me = &walk.sim.units[walk.player.index as usize];
     let b = &walk.sim.battle;
     let on_foot = me.alive && me.mount.is_none();
+    let spawn = spawn_model(walk, feed).and_then(|s| s.page);
+    let slot = me.spec.player_slot.map_or(0, usize::from);
     let weapon = on_foot.then(|| {
         let class = walk.sim.weapon_classes.get(me.weapon_class);
         let rounds = class.map_or(0, |c| c.rounds_per_clip);
@@ -452,14 +481,11 @@ pub(super) fn hud_model(
         reticle,
         reticle_y: walk.reticle_y(),
         dead: !me.alive,
+        // A human waits for no spawn wave (card SSELA): its timer only.
         respawn_in: (!me.alive).then(|| {
-            let timer = me.respawn_at.map_or(0.0, |t| {
+            me.respawn_at.map_or(0.0, |t| {
                 t.saturating_sub(walk.sim.tick) as f32 / core::TICK_HZ as f32
-            });
-            let wave = me.spawn_slot.map_or(0.0, |s| {
-                walk.sim.waves[usize::from(me.team).min(1)].countdown(s)
-            });
-            timer.max(wave)
+            })
         }),
         outcome: walk.sim.outcome,
         time_left: walk.sim.time_limit.map(|l| {
@@ -469,8 +495,14 @@ pub(super) fn hud_model(
         messages: feed.take(),
         stats: Some(feed.stats(&walk.sim, walk.player)),
         player_team: me.team,
-        map: walk.minimap.as_ref().map(|m| m.model(walk)),
+        map: walk.minimap.as_ref().map(|m| match &spawn {
+            // The spawn map page shows the Map element's Spawn view.
+            Some(ui::spawn_draw::SpawnPage::Map { .. }) => m.spawn_model(walk, slot),
+            _ => m.model(walk),
+        }),
         squad: feed.squad(walk.sim.tick),
+        // The spawn screen up, drawn in the HUD's frame (card SSELB).
+        spawn,
         capture: game::capture_feed::for_unit(
             &walk.sim,
             walk.player.index as usize,
@@ -480,68 +512,103 @@ pub(super) fn hud_model(
 }
 
 /// Spawn screen model while the player is dead and the round is live; None
-/// otherwise. `selected` is the UI cursor — see `ui::spawn` on why it does not
-/// steer the respawn yet.
-pub(super) fn spawn_model(walk: &WalkSim, selected: usize) -> Option<ui::spawn::SpawnModel> {
+/// otherwise. The post list is the sim's ([`core::sim::Sim::player_spawn_posts`]:
+/// the team's posts, then its live command walkers) and the selection is the
+/// sim's spawn-map pick for this player's slot (card SPSEL), as is the class
+/// row; the class names come from the disc's text through `feed`.
+pub(super) fn spawn_model(
+    walk: &WalkSim,
+    feed: &game::event_feed::EventFeed,
+) -> Option<ui::spawn::SpawnModel> {
     let me = &walk.sim.units[walk.player.index as usize];
     if me.alive || walk.sim.outcome.is_some() {
         return None;
     }
     let b = &walk.sim.battle;
-    // The team's posts, then its live command walkers — each owns a post
-    // the PS2's spawn map lists like any other, at the walker's live position
-    // (card CWSP, re-command-walker-post §5); named by the class `Label`.
-    let walkers = walk
+    let slot = me.spec.player_slot.map_or(0, usize::from);
+    let list = walk.sim.player_spawn_posts(me.team);
+    let selected = walk
         .sim
-        .command_walkers(me.team)
-        .map(|(_, v)| ui::spawn::SpawnPost {
-            name: walk
-                .vehicle_labels
-                .get(v.class as usize)
-                .and_then(Clone::clone)
-                .unwrap_or_else(|| "Command walker".to_owned()),
-            contested: false,
-            distance: (v.pos - me.soldier.pos).length(),
-        });
-    let posts = walk
-        .sim
-        .cps
+        .spawn_post_selected(slot)
+        .and_then(|p| list.iter().position(|q| q.0 == p));
+    // A walker's post is named by its class `Label` (card CWSP,
+    // re-command-walker-post §5); a command post by its own name.
+    let posts: Vec<ui::spawn::SpawnPost> = list
         .iter()
-        .filter(|c| c.spawnable_by(me.team))
-        .map(|c| ui::spawn::SpawnPost {
-            name: c.def.name.clone(),
-            // Enemies are neutralizing it right now.
-            contested: c.neutral > 0.0,
-            distance: (c.def.pos - me.soldier.pos).length(),
+        .map(|&(post, pos)| match post {
+            core::unit::SpawnPost::Post(i) => {
+                let c = &walk.sim.cps[usize::from(i)];
+                ui::spawn::SpawnPost {
+                    name: feed
+                        .post_names()
+                        .get(usize::from(i))
+                        .cloned()
+                        .unwrap_or_else(|| c.def.name.clone()),
+                    // Enemies are neutralizing it right now.
+                    contested: c.neutral > 0.0,
+                    distance: (pos - me.soldier.pos).length(),
+                }
+            }
+            core::unit::SpawnPost::Walker(h) => ui::spawn::SpawnPost {
+                name: walk
+                    .sim
+                    .vehicle(h)
+                    .and_then(|v| walk.vehicle_labels.get(v.class as usize))
+                    .and_then(Clone::clone)
+                    .unwrap_or_else(|| "Command walker".to_owned()),
+                contested: false,
+                distance: (pos - me.soldier.pos).length(),
+            },
         })
-        .chain(walkers)
         .collect();
+    // A human waits for no spawn wave (card SSELA): its timer only.
     let countdown = {
-        let timer = me.respawn_at.map_or(0.0, |t| {
+        let secs = me.respawn_at.map_or(0.0, |t| {
             t.saturating_sub(walk.sim.tick) as f32 / core::TICK_HZ as f32
         });
-        let wave = me.spawn_slot.map_or(0.0, |s| {
-            walk.sim.waves[usize::from(me.team).min(1)].countdown(s)
-        });
-        let secs = timer.max(wave);
         (secs > 0.0).then_some(secs)
     };
-    // The class row comes from the SIM: the labels are the team's table and
-    // the selection is `Sim::spawn_choice` for this player's slot, which the
-    // pad moves and the respawn reads (`ui::spawn`).
+    // The sim's spawn screen for this slot (card SSELA), when it runs them.
+    let screen = walk.sim.spawn_screens.then(|| {
+        use core::sim::{SideChoice, SpawnStage};
+        match walk.sim.spawn_stage.get(slot).copied().unwrap_or_default() {
+            SpawnStage::Side => ui::spawn::SpawnScreen::Side {
+                rows: [
+                    walk.teams[0].faction.clone(),
+                    walk.teams[1].faction.clone(),
+                    "Auto Assign".to_owned(),
+                ],
+                selected: match walk.sim.side_choice.get(slot).copied().unwrap_or_default() {
+                    SideChoice::Team1 => 0,
+                    SideChoice::Team2 => 1,
+                    SideChoice::Auto => 2,
+                },
+            },
+            SpawnStage::Map => ui::spawn::SpawnScreen::Map,
+            SpawnStage::Class => ui::spawn::SpawnScreen::Class,
+            SpawnStage::Accepted => ui::spawn::SpawnScreen::Waiting,
+        }
+    });
+    let page = game::spawn_page::page(walk, feed, slot);
+    // The class row comes from the SIM: the table's order and the selection
+    // `Sim::spawn_choice` for this player's slot, which the pad moves and the
+    // respawn reads; each name is the disc's (`EventFeed::class_names`), else
+    // the roster's label.
     let team = &walk.teams[usize::from(me.team.min(1))];
-    let slot = me.spec.player_slot.map_or(0, usize::from);
     let has_table = !walk.sim.classes[usize::from(me.team.min(1))].is_empty();
+    let names = feed.class_names(me.team);
     Some(ui::spawn::SpawnModel {
         team_names: [walk.teams[0].faction.clone(), walk.teams[1].faction.clone()],
         player_team: me.team,
         tickets: [b.teams[0].tickets(), b.teams[1].tickets()],
         posts,
         selected,
-        classes: if has_table {
-            team.classes.iter().map(|c| c.label.clone()).collect()
-        } else {
+        classes: if !has_table {
             Vec::new()
+        } else if names.len() == team.classes.len() {
+            names.to_vec()
+        } else {
+            team.classes.iter().map(|c| c.label.clone()).collect()
         },
         selected_class: walk
             .sim
@@ -549,5 +616,7 @@ pub(super) fn spawn_model(walk: &WalkSim, selected: usize) -> Option<ui::spawn::
             .get(slot)
             .map_or(0, |c| usize::from(*c)),
         countdown,
+        screen,
+        page,
     })
 }

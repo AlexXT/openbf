@@ -44,3 +44,7 @@ menu emit UI sound events; 2-D playback through the CORE / map sound library.
 - The two zoom names (`binocularzoomin` / `binocularzoomout`) on scope in / out, if the port has the scope.
 - Mutation check: map `SpawnDisplayBack` to the accept sound and see the test fail.
 - 2026-10-06 planner: `engine/CRATES.md` taken out of `files:`. The picker refuses a card whose files overlap a card in progress, and 22 open cards listed the map, so any one of them held the other 21 (a chain card in progress held WADE and WTHR). The map's row for a new or moved source file is still owed in the same branch (`scripts/size_report.sh --check-map`); a rebase conflict in it is one line. Undo: add the path back.
+- 2026-10-20 (card BSHL's RE, `analysis/re-bf2-shell.md` §3.2): the PS2 shell's own clicks for the menus BSHLA builds -
+  the shell-screen template's defaults are accept `shell_menu_accept`, back `shell_menu_cancel`, exit `shell_menu_exit`,
+  error `shell_menu_error`, enter none; every focus move in a button stack plays `shell_select_change` (also when the
+  walk wraps back to the same button). One sound table for the shell and the pause menu.

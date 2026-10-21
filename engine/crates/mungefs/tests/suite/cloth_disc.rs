@@ -49,6 +49,7 @@ fn all_58_disc_chunks_parse() {
         // find_cloths keeps one per name.
         let one = find_cloths(inner).unwrap();
         let mut names: Vec<_> = one.iter().map(|c| c.name.to_ascii_lowercase()).collect();
+        names.sort();
         names.dedup();
         assert_eq!(names.len(), one.len(), "{}", f.display());
     }

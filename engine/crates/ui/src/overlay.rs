@@ -21,6 +21,20 @@ pub struct FramePaint {
     pixels_per_point: f32,
 }
 
+impl FramePaint {
+    /// The texture uploads this frame carries and their bytes (a font
+    /// atlas that grew, a new image) - the frame recorder's (card HITCH).
+    pub fn texture_uploads(&self) -> (usize, u64) {
+        let bytes = self
+            .textures
+            .set
+            .iter()
+            .map(|(_, d)| (d.image.width() * d.image.height() * 4) as u64)
+            .sum();
+        (self.textures.set.len(), bytes)
+    }
+}
+
 impl EguiOverlay {
     pub fn new(window: &Window, device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let ctx = egui::Context::default();

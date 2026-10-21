@@ -121,10 +121,10 @@ struct VsIn {
     @location(6) m2: vec4<f32>,
     @location(7) m3: vec4<f32>,
     @location(8) inst_color: vec4<f32>,
-    // Far-scene cull distance, metres (render::mesh::NO_CULL = never).
-    @location(11) cull: f32,
-    // Far scene's NEAR edge, metres (render::mesh::NO_CULL_NEAR = 0 = never).
-    @location(12) cull_near: f32,
+    // Far-scene cull band [lo, hi], metres (render::mesh::NO_CULL = never).
+    @location(11) cull: vec2<f32>,
+    // Far scene's NEAR edge band, metres (render::mesh::NO_CULL_NEAR = 0 = never).
+    @location(12) cull_near: vec2<f32>,
     // render::LightPath.
     @location(13) light: u32,
     // render::Fade [begin, end, near], metres (render::mesh::NO_FADE = never).
@@ -141,8 +141,8 @@ struct VsOut {
     // Radial distance from the eye, for the far-scene cull and fades.
     @location(3) view_dist: f32,
     // Per-instance, so it is the same value across the whole primitive.
-    @location(4) cull: f32,
-    @location(5) cull_near: f32,
+    @location(4) cull: vec2<f32>,
+    @location(5) cull_near: vec2<f32>,
     @location(6) @interpolate(flat) light: u32,
     // World position, read by the water's two entry points only.
     @location(7) world_pos: vec3<f32>,
@@ -326,8 +326,15 @@ fn fs_main(raw: VsOut) -> @location(0) vec4<f32> {
 // overlap instead (`game::viewer::lowres_range`). A geometry's LOWD
 // extension (card UTAS) takes the same edge at `NearSceneRange[1]`, the far
 // scene's reach. NO_CULL_NEAR is 0, so the test is a no-op for every other draw.
+// Each edge is a band [lo, hi] (`render::draw::instance_cull`), read at ONE
+// dithered point per pixel: a plain cull is a band of width 0, and the far
+// scene's model / LOWD switch (card LOD, `render::LodSwitch`) gives the model
+// a far band and its LOWD the same near band, so the pixel's one threshold
+// keeps exactly one of the two. `render::fragment_kept` is this test in Rust.
 fn far_cull(in: VsOut) {
-    if in.view_dist > in.cull || in.view_dist < in.cull_near {
+    let u = bayer4(in.clip_pos.xy);
+    if in.view_dist > mix(in.cull.x, in.cull.y, u)
+        || in.view_dist < mix(in.cull_near.x, in.cull_near.y, u) {
         discard;
     }
     // A fading instance (`fade_alpha`) as an ordered dither: the PS2 blends
@@ -806,8 +813,8 @@ struct VsSpecOut {
     // draw the viewer makes carries a white instance colour.
     @location(2) color: vec4<f32>,
     @location(3) view_dist: f32,
-    @location(4) cull: f32,
-    @location(5) cull_near: f32,
+    @location(4) cull: vec2<f32>,
+    @location(5) cull_near: vec2<f32>,
     @location(6) spec_uv: vec2<f32>,
     @location(7) spec_rgb: vec3<f32>,
     // The base draw's `render::LightPath`, so `fs_spec` recomputes the base
@@ -857,8 +864,8 @@ fn spec_varyings(
     uv: vec2<f32>,
     color: vec4<f32>,
     inst_color: vec4<f32>,
-    cull: f32,
-    cull_near: f32,
+    cull: vec2<f32>,
+    cull_near: vec2<f32>,
     light: u32,
     fade: f32,
     lights: vec4<u32>,
@@ -948,8 +955,8 @@ struct VsSkinnedIn {
     @location(8) inst_color: vec4<f32>,
     @location(9) joints: vec4<u32>,
     @location(10) weights: vec4<f32>,
-    @location(11) cull: f32,
-    @location(12) cull_near: f32,
+    @location(11) cull: vec2<f32>,
+    @location(12) cull_near: vec2<f32>,
     @location(13) light: u32,
     @location(15) lights: vec4<u32>,
 };

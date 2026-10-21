@@ -531,6 +531,56 @@ pub fn lowres_range(
     (near.is_finite() && near > 0.0 && far > near).then_some((near, far))
 }
 
+/// Is the far scene's model / LOWD switch on? Yes unless `OPENBF_LOD=0`,
+/// which draws every geometry as its model at every distance (the port before
+/// card LOD), for an A/B.
+pub fn lod_enabled() -> bool {
+    std::env::var("OPENBF_LOD").as_deref() != Ok("0")
+}
+
+/// Where a map switches a LOWD-bearing geometry from its model to its `LOWD`
+/// (card LOD, `analysis/re-lod.md` §4, §7 [O]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LodBands {
+    /// `NearSceneRange[1]`: the far scene's reach, where the crossfade begins.
+    pub begin: f32,
+    /// `NearSceneRange[2]`: the near scene's end — no model past it.
+    pub end: f32,
+}
+
+impl LodBands {
+    /// The model's and the LOWD's sides of the switch ([`render::LodSwitch`]).
+    pub fn sides(self) -> (render::LodSwitch, render::LodSwitch) {
+        let side = |side| render::LodSwitch {
+            fade_begin: self.begin,
+            fade_end: self.end,
+            side,
+        };
+        (side(render::LodSide::Model), side(render::LodSide::Lowd))
+    }
+}
+
+/// The map's [`LodBands`], or `None` when it has no far scene to draw a LOWD
+/// in: `FarSceneRange(0)` (nine of the 32 baked maps, re-fog §6), a
+/// `FarSceneRange` that does not reach past `NearSceneRange[1]` (BF2 inserts
+/// nothing then, re-lod §4.1; BF1's walker culls it), or no `NearSceneRange`.
+/// A map that authors no `FarSceneRange` takes the ELF's default, as
+/// [`far_cull_from`] does.
+///
+/// The PS2 scales `NearSceneRange` by the camera's zoom (re-lod §3.1, §4.1:
+/// `b·S`); these bands do not — the port's other scene-range culls do not
+/// either. A DEVIATION: through a zoomed scope the switch stays at its
+/// unzoomed distance.
+pub fn lod_bands(lighting: &manifest::ManifestLighting) -> Option<LodBands> {
+    let [_, begin, end] = lighting.near_scene_range?;
+    let far = lighting.far_scene_range.unwrap_or(DEFAULT_FAR_SCENE_RANGE);
+    let ok = |v: f32| v.is_finite() && v > 0.0;
+    (ok(begin) && ok(end) && ok(far) && far > begin.min(end)).then_some(LodBands {
+        begin: begin.min(end),
+        end,
+    })
+}
+
 /// The near scene's fade into the sky on a BF2 map that draws no far layer,
 /// or `None` when the map draws one.
 ///
@@ -765,7 +815,7 @@ mod tests {
         };
 
         // BF1 TAT1: NearSceneRange(1, 100, 150), FarSceneRange 2000 — the
-        // values `mungefs/tests/tat1_lvl.rs` pins against the disc bytes.
+        // values `mungefs/tests/suite/tat1_lvl.rs` pins against the disc bytes.
         assert_eq!(
             with(Some([1.0, 100.0, 150.0]), Some(2000.0)),
             Some(FarCull {
@@ -1190,5 +1240,47 @@ mod tests {
         w.config.as_mut().unwrap().ocean = true;
         assert_eq!(water_shading(&l, Some(&w)), render::WaterShading::default());
         assert_eq!(water_shading(&l, None), render::WaterShading::default());
+    }
+
+    fn ranges(near: Option<[f32; 3]>, far: Option<f32>) -> manifest::ManifestLighting {
+        manifest::ManifestLighting {
+            near_scene_range: near,
+            far_scene_range: far,
+            ..manifest::ManifestLighting::default()
+        }
+    }
+
+    /// Card LOD: the switch's band is `NearSceneRange[1]..[2]` (BF1 NAB1
+    /// authors 100 / 130 / 1000); a map with no far scene draws no LOWD.
+    #[test]
+    fn lod_bands_come_from_the_scene_ranges() {
+        let nab1 = lod_bands(&ranges(Some([1.0, 100.0, 130.0]), Some(1000.0)));
+        assert_eq!(
+            nab1,
+            Some(LodBands {
+                begin: 100.0,
+                end: 130.0
+            })
+        );
+        // FarSceneRange(0): no far layer, no LOWD (BF1 YAV1 50 / 100 / 0).
+        assert_eq!(
+            lod_bands(&ranges(Some([1.0, 50.0, 100.0]), Some(0.0))),
+            None
+        );
+        // A far scene that never reaches past NearSceneRange[1].
+        assert_eq!(
+            lod_bands(&ranges(Some([1.0, 100.0, 150.0]), Some(100.0))),
+            None
+        );
+        // No NearSceneRange (a stale bake): nothing to switch on.
+        assert_eq!(lod_bands(&ranges(None, Some(1000.0))), None);
+        // No FarSceneRange authored: the ELF's default, which reaches past.
+        assert!(lod_bands(&ranges(Some([1.0, 100.0, 130.0]), None)).is_some());
+        let (m, l) = nab1.unwrap().sides();
+        assert_eq!(
+            (m.side, l.side),
+            (render::LodSide::Model, render::LodSide::Lowd)
+        );
+        assert_eq!((m.fade_begin, m.fade_end), (l.fade_begin, l.fade_end));
     }
 }

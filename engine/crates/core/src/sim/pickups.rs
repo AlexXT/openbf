@@ -112,6 +112,14 @@ pub struct DropTable {
 }
 
 impl DropTable {
+    /// No drops (the `Default`, as a constant: a golden test that builds a
+    /// template links no `core::sim` function, `engine/goldens/deps.toml`).
+    pub const NONE: Self = Self {
+        count: 0,
+        item: [0; MAX_DROPS],
+        prob: [0.0; MAX_DROPS],
+    };
+
     pub fn from_pairs(pairs: &[(u8, f32)]) -> Self {
         let mut t = DropTable::default();
         for (i, (item, prob)) in pairs.iter().take(MAX_DROPS).enumerate() {

@@ -17,9 +17,16 @@
 //! R1 (`RightTrigger`) next class and Select previous. The PS2's own
 //! spawn-screen buttons are UNTRACED.
 //!
-//! The D-PAD is the squad commands' (Phase D, card SQACK). It is still read UI-side by the
-//! pause menu and the dead player's spawn cursor, which never overlaps: an
-//! alive, unpaused player's presses reach the sim, nobody else's do.
+//! The spawn screens' accept and back (card SSELA, `SPAWN_ACCEPT` /
+//! `SPAWN_BACK`) are the PS2's X and Triangle (re-spawn-flow §1): Cross and
+//! Triangle carry them beside JUMP and ACTION; the sim reads them only from a
+//! slot that is not on the field.
+//!
+//! The D-PAD is the squad commands' (Phase D, card SQACK) and, while the
+//! player is dead, the spawn map's post push (card SPSEL, `SPAWN_POST_*`): the
+//! sim reads the squad bits only from a live player and the post bits only
+//! from a dead one. The pause menu still reads it UI-side; a paused player's
+//! pad reaches the sim as idle.
 //!
 //! Pads (card PADM): every `Gilrs` comes from [`open_gilrs`], which adds the
 //! project's own SDL mappings (`pads.txt`, pads the SDL_GameControllerDB
@@ -47,19 +54,36 @@ impl Mapping {
             table: vec![
                 (Button::RightTrigger2, buttons::FIRE),
                 (Button::LeftTrigger2, buttons::SECONDARY_FIRE),
-                (Button::South, buttons::JUMP),
+                // X / Triangle are also the spawn screens' accept / back
+                // (card SSELA), read by the sim only off the field.
+                (Button::South, buttons::JUMP | buttons::SPAWN_ACCEPT),
                 (Button::East, buttons::ROLL_STANCE),
                 (Button::LeftThumb, buttons::SPRINT),
                 (Button::LeftTrigger, buttons::SWITCH_SECONDARY),
                 (Button::West, buttons::RELOAD),
-                (Button::North, buttons::ACTION),
+                (Button::North, buttons::ACTION | buttons::SPAWN_BACK),
                 (Button::RightThumb, buttons::ZOOM),
                 // The four squad orders, on the PS2's D-pad arms (card
-                // SQACK, re-squad-orders.md section 1).
-                (Button::DPadUp, buttons::SQUAD_MOVE_OUT),
-                (Button::DPadDown, buttons::SQUAD_HOLD),
-                (Button::DPadLeft, buttons::SQUAD_AT_EASE),
-                (Button::DPadRight, buttons::SQUAD_FOLLOW),
+                // SQACK, re-squad-orders.md section 1). The same arms move
+                // the spawn map's post while dead (card SPSEL, as the PS2's
+                // spawn map reads its D-pad): the sim reads squad bits only
+                // alive and post bits only dead.
+                (
+                    Button::DPadUp,
+                    buttons::SQUAD_MOVE_OUT | buttons::SPAWN_POST_UP,
+                ),
+                (
+                    Button::DPadDown,
+                    buttons::SQUAD_HOLD | buttons::SPAWN_POST_DOWN,
+                ),
+                (
+                    Button::DPadLeft,
+                    buttons::SQUAD_AT_EASE | buttons::SPAWN_POST_LEFT,
+                ),
+                (
+                    Button::DPadRight,
+                    buttons::SQUAD_FOLLOW | buttons::SPAWN_POST_RIGHT,
+                ),
                 // The spawn-class bits are PROVISIONAL (lead placeholder, no
                 // RE) and read by the sim only while the player is dead, so
                 // R1 carries both.
@@ -294,12 +318,52 @@ pub fn pad_from_gamepad(pad: &gilrs::Gamepad<'_>) -> PadState {
     pad_from_gamepad_with(pad, &Mapping::ps2_default())
 }
 
+/// Card (the maintainer, 2026-10-20): the left stick works the menus and the spawn map
+/// like the D-pad. A push past this reads as an arm; one already held stays
+/// until the stick falls under [`STICK_ARM_OFF`], so a wobble near the edge
+/// does not click twice.
+pub const STICK_ARM_ON: f32 = 0.6;
+pub const STICK_ARM_OFF: f32 = 0.35;
+/// The D-pad arm bits a stick position stands for (1 up, 2 down, 4 left,
+/// 8 right: the menu's edge bits): the dominant axis only, so a diagonal
+/// never presses two arms. `held` is the arms read last frame (hysteresis);
+/// +y is up, as gilrs reports it.
+pub fn stick_arms(x: f32, y: f32, held: u32) -> u32 {
+    let (ax, ay) = (x.abs(), y.abs());
+    let (v, along_x) = if ax >= ay { (ax, true) } else { (ay, false) };
+    let arm = match (along_x, if along_x { x } else { y } > 0.0) {
+        (true, true) => 8,
+        (true, false) => 4,
+        (false, true) => 1,
+        (false, false) => 2,
+    };
+    if v >= STICK_ARM_ON || (held & arm != 0 && v >= STICK_ARM_OFF) {
+        arm
+    } else {
+        0
+    }
+}
+
 /// [`pad_from_gamepad`] through a given [`Mapping`].
 pub fn pad_from_gamepad_with(pad: &gilrs::Gamepad<'_>, map: &Mapping) -> PadState {
     use gilrs::Axis;
     let mut b = 0u32;
     for &(gb, bit) in &map.table {
         if is_down(pad, gb) {
+            b |= bit;
+        }
+    }
+
+    // The left stick also moves the spawn map's post while dead (the sim
+    // reads post bits only dead; alive the stick walks).
+    let arms = stick_arms(pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY), 0);
+    for (arm, bit) in [
+        (1, buttons::SPAWN_POST_UP),
+        (2, buttons::SPAWN_POST_DOWN),
+        (4, buttons::SPAWN_POST_LEFT),
+        (8, buttons::SPAWN_POST_RIGHT),
+    ] {
+        if arms & arm != 0 {
             b |= bit;
         }
     }
@@ -316,6 +380,23 @@ pub fn pad_from_gamepad_with(pad: &gilrs::Gamepad<'_>, map: &Mapping) -> PadStat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_left_stick_reads_as_the_dpad_arms() {
+        assert_eq!(stick_arms(0.0, 1.0, 0), 1, "up");
+        assert_eq!(stick_arms(0.0, -1.0, 0), 2, "down");
+        assert_eq!(stick_arms(-1.0, 0.0, 0), 4, "left");
+        assert_eq!(stick_arms(1.0, 0.0, 0), 8, "right");
+        assert_eq!(stick_arms(0.0, 0.0, 0), 0, "centred");
+        assert_eq!(stick_arms(0.5, 0.0, 0), 0, "a half push is not a click");
+        // A diagonal presses its stronger axis only, never two arms.
+        assert_eq!(stick_arms(0.7, 0.9, 0), 1);
+        assert_eq!(stick_arms(0.9, 0.7, 0), 8);
+        // Hysteresis: a held arm stays down to 0.35 and a new one needs 0.6.
+        assert_eq!(stick_arms(0.0, 0.45, 1), 1);
+        assert_eq!(stick_arms(0.0, 0.45, 0), 0);
+        assert_eq!(stick_arms(0.0, 0.3, 1), 0);
+    }
 
     fn fwd(buttons: u32) -> PadState {
         PadState {
@@ -490,12 +571,22 @@ mod tests {
             SPAWN_CLASS_NEXT,
             SPAWN_CLASS_PREV,
             SWITCH_SECONDARY,
+            SPAWN_POST_UP,
+            SPAWN_POST_DOWN,
+            SPAWN_POST_LEFT,
+            SPAWN_POST_RIGHT,
+            SPAWN_ACCEPT,
+            SPAWN_BACK,
         ];
         let mut seen = 0u32;
         for b in all {
             assert_eq!(seen & b, 0, "overlapping bit {b:#x}");
             seen |= b;
         }
+    }
+
+    fn of_bits(m: &Mapping, gb: Button) -> Option<u32> {
+        m.table.iter().find(|(b, _)| *b == gb).map(|(_, x)| *x)
     }
 
     /// D10: the default table binds every bit the sim reads, binds each
@@ -529,14 +620,22 @@ mod tests {
             SQUAD_MOVE_OUT,
             SPAWN_CLASS_NEXT,
             SPAWN_CLASS_PREV,
+            SPAWN_POST_UP,
+            SPAWN_POST_DOWN,
+            SPAWN_POST_LEFT,
+            SPAWN_POST_RIGHT,
+            SPAWN_ACCEPT,
+            SPAWN_BACK,
         ] {
             assert_ne!(bits & bit, 0, "nothing presses {bit:#x}");
         }
+        assert_eq!(of_bits(&m, Button::South), Some(JUMP | SPAWN_ACCEPT));
+        assert_eq!(of_bits(&m, Button::North), Some(ACTION | SPAWN_BACK));
         let of = |gb: Button| m.table.iter().find(|(b, _)| *b == gb).map(|(_, x)| *x);
-        assert_eq!(of(Button::DPadUp), Some(SQUAD_MOVE_OUT));
-        assert_eq!(of(Button::DPadDown), Some(SQUAD_HOLD));
-        assert_eq!(of(Button::DPadLeft), Some(SQUAD_AT_EASE));
-        assert_eq!(of(Button::DPadRight), Some(SQUAD_FOLLOW));
+        assert_eq!(of(Button::DPadUp), Some(SQUAD_MOVE_OUT | SPAWN_POST_UP));
+        assert_eq!(of(Button::DPadDown), Some(SQUAD_HOLD | SPAWN_POST_DOWN));
+        assert_eq!(of(Button::DPadLeft), Some(SQUAD_AT_EASE | SPAWN_POST_LEFT));
+        assert_eq!(of(Button::DPadRight), Some(SQUAD_FOLLOW | SPAWN_POST_RIGHT));
         assert_eq!(of(Button::RightThumb), Some(ZOOM));
         assert_eq!(of(Button::LeftTrigger), Some(SWITCH_SECONDARY));
         assert_eq!(

@@ -261,10 +261,16 @@ pub(super) fn run(
         // The cone a shot can leave in: the weapon's spread as it is now
         // (a sniper's AI table, the posture, the recoil) round the aim.
         let spread = u.weapon.yaw_spread(wc).max(u.weapon.pitch_spread(wc));
-        // Card HVYW (OURS): a missile leaves a wind-up late and flies slowly.
-        let late = (wc.ordnance.kind == crate::weapon::OrdKind::Missile)
-            .then_some((wc.initial_salvo_delay, wc.ordnance.velocity));
-        friend_in_line(sim, me, u, eye, range, LINE_SPREAD + spread, late)
+        friend_in_line(
+            sim,
+            me,
+            u,
+            eye,
+            range,
+            LINE_SPREAD + spread,
+            Some(shot_late(wc)),
+        )
+        .or_else(|| friend_in_blast(sim, me, u, e.capsule().center(), wc))
     });
     let mut no_throw = false;
     let range = match (enemy, memory) {
@@ -364,6 +370,19 @@ pub(super) fn run(
     })
 }
 
+/// How late a shot of class `wc` leaves and how fast it flies (s, m/s), for
+/// [`friend_in_line`]. Card HVYW (OURS): a missile leaves a wind-up late and
+/// flies slowly. Card TEAM (OURS): any other shot leaves after this tick's
+/// walk - the sim moves the units, then fires - so a friend crossing a metre
+/// in front of the muzzle met it (a mortar's shell, one tick old: 40 of the
+/// BF2 maps' 53 mortar team kills in 8 seeds, the friend 1-2 m out).
+fn shot_late(wc: &crate::weapon::WeaponClass) -> (f32, f32) {
+    match wc.ordnance.kind {
+        crate::weapon::OrdKind::Missile => (wc.initial_salvo_delay, wc.ordnance.velocity),
+        _ => (1.0 / crate::TICK_HZ as f32, wc.ordnance.velocity),
+    }
+}
+
 /// Card FFLN: is a unit of `u`'s own team in its line of fire — the unit's
 /// own aim from `eye`, out to `range` (its target) and [`LINE_PAST`] beyond,
 /// where a miss flies on? A friend is in the line when its capsule's axis is
@@ -371,8 +390,8 @@ pub(super) fn run(
 /// and the weapon's own spread). A friend beside or behind the muzzle counts
 /// when it is that close to the muzzle itself. The answer is the side to step
 /// to, away from the nearest such friend (+1 = the unit's right). OURS: the PS2's bots shoot through their friends
-/// (`analysis/re-blaster-damage.md` section 6.3). No allocation; riders are
-/// behind their vehicle's hull and are not counted.
+/// (`analysis/re-blaster-damage.md` section 6.3). Riders are behind their
+/// vehicle's hull and are not counted.
 ///
 /// Card HVYW (OURS): `late` is a MISSILE's wind-up (s) and speed (m/s). The
 /// rocket leaves the tube a quarter of a second after the trigger and takes
@@ -380,6 +399,10 @@ pub(super) fn run(
 /// meets outright where a rifle's bolt wounds him: its line is cleared by
 /// what the shooter walks in the wind-up and what the friend walks until
 /// the rocket is where he is, on top of [`LINE_CLEAR`].
+/// Card TEAM: the fastest a soldier walks or a shooter is carried, for the
+/// grid's bound on [`friend_in_line`] (m/s; a sprint is under 10).
+const LINE_WALK_BOUND: f32 = 20.0;
+
 fn friend_in_line(
     sim: &Sim,
     me: UnitHandle,
@@ -393,7 +416,22 @@ fn friend_in_line(
     let reach = range + LINE_PAST;
     let own = u.soldier.vel.length();
     let mut best: Option<(f32, i8)> = None;
-    for (h, o) in sim.alive_units() {
+    // Card TEAM: a friend in the line stands within the line's reach and
+    // its widest clearance of the eye, plus what a unit at
+    // [`LINE_WALK_BOUND`] walks before the shot is there; a missile's
+    // walked term is longer, so it asks every unit.
+    let wide = reach + LINE_CLEAR + spread.max(0.0) * reach + 1.0;
+    let bound = match late {
+        None => wide,
+        Some((wind, speed)) if wind < 0.1 && speed > 20.0 => {
+            wide + 2.0 * LINE_WALK_BOUND * (wind + reach / speed)
+        }
+        Some(_) => f32::INFINITY,
+    };
+    let mut near: Vec<u32> = Vec::new();
+    sim.units_within(eye, bound, &mut near);
+    for &i in &near {
+        let (h, o) = (sim.handle(i as usize), &sim.units[i as usize]);
         if h == me || o.team != u.team || o.mount.is_some() {
             continue;
         }
@@ -425,6 +463,102 @@ fn friend_in_line(
     best.map(|(_, side)| side)
 }
 
+/// Card RKEX (OURS, FFLN's rule carried to the blast): a weapon whose
+/// ordnance detonates an impact explosion (the rocket launchers) holds its
+/// shot while a unit of `u`'s team on foot stands within the explosion's
+/// `DamageRadiusOuter` + [`BLAST_CLEAR`] of the target `at` - the blast that
+/// kills the target kills him too. The PS2's bots fire regardless
+/// (re-soldier-ai 6: no awareness of an AI friend); the side is the one
+/// away from the nearest such friend, as [`friend_in_line`]'s.
+fn friend_in_blast(
+    sim: &Sim,
+    me: UnitHandle,
+    u: &Unit,
+    at: Vec3,
+    wc: &crate::weapon::WeaponClass,
+) -> Option<i8> {
+    let r = wc.ordnance.explosion.as_ref()?.damage_outer;
+    if r <= 0.0 {
+        return None;
+    }
+    let (_, right, _) = u.aim_frame();
+    let mut near: Vec<u32> = Vec::new();
+    sim.units_within(at, r + BLAST_CLEAR, &mut near);
+    let mut best: Option<(f32, i8)> = None;
+    for &i in &near {
+        let (h, o) = (sim.handle(i as usize), &sim.units[i as usize]);
+        if h == me || o.team != u.team || o.mount.is_some() || !o.alive {
+            continue;
+        }
+        let off = o.capsule().center() - at;
+        let d = off.length();
+        if d < r + BLAST_CLEAR && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, if off.dot(right) > 0.0 { -1 } else { 1 }));
+        }
+    }
+    best.map(|(_, side)| side)
+}
+
+/// Card RKSLF (OURS): does the exploding shot bot `i`'s weapon holds land
+/// its blast on its own side? Asked where the shot leaves, not at the
+/// press: the launcher's cycle releases a salvo after the trigger
+/// (InitialSalvoDelay, a second salvo; `weapon::fire_cycle`), by when the
+/// muzzle may face the cover beside it. The bolt's own spawn ray along the
+/// aim (spread left out); true when the blast point,
+/// [`crate::weapon::EXPLOSION_OFFSET`] short of the hit, is within
+/// `DamageRadiusOuter` + [`BLAST_CLEAR`] of the bot or a team-mate on foot. The PS2's cycle cancels a salvo only when the weapon
+/// is put away (weapon+0xc4), and its bots fire regardless (re-soldier-ai 6).
+pub(crate) fn release_blasts_own_side(sim: &Sim, i: usize) -> bool {
+    let u = &sim.units[i];
+    let wc = &sim.weapon_classes[u.weapon_class];
+    let Some(r) = wc.ordnance.explosion.as_ref().map(|e| e.damage_outer) else {
+        return false;
+    };
+    let speed = wc.ordnance.velocity;
+    if r <= 0.0 || speed <= 0.0 {
+        return false;
+    }
+    let me = sim.handle(i);
+    let (fwd, _, _) = u.aim_frame();
+    let who = crate::projectile::Shooter {
+        owner: me,
+        team: u.team,
+        weapon_class: u.weapon_class,
+        is_player: u.is_player,
+    };
+    let b = crate::projectile::Bolt::spawn(
+        u.muzzle(),
+        fwd,
+        speed,
+        wc.ordnance.life_span,
+        who,
+        sim.heightfield.as_ref(),
+        &sim.collision,
+        crate::collision::HullFilter::All,
+        sim.alive_units()
+            .filter(|(h, _)| *h != me)
+            .map(|(h, o)| (h, o.capsule())),
+    );
+    if matches!(b.hit, crate::projectile::Hit::None) {
+        return false;
+    }
+    let at = b.end - fwd * crate::weapon::EXPLOSION_OFFSET;
+    let mut near: Vec<u32> = Vec::new();
+    sim.units_within(at, r + BLAST_CLEAR, &mut near);
+    near.iter().any(|&j| {
+        let o = &sim.units[j as usize];
+        o.alive
+            && o.team == u.team
+            && (j as usize == i || o.mount.is_none())
+            && (o.capsule().center() - at).length() < r + BLAST_CLEAR
+    })
+}
+
+/// [`friend_in_blast`]'s margin past the explosion's outer radius (m): a
+/// standing soldier's blast sphere reaches 0.73 m nearer than his centre
+/// (`sim::blast::soldier_blast_sphere`) and a step more. PROVISIONAL (ours).
+const BLAST_CLEAR: f32 = 1.0;
+
 /// The aim point at a SEEN enemy `e` from `eye`, for a bolt of `speed` out of
 /// a weapon of class `wc` (on foot and in a seat, VTAI). BF2: the lead point
 /// offset by the TARGET's own [`radius`] along the SHOOTER's direction
@@ -453,7 +587,7 @@ pub(super) fn seen_aim(
         return aim;
     };
     // The cap is the shooter's skill's, under the tier's override (Elite).
-    let cap = sim.difficulty.skill_at(u.skill).err_cap;
+    let cap = sim.difficulty_of(u.team).skill_at(u.skill).err_cap;
     let moving = e.soldier.vel.length() / e.consts.max_speed.max(0.1);
     if sim.ground_rules != crate::soldier::GroundRules::Bf2 {
         let vis = crate::perception::VIS;
@@ -1469,6 +1603,78 @@ mod tests {
         assert_eq!(ask(far, 6.0, 0.0, rocket), Some(-1));
         assert_eq!(ask(far, 6.0, 0.0, Some((0.25, 1e6))), None);
         assert_eq!(ask(far, 6.0, 0.0, None), None);
+    }
+
+    /// Card RKEX (OURS): a weapon whose ordnance explodes (Damage radius 4)
+    /// holds its shot while a friend on foot stands within 4 + 1 m of the
+    /// target - 3 m off it he is, 5.5 m off he is not, nor is an enemy
+    /// there; a rifle (no explosion) never asks.
+    #[test]
+    fn an_exploding_shot_waits_for_a_friend_beside_its_target() {
+        use crate::sim::Sim;
+        use crate::unit::UnitSpec;
+        use crate::weapon::ExplosionClass;
+        let target = Vec3::new(0.0, 1.0, -20.0);
+        let ask = |at: Vec3, team: u8, explodes: bool| {
+            let mut s = Sim::empty(5);
+            let shooter = s.spawn(&UnitSpec::trooper(0, Vec3::ZERO)).unwrap();
+            let f = s.spawn(&UnitSpec::trooper(team, at)).unwrap();
+            // No ground in `Sim::empty`: stand him at y 0.
+            s.units[f.index as usize].soldier.pos = at;
+            let mut wc = s.weapon_classes[0].clone();
+            if explodes {
+                wc.ordnance.explosion = Some(ExplosionClass {
+                    damage: 400.0,
+                    damage_inner: 2.0,
+                    damage_outer: 4.0,
+                    ..ExplosionClass::default()
+                });
+            }
+            let u = s.unit(shooter).unwrap();
+            friend_in_blast(&s, shooter, u, target, &wc)
+        };
+        let beside = Vec3::new(3.0, 0.0, -20.0);
+        assert_eq!(ask(beside, 0, true), Some(-1), "a friend beside it");
+        assert_eq!(
+            ask(Vec3::new(-3.0, 0.0, -20.0), 0, true),
+            Some(1),
+            "the other side"
+        );
+        assert_eq!(ask(Vec3::new(5.5, 0.0, -20.0), 0, true), None, "outside");
+        assert_eq!(ask(beside, 1, true), None, "an enemy");
+        assert_eq!(ask(beside, 0, false), None, "a rifle");
+    }
+
+    /// Card TEAM (OURS): any shot's line is cleared by one tick of walking
+    /// (the sim fires after it moves the units) and by its flight. A friend
+    /// 1.5 m ahead and 0.9 m off the line is in no standing rifleman's line
+    /// (0.75 m); walking at 6 m/s he is (0.75 + 6 x (1/30 + 1.5/v)), and so
+    /// he is to a shooter walking at 6 m/s (0.75 + 6/30); 1.2 m off he is in
+    /// neither.
+    #[test]
+    fn a_shots_line_is_cleared_by_a_ticks_walk_and_its_flight() {
+        use crate::sim::Sim;
+        use crate::unit::UnitSpec;
+        let ask = |at: Vec3, friend_v: f32, own_v: f32| {
+            let mut s = Sim::empty(5);
+            let shooter = s.spawn(&UnitSpec::trooper(0, Vec3::ZERO)).unwrap();
+            let friend = s.spawn(&UnitSpec::trooper(0, at)).unwrap();
+            s.units[friend.index as usize].soldier.vel = Vec3::X * friend_v;
+            s.units[shooter.index as usize].soldier.vel = Vec3::X * own_v;
+            let u = s.unit(shooter).unwrap();
+            let wc = &s.weapon_classes[u.weapon_class];
+            assert_ne!(wc.ordnance.kind, crate::weapon::OrdKind::Missile);
+            assert!(wc.ordnance.velocity > 20.0, "a bolt");
+            let late = shot_late(wc);
+            assert_eq!(late.0, 1.0 / crate::TICK_HZ as f32);
+            friend_in_line(&s, shooter, u, u.muzzle(), 40.0, 0.0, Some(late))
+        };
+        let near = Vec3::new(0.9, 0.0, -1.5);
+        assert_eq!(ask(near, 0.0, 0.0), None, "a standing friend");
+        assert_eq!(ask(near, 6.0, 0.0), Some(-1), "he walks");
+        assert_eq!(ask(near, 0.0, 6.0), Some(-1), "the shooter walks");
+        assert_eq!(ask(Vec3::new(1.2, 0.0, -1.5), 6.0, 0.0), None);
+        assert_eq!(ask(Vec3::new(1.2, 0.0, -1.5), 0.0, 6.0), None);
     }
 
     /// The whole trigger, both games: a standing bot's shots at a standing

@@ -45,7 +45,18 @@ fn render_headless_hud(
         };
         ui::hud::draw_hud(ctx, &hud);
         if let Some(s) = spawn {
-            ui::spawn::draw_spawn(ctx, s);
+            // The PS2's screen is the HUD pass's; without one the panel
+            // stands in.
+            match hud_view.is_some() {
+                true => ui::spawn::draw_spawn(ctx, s),
+                false => ui::spawn::draw_spawn(
+                    ctx,
+                    &ui::spawn::SpawnModel {
+                        page: None,
+                        ..s.clone()
+                    },
+                ),
+            }
         }
     });
     r.render_frame(
@@ -236,6 +247,7 @@ pub(super) fn run_bench(v: &ViewerArgs) -> Result<()> {
     // without them is not a frame the game ever renders — and the skinned path
     // (a 96-joint palette per draw) is the part most likely to cost.
     let mut frame = game::bench::Samples::default();
+    let mut gpu_sections = game::bench::Sections::default();
     let mut battle_draws = 0usize;
     let mut skinned_draws = 0usize;
     if v.bench_frames > 0 {
@@ -275,6 +287,8 @@ pub(super) fn run_bench(v: &ViewerArgs) -> Result<()> {
             // into the frame time measures the harness instead of the render.
             r.wait_idle().map_err(|e| anyhow!("wait: {e}"))?;
             frame.push(t.elapsed());
+            // `OPENBF_GPU_TIMING=1`: the newest frame the timer has read back.
+            gpu_sections.add(r.gpu_sections());
         }
     }
 
@@ -299,6 +313,7 @@ pub(super) fn run_bench(v: &ViewerArgs) -> Result<()> {
         stats,
         tick,
         frame,
+        gpu: gpu_sections,
     };
     report.print();
     if let Some(p) = &v.bench_csv {
@@ -527,7 +542,7 @@ pub(super) fn run_headless(v: &ViewerArgs) -> Result<()> {
                     match &mut overlay {
                         Some(o) => {
                             let model = hud_model(&walk, &mut feed);
-                            let spawn = spawn_model(&walk, 0);
+                            let spawn = spawn_model(&walk, &feed);
                             let dt = hud_tick.map_or(0.0, |t| {
                                 walk.sim.tick.saturating_sub(t) as f32 * core::TICK_DT
                             });
@@ -626,7 +641,7 @@ pub(super) fn run_headless(v: &ViewerArgs) -> Result<()> {
         match &mut overlay {
             Some(o) => {
                 let model = hud_model(&walk, &mut feed);
-                let spawn = spawn_model(&walk, 0);
+                let spawn = spawn_model(&walk, &feed);
                 let dt = hud_tick.map_or(0.0, |t| {
                     walk.sim.tick.saturating_sub(t) as f32 * core::TICK_DT
                 });

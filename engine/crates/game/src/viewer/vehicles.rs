@@ -259,6 +259,12 @@ impl VehicleVisuals {
         out
     }
 
+    /// Upload what `sim`'s battle can show later (card HITCH): the item
+    /// models ([`super::pickups::PickupVisuals::preload`]).
+    pub fn preload(&mut self, r: &mut Renderer, sim: &core::sim::Sim) {
+        self.items.preload(r, sim);
+    }
+
     /// The draws of every live vehicle of `sim`, at its sim transform; a
     /// skinned walker's meshes are posed first (card WSKN).
     pub fn draws(&mut self, r: &mut Renderer, sim: &core::sim::Sim) -> Vec<DrawCmd> {

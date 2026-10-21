@@ -31,12 +31,15 @@ impl Renderer {
         let unpadded = 4 * w;
         let padded = padded_bytes_per_row(w);
 
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("capture readback"),
-            size: u64::from(padded) * u64::from(h),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let buffer = crate::made::buffer(
+            &self.device,
+            &wgpu::BufferDescriptor {
+                label: Some("capture readback"),
+                size: u64::from(padded) * u64::from(h),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            },
+        );
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {

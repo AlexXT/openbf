@@ -444,6 +444,7 @@ mod tests {
             spec_color: 0,
             textures: vec![(0, tex.to_owned())],
             bone: None,
+            group: None,
             bmap: Vec::new(),
             bind: Vec::new(),
             wght: Vec::new(),

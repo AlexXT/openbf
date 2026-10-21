@@ -50,8 +50,20 @@
 //! The PS2's own per-level bases, for scale (RE §2.1): BF2 non-human teams
 //! 4 / 14 / 17 at Easy / Medium / Hard, human-team teammates 6 / 11 / 11.
 
-/// The four host difficulty tiers (PLAN §Saves: host authority).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+/// The four host difficulty tiers (PLAN §Saves: host authority), ordered
+/// easiest first (the arena's head-to-head takes the lower of two).
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Difficulty {
     Easy,
@@ -125,6 +137,9 @@ impl Difficulty {
                 react: [0.20, 0.05, 0.10],
                 grenade: 0.30,
                 grenade_delay: (33, 63),
+                tell: false,
+                cover: false,
+                flank: false,
             },
             Difficulty::Normal => Tier {
                 view_mult: 1.0,
@@ -136,6 +151,9 @@ impl Difficulty {
                 react: [0.30, 0.15, 0.20],
                 grenade: 0.60,
                 grenade_delay: (18, 39),
+                tell: true,
+                cover: false,
+                flank: true,
             },
             Difficulty::Hard => Tier {
                 view_mult: 1.25,
@@ -147,6 +165,9 @@ impl Difficulty {
                 react: [0.30, 0.20, 0.30],
                 grenade: 0.85,
                 grenade_delay: (0, 24),
+                tell: true,
+                cover: true,
+                flank: true,
             },
             Difficulty::Elite => Tier {
                 view_mult: 1.5,
@@ -160,6 +181,9 @@ impl Difficulty {
                 react: [0.30, 0.25, 0.35],
                 grenade: 0.95,
                 grenade_delay: (0, 24),
+                tell: true,
+                cover: true,
+                flank: true,
             },
         }
     }
@@ -224,6 +248,24 @@ pub struct Tier {
     /// difficulty 14, U(0.6, 1.3) s under 17, else U(0, 0.8) s); which tier
     /// takes which range is ours.
     pub grenade_delay: (u64, u64),
+    /// Card TEAM (`analysis/bot-design.md` 4.1, section 7): an enemy a
+    /// friend within `perception::TELL_RADIUS` sees is passed on as heard -
+    /// aimed at, never fired at unseen. OURS: the PS2 has no team sense.
+    /// The design's column: Easy no, the rest yes. A told record keeps no
+    /// bot on a position (`ai::behave`): before that rule a told enemy held
+    /// a bot standing at its fight spot while its friends saw him - BF2
+    /// Coruscant's foot time in 20 s spells within 2 m 11.7 -> 21.1 % (8
+    /// seeds), with it 9.4 %.
+    pub tell: bool,
+    /// Card TEAM (`analysis/bot-design.md` 4.3, section 7): while a friend
+    /// captures a post, up to two others inside its region take guard
+    /// positions facing the approach (the board's Cover role,
+    /// `ai::team::board`). OURS. The design's column: Hard and Elite.
+    pub cover: bool,
+    /// Card FLNK (`analysis/bot-design.md` 6.2, section 7): a share of a
+    /// post's attackers walks the pair's flank route (the board's Flank
+    /// role, `ai::team::board`). OURS. The design's column: all but Easy.
+    pub flank: bool,
 }
 
 /// Everything the AI reads off its integer skill, computed once per think.

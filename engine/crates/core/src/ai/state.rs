@@ -73,6 +73,8 @@ pub enum RouteSource {
     Bfs,
     /// Neither could answer: walk straight at the goal.
     Straight,
+    /// Card FLNK: the next hub of the bot's flank route (`crate::nav::flank`).
+    Flank,
 }
 
 impl RouteSource {
@@ -81,6 +83,7 @@ impl RouteSource {
             RouteSource::Table => "table",
             RouteSource::Bfs => "bfs",
             RouteSource::Straight => "straight",
+            RouteSource::Flank => "flank",
         }
     }
 }
@@ -178,6 +181,8 @@ pub struct NavTick {
     pub bfs: u32,
     /// Hops neither the table nor BFS could answer.
     pub straight: u32,
+    /// Card FLNK: hops taken from a flank route (on it or joining it).
+    pub flank: u32,
     /// This unit's current run of ticks without progress.
     pub stuck_run: u16,
     /// Legs planned this tick whose straight line crossed a barrier and got a
@@ -204,6 +209,9 @@ pub struct NavTick {
     pub contacts: u8,
     /// Records this think made by HEARING rather than sight.
     pub heard: u8,
+    /// Card TEAM: records this think made or refreshed from what a friend
+    /// near by sees (`perception::tell`).
+    pub told: u8,
     /// 1 when this think ENDED a squad order (brief D6/D9): the leader is
     /// gone, or the follower has been beyond [`crate::squad::LEAVE_DIST`]
     /// of its leader — or the holder of its anchor — for
@@ -431,6 +439,80 @@ pub struct AiState {
     /// only when it differs from the default (a bot that never held a
     /// scoped rifle), after `arm`.
     pub snipe: SnipeBook,
+    /// Card TEAM: the role the team board gave the bot ([`RoleState`],
+    /// `super::team::board`) — hashed only when it differs from the
+    /// default, after `snipe`.
+    pub role: RoleState,
+    /// Card FLNK: where the bot's attack began and the flank route it walks
+    /// ([`FlankState`], `super::team::board`) — hashed only when it differs
+    /// from the default, after `role`.
+    pub flank: FlankState,
+}
+
+/// Card FLNK (`analysis/bot-design.md` 6.2; OURS): the hub a bot's route to
+/// the post it attacks was planned from, that post's hub, and the flank
+/// route the team board gave it (`crate::nav::flank`; `plan_leg` walks its
+/// hubs, then the authored route).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlankState {
+    /// The hub the attack's route was planned from and the attacked post's
+    /// hub; [`FlankState::NONE`] = none.
+    pub from: u16,
+    pub to: u16,
+    /// The flank route walked (an index into `Sim::flank`), and the tick it
+    /// was given.
+    pub route: Option<u16>,
+    pub since: u64,
+}
+
+impl FlankState {
+    pub const NONE: u16 = u16::MAX;
+
+    fn hash_into(&self, eat: &mut impl FnMut(&[u8])) {
+        eat(&[12]);
+        eat(&self.from.to_le_bytes());
+        eat(&self.to.to_le_bytes());
+        eat(&self.route.map_or(u16::MAX, |k| k).to_le_bytes());
+        eat(&self.since.to_le_bytes());
+    }
+}
+
+impl Default for FlankState {
+    fn default() -> Self {
+        FlankState {
+            from: FlankState::NONE,
+            to: FlankState::NONE,
+            route: None,
+            since: 0,
+        }
+    }
+}
+
+/// Card TEAM (`analysis/bot-design.md` 4.3; OURS): a role inside a post's
+/// group, given and ended by the team board (`super::team::board`). Today
+/// the one role is COVER: while a friend captures `post`, guard position
+/// `at` (an index into the position table), facing `look`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RoleState {
+    /// The post covered; `None` = no role (Assault, the default).
+    pub post: Option<u8>,
+    /// The tick the role was given.
+    pub since: u64,
+    /// The guard position.
+    pub at: u32,
+    /// The point it faces: the approach to the post.
+    pub look: Vec3,
+}
+
+impl RoleState {
+    fn hash_into(&self, eat: &mut impl FnMut(&[u8])) {
+        eat(&[11, self.post.map_or(0, |p| p.wrapping_add(1))]);
+        eat(&self.since.to_le_bytes());
+        eat(&self.at.to_le_bytes());
+        for v in [self.look.x, self.look.y, self.look.z] {
+            eat(&v.to_bits().to_le_bytes());
+        }
+    }
 }
 
 /// Card SNPR (OURS): a sniper's spot with a long lane onto enemy ground,
@@ -993,7 +1075,8 @@ pub struct TposState {
     pub held: Option<u32>,
     /// The tick it was granted (the write-back's tie rule, `tactic::grant`).
     pub at: u64,
-    /// The reservation lasts to this tick: renewed every think it is held,
+    /// The reservation lasts to this tick: renewed every tick it is held
+    /// (`tactic::keep`, card TPOSR),
     /// so a position is free [`crate::ai::tactic::FREE_AFTER`] after it is
     /// left (the PS2's hint rule).
     pub until: u64,
@@ -1282,6 +1365,8 @@ impl Default for AiState {
             charge_until: 0,
             arm: ArmState::default(),
             snipe: SnipeBook::default(),
+            role: RoleState::default(),
+            flank: FlankState::default(),
         }
     }
 }
@@ -1403,6 +1488,12 @@ impl AiState {
         if self.snipe != SnipeBook::default() {
             self.snipe.hash_into(eat);
         }
+        if self.role != RoleState::default() {
+            self.role.hash_into(eat);
+        }
+        if self.flank != FlankState::default() {
+            self.flank.hash_into(eat);
+        }
     }
 }
 
@@ -1501,6 +1592,13 @@ mod tests {
             |st: &mut AiState| st.strafe_side = -1,
             |st: &mut AiState| st.fight.mode = FightState::STAND,
             |st: &mut AiState| st.fight.pause_until = 1,
+            // ... and card TEAM's role.
+            |st: &mut AiState| st.role.post = Some(0),
+            |st: &mut AiState| st.role.since = 1,
+            |st: &mut AiState| st.role.at = 1,
+            |st: &mut AiState| st.role.look.x = 1.0,
+            |st: &mut AiState| st.role.look.y = 1.0,
+            |st: &mut AiState| st.role.look.z = 1.0,
         ] {
             let mut b = AiState::default();
             let before = hash(&b);

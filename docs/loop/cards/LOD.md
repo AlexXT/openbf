@@ -4,14 +4,14 @@ title: The `modl` LOD switch rule: the port draws LOD0 forever (and discards the
 milestone: M1
 value: 5
 phase: build
-status: todo
+status: done
 deps:
 files: engine/crates/game/src/assets.rs, engine/crates/game/src/viewer/scene.rs, engine/crates/game/src/viewer/vehicles.rs, engine/crates/render/src/draw.rs, engine/crates/render/src/mesh.rs, engine/crates/render/src/shader.wgsl, engine/crates/bake/src/far_lowd.rs
-declares: goldens=<predict from data: map/pose goldens with a LOWD-bearing instance past NearSceneRange[1] in view, on maps with FarSceneRange > 0>
+declares: goldens=maps/bf1_bes1.png,maps/bf1_bes2.png,maps/bf1_geo1.png,maps/bf1_hot1.png,maps/bf1_kam1.png,maps/bf1_kas1.png,maps/bf1_kas2.png,maps/bf1_nab1.png,maps/bf1_nab2.png,maps/bf1_yav2.png,maps/bf2_cor1.png,maps/bf2_geo1.png,maps/bf2_hot1.png,maps/bf2_kam1.png,maps/bf2_kas2.png,maps/bf2_mus1.png,maps/bf2_myg1.png,maps/bf2_pol1.png,maps/bf2_tan1.png,maps/bf2_uta1.png,maps/tat1.png,maps/tat2.png,tat1_spawn.png,tat1_overview.png,tat1_hud.png,walkabout_stats.ron
 needs:
 effort:
-branch:
-resume: BUILD (re done 2026-10-16, analysis/re-lod.md section 7): per LOWD-bearing instance on a FarSceneRange>0 map draw the model with fragments cut past a per-pixel threshold t in [NearSceneRange b, c] (dithered = the b..c crossfade) and the LOWD (ManifestGeometry.lods 'LOWD', GLB already baked) with fragments cut nearer than t and past FarSceneRange - the shader already has per-instance cull / cull_near; vehicles' LOWD the same. Decide whether UTAS's bake::far_lowd extension is subsumed (the LOWD past c covers the UTA1 ring). Bar: lead_tmp/re/lod/tools/accept.py PASS at NAB1 station A + a mutation-checked unit test + UTA1 b000 pair + declared goldens.
+branch: lod
+resume: LANDED dde30a1 (2026-10-20). Follow-ups: LODV (vehicles), the dither stipple in the band (Calls to reverse)
 created: 2026-09-25
 alpha: yes
 first: 1

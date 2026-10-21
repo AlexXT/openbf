@@ -1,5 +1,6 @@
 //! What a bolt does when it lands (`resolve_bolt`, step 5: damage through the
-//! id guard, D12's human damage layer, the kill and its ticket) and the one
+//! id guard, D12's human damage layer, the kill and its ticket, then its
+//! ordnance's impact explosion - card RKEX, the rocket launchers) and the one
 //! environmental death path, [`Sim::kill_environment`] (a mission death
 //! region, step 3c, or a lethal landing, step 3). The bolt, cheat, damage and
 //! environmental-death tests live here; the bolts themselves are fired inline
@@ -50,7 +51,7 @@ impl Sim {
                     && !b.shooter_is_player
                     && !friendly
                 {
-                    self.difficulty.tier().human_damage
+                    self.difficulty_of(b.team).tier().human_damage
                 } else {
                     1.0
                 } * self.buff_scale(Some(b.owner), h);
@@ -88,6 +89,7 @@ impl Sim {
                 if killed {
                     self.unit_killed(h, Some(b.owner));
                 }
+                self.bolt_explodes(b);
             }
             // The hull pool (re-vehicles §6): the ordnance's damage at this
             // age, scaled by the hull's HealthType (`VehicleScale`). The id
@@ -109,6 +111,7 @@ impl Sim {
                 });
                 self.push_impact(b, Surface::Vehicle, Some(vh));
                 self.damage_vehicle(vh, &desc, 1.0, Some((b.owner, b.team)));
+                self.bolt_explodes(b);
             }
             // A model wall ends the flight exactly as the terrain sheet does:
             // the same event, so the same puff and the same impact sound.
@@ -123,12 +126,37 @@ impl Sim {
                     Surface::Building
                 };
                 self.push_impact(b, surface, None);
+                self.bolt_explodes(b);
             }
             Hit::None => self.events.push(Event::BoltExpired {
                 pos: b.end,
                 struck: false,
             }),
         }
+    }
+
+    /// A struck bolt's impact explosion (card RKEX): the ordnance base's
+    /// collision (B1 FUN_00272d70, B2 FUN_0030f550) detonates the class's
+    /// `Explosion` / `ExplosionImpact` / `ExplosionName` class (B1 class
+    /// +0x38, B2 +0x4c) 0.2 m off the hit with the shooter's {owner, team}
+    /// whenever the class names one - on every surface (re-blaster-damage
+    /// 7.3; the rocket launchers: MaxDamage 500 on the one it strikes, then
+    /// Damage 400 over DamageRadius 4). After the direct hit [D]: the bolt
+    /// handler (B1 FUN_00276810, B2 FUN_00313c40) builds its damage at
+    /// B1:197920 and calls the base last (B1:198103), so a victim the direct
+    /// hit killed is no longer gathered. A bolt whose target died in flight
+    /// dies with no impact and no blast, as before. The drawn explosion and
+    /// its sound ride [`Event::Impact`].
+    fn bolt_explodes(&mut self, b: &Bolt) {
+        let Some(e) = self.weapon_classes[b.weapon_class]
+            .ordnance
+            .explosion
+            .clone()
+        else {
+            return;
+        };
+        let at = b.end - b.vel.normalize_or_zero() * crate::weapon::EXPLOSION_OFFSET;
+        self.explode(&e, at, Some(b.owner), Some(b.team));
     }
 
     /// BF2's buffs on one damage (card PWUP, `re-powerups.md` §5.5): the
@@ -356,6 +384,98 @@ mod tests {
         }
         let n = s.nav_stats;
         assert_eq!((n.unit_kills, n.team_kills, n.self_kills), (1, 1, 0));
+    }
+
+    /// Card RKEX: a struck bolt whose ordnance names an impact explosion
+    /// (the rocket launchers' `ExplosionName`: Damage 400, DamageRadiusInner
+    /// 2, Outer 4, VehicleScale 0) detonates it 0.2 m back along the flight:
+    /// a soldier beside the impact takes the blast's falloff, one outside
+    /// the radius nothing, a wall hit as a ground hit, the struck soldier
+    /// the direct hit (then the blast round it); a bolt with no explosion
+    /// (the rifle's) hurts nobody beside its hit.
+    #[test]
+    fn a_rocket_explodes_where_it_lands() {
+        use super::super::blast::soldier_blast_sphere;
+        use crate::projectile::{Bolt, Hit, Target};
+        use crate::weapon::{blast_falloff, ExplosionClass, HealthType};
+        let rocket = |s: &mut Sim| {
+            let mut w = s.weapon_classes[0].clone();
+            w.ordnance.max_damage = 500.0;
+            let mut e = ExplosionClass {
+                damage: 400.0,
+                damage_inner: 2.0,
+                damage_outer: 4.0,
+                ..ExplosionClass::default()
+            };
+            e.scales[HealthType::Vehicle as usize] = 0.0;
+            w.ordnance.explosion = Some(e);
+            s.weapon_classes.push(w);
+            s.weapon_classes.len() - 1
+        };
+        let bolt = |owner: UnitHandle, wc: usize, hit: Hit, end: Vec3| Bolt {
+            pos: end,
+            vel: Vec3::new(0.0, -100.0, 0.0),
+            remaining: 0.0,
+            age: 0.0,
+            owner,
+            team: 0,
+            weapon_class: wc,
+            hit,
+            end,
+            shooter_is_player: false,
+        };
+        let world = || {
+            let mut s = Sim::empty(3);
+            s.heightfield = Some(flat_ground());
+            let shooter = s
+                .spawn(&UnitSpec::trooper(0, Vec3::new(-30.0, 0.0, 0.0)))
+                .unwrap();
+            let near = s
+                .spawn(&UnitSpec::trooper(1, Vec3::new(3.5, 0.0, 0.0)))
+                .unwrap();
+            let far = s
+                .spawn(&UnitSpec::trooper(1, Vec3::new(7.0, 0.0, 0.0)))
+                .unwrap();
+            (s, shooter, near, far)
+        };
+        let hp = |s: &Sim, h: UnitHandle| s.unit(h).map_or(0.0, |u| u.health.cur);
+        // At the ground between them: `near`'s sphere surface is inside the
+        // ramp, `far`'s outside the 4 m.
+        let (mut s, shooter, near, far) = world();
+        let wc = rocket(&mut s);
+        s.resolve_bolt(&bolt(shooter, wc, Hit::Terrain, Vec3::ZERO));
+        let at = Vec3::Y * 0.2;
+        let (lift, w) = soldier_blast_sphere(s.unit(near).unwrap().soldier.stance);
+        let d = (Vec3::new(3.5, lift, 0.0) - at).length();
+        let f = blast_falloff(d, w, 2.0, 4.0);
+        assert!(f > 0.0 && f < 1.0, "the near soldier is on the ramp: {f}");
+        assert!(
+            (300.0 - hp(&s, near) - 400.0 * f).abs() < 1e-3,
+            "{}",
+            hp(&s, near)
+        );
+        assert_eq!(hp(&s, far), 300.0, "outside the radius");
+        // The rifle's bolt (no explosion) at the same spot: nobody.
+        let (mut s, shooter, near, _) = world();
+        s.resolve_bolt(&bolt(shooter, 0, Hit::Terrain, Vec3::ZERO));
+        assert_eq!(hp(&s, near), 300.0, "a bolt with no explosion");
+        // A wall model is struck the same way.
+        let (mut s, shooter, near, _) = world();
+        let wc = rocket(&mut s);
+        s.resolve_bolt(&bolt(shooter, wc, Hit::World, Vec3::ZERO));
+        assert!(hp(&s, near) < 300.0, "a wall hit explodes too");
+        // A direct hit kills: 500 on a 300 trooper, the blast beside it.
+        let (mut s, shooter, near, far) = world();
+        let wc = rocket(&mut s);
+        let chest = Vec3::new(3.5, 1.2, 0.0);
+        s.resolve_bolt(&bolt(shooter, wc, Hit::Target(Target::Unit(near)), chest));
+        assert!(s.unit(near).is_none(), "the struck soldier dies");
+        let (lift, w) = soldier_blast_sphere(s.unit(far).unwrap().soldier.stance);
+        let d = (Vec3::new(7.0, lift, 0.0) - (chest + Vec3::Y * 0.2)).length();
+        let want = 400.0 * blast_falloff(d, w, 2.0, 4.0);
+        assert!(want > 0.0, "{d}");
+        assert!((300.0 - hp(&s, far) - want).abs() < 1e-3, "{}", hp(&s, far));
+        assert_eq!(s.nav_stats.unit_kills, 1);
     }
 
     /// The 3c pass runs units in index order over regions in the mission's

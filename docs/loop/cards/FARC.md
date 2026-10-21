@@ -9,10 +9,11 @@ deps:
 files:
 declares:
 needs:
+effort:
 branch:
 resume:
 created: 2026-09-25
-defer: post-alpha
+defer: 
 value_pre_alpha: 4
 ---
 
@@ -74,3 +75,6 @@ RHN1 (no fog, NearSceneRange 100..150, no LOWR sheet) draws its far terrain brig
 sky's grey: terrain port / PS2 (filter undone) is 1.20-1.41 on the 5 poses that look over far ground (walk/cp2_cp7_b180
 1.41, cp1_cp6_b180 1.20, cp4_cp5_b000 1.21, cp2_cp7_b000 / b090 1.17 / 1.21) against 1.03-1.08 on the other 20; the snow
 carries +6.4 of RHN1's +5.2 dluma. Pair `lead_tmp/brgt/sheet_rhn1.png`; numbers `lead_tmp/brgt/tools/chan.py bf1_rhn1 terrain --poses`.
+
+## Notes
+- planner 2026-10-19 16:25: `defer: post-alpha` removed - the maintainer's 10-19 ask 1 (speed on an Iris Xe laptop): far culling on by default is one of ISPD's biggest candidate savings, and this card is what lets it default on faithfully.

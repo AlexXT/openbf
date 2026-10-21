@@ -43,8 +43,12 @@
 //!   takes them round ([`Animator::step`]); the aim pose turns the torso back
 //!   by the twist.
 //!
-//! PROVISIONAL and ours, each its own card: the soldier's skeleton scale is
-//! taken as 1 (the port reads none); BF2's alert soldier takes the BF1 alert
+//! A class's `SkeletonRootScale` divides the velocity the chooser and the
+//! clip rate read ([`AnimInput::root_scale`], card USKN); BF2's raised 10/s
+//! limit under a scale below 1 and the scale's reset bracket (soldier
+//! +0xc14) are not built (re-soldier-skeleton-skins 7).
+//!
+//! PROVISIONAL and ours, each its own card: BF2's alert soldier takes the BF1 alert
 //! window (the soldier update's other branch, by a weapon's virtual at
 //! vtable+0x5c, is unread `[H]`); the BF1 grenade's three throw clips and the
 //! charge clip are not driven. The alert timer, its clip rows and the aim
@@ -139,10 +143,15 @@ pub fn body_vel(vel: glam::Vec3, yaw: f32) -> glam::Vec2 {
 }
 
 /// What picks a soldier class's sets (`game::roster::class_anim`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClassAnim {
     /// BF2's skeleton family.
     pub family: String,
+    /// `SkeletonRootScale` of a class with its own skeleton, else 1 (0 =
+    /// unset, taken as 1): the chooser and the clip rate read the velocity
+    /// over it ([`AnimInput::root_scale`]). The bone_root translation it
+    /// scales is in the baked clips (`bake::soldier::PoseRig`, card USKN).
+    pub root_scale: f32,
     /// (weapon class, lowercase; its animation bank) per weapon slot that
     /// names one.
     pub banks: Vec<(String, String)>,
@@ -170,6 +179,12 @@ pub struct AnimInput {
     pub yaw: f32,
     /// BF2: the class's MaxSpeed (m/s), which the speed mode is measured on.
     pub max_speed: f32,
+    /// The class's `SkeletonRootScale` ([`ClassAnim::root_scale`]; <= 0 is
+    /// taken as 1): the movement clip's choice and rate read `vel / scale`
+    /// (BF1 `FUN_0022e990` B1:144992-144995, BF2 `FUN_0027ed18`
+    /// B2:202177-202181; `analysis/re-soldier-skeleton-skins.md` 7 [O]), so
+    /// a 1.15 Wookiee walks at v / 1.15 on his longer legs.
+    pub root_scale: f32,
     pub dead: bool,
     /// The set of the weapon in hand ([`Rig::weapon_set`]).
     pub set: usize,
@@ -306,15 +321,22 @@ impl Default for Legs {
 /// BF2 `FUN_0024f350` (B2:168676-168810) and `FUN_0027ed18`
 /// (B2:202144-202356). Which of walk or run a stance HAS is left to
 /// [`Rig::body_slots`]'s fallback (the PS2's tests come to the same clip).
+///
+/// `scale` is the class's `SkeletonRootScale`: the animator's own tests (BF1
+/// all of them, BF2's idle test) read `v / scale`; BF2's speed mode is the
+/// soldier's (`FUN_0024f350`) and reads `v` against MaxSpeed.
 pub fn choose(
     game: Game,
     v: glam::Vec2,
+    scale: f32,
     strafe: bool,
     alert: bool,
     max_speed: f32,
     legs: &mut Legs,
 ) -> Option<(Move, f32)> {
     let wrap = |a: f32| (a + PI).rem_euclid(TAU) - PI;
+    let raw = v.length();
+    let v = v / scale;
     let (side, fwd, speed) = (v.x, v.y, v.length());
     let a = side.atan2(fwd);
     let prev = legs.mv;
@@ -393,7 +415,7 @@ pub fn choose(
             }
             // The speed mode: run above 0.78 MaxSpeed, 0.71 to stay.
             let k = if legs.bf2_run { BF2_RUN_STAY } else { BF2_RUN };
-            legs.bf2_run = speed > max_speed * k;
+            legs.bf2_run = raw > max_speed * k;
             let gait = |walk: Move, run: Move| if legs.bf2_run { run } else { walk };
             // The soldier's twist and forward bit (`FUN_0024f350`).
             let (lo, hi) = window(legs.bf2_forward);
@@ -1015,6 +1037,11 @@ impl Animator {
         let turned = self.yaw.map_or(0.0, |y| wrap(i.yaw - y));
         self.yaw = Some(i.yaw);
         let stance = stance_of(i, rig.game);
+        let scale = if i.root_scale > 0.0 {
+            i.root_scale
+        } else {
+            1.0
+        };
         // The action: a shot (re)starts shoot, a reload's first update
         // starts reload; it ends with its clip, or in a special state.
         let mut restart = false;
@@ -1077,7 +1104,15 @@ impl Animator {
             }
             Ok(s) => {
                 let strafe = rig.strafes(i.set, s, alert);
-                let mv = match choose(rig.game, i.vel, strafe, alert, i.max_speed, &mut self.legs) {
+                let mv = match choose(
+                    rig.game,
+                    i.vel,
+                    scale,
+                    strafe,
+                    alert,
+                    i.max_speed,
+                    &mut self.legs,
+                ) {
                     // BF1 sprints on the run clip.
                     Some((Move::WalkForward, leg)) if i.stance == Stance::Sprint => {
                         self.leg = leg;
@@ -1138,7 +1173,7 @@ impl Animator {
         let walk = match (mv, low) {
             (Some(m), Some(l)) if m.moving() => rig
                 .root_speed(l.clip, m)
-                .map_or(1.0, |v| move_rate(i.speed(), v)),
+                .map_or(1.0, |v| move_rate(i.speed() / scale, v)),
             _ => 1.0,
         };
         let rate = self.action.map_or(1.0, |a| a.rate);

@@ -711,6 +711,33 @@ impl Scene {
             .map(String::as_str)
     }
 
+    /// The `LOWD` model of `class`'s geometry — what the PS2's far scene
+    /// draws it as (card LOD, `analysis/re-lod.md` §4 [O]) — when its gmod
+    /// has one other than the model [`Scene::resolve_model`] draws, and its
+    /// mesh loaded.
+    pub fn resolve_lowd(&self, class: &str) -> Option<&str> {
+        let geom = self.resolve_class(class)?.geometry.as_deref()?;
+        let g = self
+            .manifest
+            .geometries
+            .iter()
+            .find(|g| g.name.eq_ignore_ascii_case(geom))?;
+        let (_, lowd) = g
+            .lods
+            .iter()
+            .find(|(tier, _)| tier.eq_ignore_ascii_case("LOWD"))?;
+        if lowd.eq_ignore_ascii_case(&g.model) {
+            return None;
+        }
+        if let Some((k, _)) = self.meshes.get_key_value(lowd.as_str()) {
+            return Some(k.as_str());
+        }
+        self.meshes
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(lowd))
+            .map(String::as_str)
+    }
+
     /// The far scene's LOWD extension of `class`'s geometry
     /// ([`manifest::ManifestGeometry::far`], card UTAS), when it has one and
     /// its mesh loaded — drawn only past `NearSceneRange[1]`.

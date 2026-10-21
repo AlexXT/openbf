@@ -85,6 +85,24 @@ impl PickupVisuals {
         Ok(parts)
     }
 
+    /// Upload every item class `sim` can drop (card HITCH): at the battle's
+    /// load, so the first powerup a death leaves reads no file in a frame.
+    pub fn preload(&mut self, r: &mut Renderer, sim: &core::sim::Sim) {
+        if self.dir.is_none() {
+            return;
+        }
+        for c in &sim.item_classes {
+            if c.geometry.is_empty() || self.models.contains_key(&c.geometry) {
+                continue;
+            }
+            let parts = self.upload(r, &c.geometry).unwrap_or_else(|e| {
+                eprintln!("pickups: {}: {e:#}", c.geometry);
+                Vec::new()
+            });
+            self.models.insert(c.geometry.clone(), parts);
+        }
+    }
+
     /// The draws of every item of `sim` that is drawn now.
     pub fn draws(&mut self, r: &mut Renderer, sim: &core::sim::Sim) -> Vec<DrawCmd> {
         let mut out = Vec::new();

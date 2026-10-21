@@ -316,14 +316,34 @@ fn not_found(key: &str) -> io::Error {
 
 // ---------- the std::fs look-alikes ----------
 
+/// Files read or opened through this crate since the process started, and
+/// the bytes [`read`] returned (card HITCH: the frame recorder counts the
+/// ones a battle frame makes - a read in a frame waits on the disk).
+static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READ_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// ([`read`] and [`open`] calls, bytes read) so far.
+pub fn reads() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (READS.load(Relaxed), READ_BYTES.load(Relaxed))
+}
+
+fn count(bytes: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    READS.fetch_add(1, Relaxed);
+    READ_BYTES.fetch_add(bytes as u64, Relaxed);
+}
+
 pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    match place(path.as_ref()) {
+    let out = match place(path.as_ref()) {
         Place::Disk(p) => std::fs::read(p),
         Place::Pak(k) => {
             let (off, len) = pak().get(&k).ok_or_else(|| not_found(&k))?;
             pak().read(off, len)
         }
-    }
+    };
+    count(out.as_ref().map_or(0, Vec::len));
+    out
 }
 
 pub fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
@@ -386,6 +406,7 @@ pub enum Reader {
 }
 
 pub fn open(path: impl AsRef<Path>) -> io::Result<Reader> {
+    count(0);
     match place(path.as_ref()) {
         Place::Disk(p) => Ok(Reader::Disk(File::open(p)?)),
         Place::Pak(k) => {

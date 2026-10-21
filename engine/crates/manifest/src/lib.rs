@@ -1741,6 +1741,21 @@ pub struct LoadScreen {
 // ordc / expc). `bake::classes` writes it, `game::classdb` reads it.
 // ---------------------------------------------------------------------------
 
+/// `side_<game>/soldiers/<model>.skins.ron` (card USKN,
+/// `analysis/re-soldier-skeleton-skins.md` 9): a soldier model's override
+/// groups and the override textures its classes name. A class's
+/// `OverrideTexture` replaces the textures listed under `override_texture`,
+/// its `OverrideTexture2` those under `override_texture2`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SoldierSkins {
+    /// Group (the segment's `MNAM`) -> the textures of the model's
+    /// segments in it, lowercase.
+    pub groups: std::collections::BTreeMap<String, Vec<String>>,
+    /// Every override texture a class on this model names, lowercase,
+    /// baked beside the model's own under `textures/`.
+    pub overrides: Vec<String>,
+}
+
 /// One munged gameplay class: its name, the chunk it came from, its BASE and
 /// its PROP list as stored. Keys stay FNV-1a hashes and values raw strings;
 /// the lookups live with their callers (`bake::classes::ClassProps`,
@@ -1768,7 +1783,7 @@ pub struct ClassDef {
 // `side_<game>/effects/<side>/`; the runtime (card FXP2) looks an effect up by
 // hash map layer first, then the sides, then common. Every field is the
 // parser's (`mungefs::particle`, which documents each); the values are the
-// PS2's own, bit for bit (its RAM, `mungefs/tests/fx_lvl.rs`).
+// PS2's own, bit for bit (its RAM, `mungefs/tests/suite/fx_lvl.rs`).
 // ---------------------------------------------------------------------------
 
 /// One layer's effects.

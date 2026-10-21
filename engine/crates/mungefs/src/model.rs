@@ -13,7 +13,8 @@
 //! STRP (u16 strip indices; a new strip is marked by bit 0x8000 set on its
 //! FIRST TWO indices), POSI (3×u16, dequantized into vertexBox), NORM
 //! (3×i8 ÷127), TEX0 (2×i16 ÷2048), COL0 (u32 RGBA, optional),
-//! BNAM (hard-skin bone, optional).
+//! BNAM (hard-skin bone, optional), MNAM (the segment's model group,
+//! optional: `override_texture` / `override_texture2`, card USKN).
 //!
 //! Skinned models (analysis/re-softskin.md, lead-verified): modl INFO word 0
 //! = 1 means POSI/NORM are stored in the PRIMARY BONE'S BIND SPACE, not model
@@ -113,6 +114,11 @@ pub struct Segment {
     pub textures: Vec<(u32, String)>,
     /// Hard-skin bone name (BNAM), if present.
     pub bone: Option<String>,
+    /// The segment's model group (MNAM), if present: a soldier class's
+    /// `OverrideTexture` replaces the texture of the `override_texture`
+    /// group, `OverrideTexture2` of `override_texture2` (BF1 `FUN_002013a0`,
+    /// BF2 `FUN_00239bb0`; re-soldier-skeleton-skins 9, card USKN).
+    pub group: Option<String>,
     /// Softskin: skeleton bone index per VU matrix slot (BMAP).
     pub bmap: Vec<u8>,
     /// Softskin: per-vertex matrix addresses (BIND, slot × 4 each).
@@ -263,6 +269,17 @@ fn parse_segment(segm: &Chunk<'_>, vbox: &Aabb) -> Result<Segment, UcfbError> {
             }
         }
     }
+    let group = segm.child(b"MNAM").and_then(|c| {
+        let end = c
+            .payload
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(c.payload.len());
+        std::str::from_utf8(&c.payload[..end])
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    });
     let bone = segm.child(b"BNAM").and_then(|c| {
         // BNAM = u32 + name in some variants; sniff a leading printable byte.
         let p = c.payload;
@@ -373,6 +390,7 @@ fn parse_segment(segm: &Chunk<'_>, vbox: &Aabb) -> Result<Segment, UcfbError> {
         index_count,
         textures,
         bone,
+        group,
         bmap,
         bind,
         wght,

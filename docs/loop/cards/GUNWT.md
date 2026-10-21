@@ -3,15 +3,15 @@ id: GUNWT
 title: BF1's AI driver waits in its seat for a gunner and the AI that answer board (UTALK's behaviour half): on the PS2 an AI in a vehicle seat with a free gun runs UnitWaitSecondaryAgent and calls 'need gunner' (chance 0.3) each time it enters the agent's state 2, and every friendly AI on foot within 30 m answers yes and gets a board goal for that vehicle (goal 5) - TAT1's yes answers are 12 of the voice slot's 32 lines a minute; the port's pilot drives off at once and its answerers carry on (UTALK census: yes 0.97 / min, need-gunner gate 1.00 against 4.25)
 milestone: M3
 value: 4
-phase: re
+phase: build
 status: todo
 deps: UTALK
-files: engine/crates/core/src/sim/seats.rs, engine/crates/core/src/ai/ride.rs
-declares:
+files: engine/crates/core/src/ai/ride.rs, engine/crates/core/src/sim/seats.rs, engine/crates/core/src/ai/hover_drive.rs, engine/crates/core/src/ai/walker_drive.rs, engine/crates/core/src/ai/behave.rs, engine/crates/core/src/sim/step.rs, engine/crates/core/src/ai.rs, engine/crates/core/src/ai/state.rs, engine/crates/core/src/squad.rs
+declares: sim; sweep
 needs:
 effort:
 branch:
-resume:
+resume: RE done (021be44, analysis/re-driver-wait.md 7). Build step A (both games): a new pilot of a hover/walker waits from its next think - stands; done when every seat is occupied; past 4.0 s from the seat taken (BF2 4.0 s from the start) only while a team-mate's board claim restamped in the last 3 s holds; BF1 MOVE OUT / AT EASE in reach sets the window to now - 2 s; replaces VTAI's GUNNER_WAIT. Step B (BF1): the need-gunner call (0.3) at the wait's start AND on every seated set-out (UTALK's SET_OUT for a seated bot), no seat test; the AI on foot within 30 m answer and claim a free seat (seats - live claims - human-held seats) at their next think, walk to it, give up when the vehicle moves faster than 2 m/s. Referees: UTALK's census kit (lead_tmp/utalk/census run.sh + tab.py; TAT1 yes 12.0 / gate 4.25, NAB1 2.0 / 2.75 within 30 %), a 2-seat hover scene (driver stands, a bot 20 m off boards, leaves when full; alone: leaves 4 s after the seat), the sweep's boarding counts sorted NOISE / EXPOSED / CAUSED
 created: 2026-10-16
 alpha: yes
 ---

@@ -370,3 +370,10 @@ fn an_item_is_hashed() {
     s.pickups[0].life -= 1.0;
     assert_ne!(s.hash(), b);
 }
+
+/// The constant empty table is the default one, and drops nothing.
+#[test]
+fn the_empty_table_is_the_default() {
+    assert_eq!(DropTable::NONE, DropTable::default());
+    assert_eq!(DropTable::NONE.pick(0.5), None);
+}

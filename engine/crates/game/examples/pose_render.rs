@@ -310,9 +310,11 @@ fn gunner(
         weapon_geometry: None,
         weapon_hud: Default::default(),
         held_hud: Vec::new(),
+        held_models: Vec::new(),
         foley_class: 0,
         cries: Default::default(),
         anim: Default::default(),
+        skins: Default::default(),
     }];
     let mut walk = game::walk::WalkSim::with_teams(sim, None, near, [team.clone(), team], None);
     walk.vehicle_seats = build.seats.clone();
@@ -466,9 +468,11 @@ fn ride_draws(
         weapon_geometry: None,
         weapon_hud: Default::default(),
         held_hud: Vec::new(),
+        held_models: Vec::new(),
         foley_class: 0,
         cries: Default::default(),
         anim: Default::default(),
+        skins: Default::default(),
     }];
     let mut walk = game::walk::WalkSim::with_teams(sim, None, pos, [team.clone(), team], None);
     walk.vehicle_seats = build.seats.clone();

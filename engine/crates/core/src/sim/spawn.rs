@@ -8,7 +8,8 @@
 //! nodes ([`Sim::spawn_posts`], `keep_or_draw_spawn_post`, card BSPN); the floor a spawn
 //! stands on ([`Sim::spawn_ground`] — a post's node inside a solid body on
 //! top of it, [`Sim::resolve_spawn_seats`], card LLEG); and the headless
-//! referees' [`Sim::vacate_player_slot`].
+//! referees' [`Sim::vacate_player_slot`]; the human's spawn screens (card
+//! SSELA: [`SpawnStage`], [`SideChoice`], [`Sim::open_spawn_screens`]).
 //! The spawn, class and spawn-screen tests live here.
 
 use super::input::{buttons, PadState};
@@ -17,6 +18,43 @@ use crate::aim_assist::AssistState;
 use crate::battle::SpawnOutcome;
 use crate::unit::{Controller, SpawnPost, UnitHandle, UnitSpec};
 use glam::{Vec2, Vec3};
+
+/// Which spawn screen a human slot has up (card SSELA; the PS2's spawn
+/// display state `SD+0x18`, re-spawn-flow §1: 0 side, 2 spawn map, 3 class,
+/// 5 accepted). A slot is on the field only in `Accepted`; a dead slot sits
+/// in `Accepted` until its respawn timer has run out, then the spawn map
+/// opens (never the side screen again, `B2:392616`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SpawnStage {
+    Side = 0,
+    Map = 2,
+    Class = 3,
+    #[default]
+    Accepted = 5,
+}
+
+/// The side screen's rows in the PS2's order (`ifs_sideselect`,
+/// re-spawn-flow §2; Spectate is hidden offline).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SideChoice {
+    #[default]
+    Team1 = 0,
+    Team2 = 1,
+    Auto = 2,
+}
+
+impl SideChoice {
+    /// One row down (`step` +1) or up (-1), wrapping over the three rows.
+    pub fn moved(self, step: i32) -> SideChoice {
+        match (self as i32 + step).rem_euclid(3) {
+            0 => SideChoice::Team1,
+            1 => SideChoice::Team2,
+            _ => SideChoice::Auto,
+        }
+    }
+}
 
 /// PROVISIONAL (ours): the weight EVERY class keeps once its share of the team
 /// is alive, as a fraction of an even share (`Sim::ai_class_weights`).
@@ -594,6 +632,99 @@ impl Sim {
         post
     }
 
+    /// The posts a HUMAN of `team` may take on the spawn map, with where each
+    /// is now (card SPSEL): [`Sim::spawn_posts`]' list, in its order, less a
+    /// post with no spawn node for the team — the PS2's `CanTeamSpawnAt` needs
+    /// a SpawnPath or class spawn points (re-command-walker-post §3 [O]), and
+    /// BF2 Hoth's spawn map skips the one team post without either
+    /// (`lead_tmp/spsel/fit_dir.py`). A walker's position is its live one.
+    pub fn player_spawn_posts(&self, team: u8) -> Vec<(SpawnPost, Vec3)> {
+        self.spawn_posts(team)
+            .into_iter()
+            .filter(|&(p, _)| !self.spawn_post_nodes(team, p).is_empty())
+            .filter_map(|(p, _)| Some((p, self.spawn_post_pos(p)?)))
+            .collect()
+    }
+
+    /// Where post `post` is: a command post's own position, a command
+    /// walker's live one (its slot's last while the slot is not yet re-used,
+    /// so a walker that just died still has a place to be nearest to).
+    pub fn spawn_post_pos(&self, post: SpawnPost) -> Option<Vec3> {
+        match post {
+            SpawnPost::Post(i) => self.cps.get(usize::from(i)).map(|c| c.def.pos),
+            SpawnPost::Walker(h) => self
+                .vehicles
+                .get(h.index as usize)
+                .filter(|v| v.gen == h.gen)
+                .map(|v| v.pos),
+        }
+    }
+
+    /// The spawn map's pick, both games (B2 `FUN_0039a058`, B1
+    /// `FUN_002e03b0`; re-command-walker-post §5 [O]): from post `from` at
+    /// `origin`, over every other post in `posts`, a candidate needs a
+    /// positive projection `along` on the push `dir` (a world xz direction,
+    /// normalised here); the lowest `along + 0.25 × perp²` wins. `None` when
+    /// no post is ahead: the caller keeps its selection.
+    pub fn pick_spawn_post(
+        posts: &[(SpawnPost, Vec3)],
+        from: Option<SpawnPost>,
+        origin: Vec3,
+        dir: Vec2,
+    ) -> Option<SpawnPost> {
+        let d = dir.normalize_or_zero();
+        if d == Vec2::ZERO {
+            return None;
+        }
+        let mut best = None;
+        let mut best_v = f32::INFINITY;
+        for &(p, pos) in posts {
+            if Some(p) == from {
+                continue;
+            }
+            let off = Vec2::new(pos.x - origin.x, pos.z - origin.z);
+            let along = off.dot(d);
+            if along <= 0.0 {
+                continue;
+            }
+            let v = along + 0.25 * (off - d * along).length_squared();
+            if v < best_v {
+                best_v = v;
+                best = Some(p);
+            }
+        }
+        best
+    }
+
+    /// A human's post for the next life (B2 `FUN_0036ca08`, B1
+    /// `FUN_002ac6f0`; re-command-walker-post §6 [O]): `chosen` while the team
+    /// may still spawn there, else the eligible post nearest to where
+    /// `chosen` is (a captured post's own place, a dead walker's last). With
+    /// no place for `chosen` at all, the list's first post — the PS2 takes its
+    /// own default pick there (`FUN_0035b6f8`, not traced: PROVISIONAL).
+    /// `None` when the team has no post.
+    pub fn keep_or_nearest_post(&self, team: u8, chosen: SpawnPost) -> Option<SpawnPost> {
+        let posts = self.player_spawn_posts(team);
+        if posts.iter().any(|q| q.0 == chosen) {
+            return Some(chosen);
+        }
+        let Some(at) = self.spawn_post_pos(chosen) else {
+            return posts.first().map(|q| q.0);
+        };
+        nearest_post(&posts, at)
+    }
+
+    /// Slot `slot`'s spawn-map selection as the next respawn would take it:
+    /// its pick through keep-or-nearest; `None` while it has never picked
+    /// (the respawn then draws from every post's nodes).
+    pub fn spawn_post_selected(&self, slot: usize) -> Option<SpawnPost> {
+        let chosen = self.spawn_post_choice.get(slot).copied().flatten()?;
+        let team = self.players.get(slot).copied().flatten().map_or(0, |h| {
+            self.units.get(h.index as usize).map_or(0, |u| u.team)
+        });
+        self.keep_or_nearest_post(team, chosen)
+    }
+
     /// Remove `n` alive AI of `team` from the field (no-overspawn shedding).
     pub(super) fn shed_ai(&mut self, team: u8, n: u32) {
         let mut left = n;
@@ -640,7 +771,10 @@ impl Sim {
         if !self.admit(spec.team, spec.is_player()) {
             return None;
         }
-        let slot = self.units.iter().position(|u| !u.alive);
+        // A dead unit a player slot still holds is that player's (its next
+        // life, or the spawn screens' held soldier, card SSELA): not free.
+        let held = |i: usize| self.players.iter().flatten().any(|p| p.index as usize == i);
+        let slot = (0..self.units.len()).find(|&i| !self.units[i].alive && !held(i));
         let gen = match slot {
             Some(i) => self.units[i].gen + 1,
             None => 1,
@@ -651,7 +785,7 @@ impl Sim {
         // team template's, a test's hand-built spec), and mirrored into the
         // spec so a respawn from it starts from the same place. Players and
         // dummies keep 0: `Unit.skill` is a BOT's number.
-        unit.skill = crate::skill_for(spec.controller, self.difficulty.base_skill());
+        unit.skill = crate::skill_for(spec.controller, self.difficulty_of(spec.team).base_skill());
         unit.spec.skill = unit.skill;
         // The probe starts from the AUTHORED node y: spawn nodes are authored
         // ON the platforms (BF1 KAM1 `CP4SpawnPath` nodes sit at y ~ 61.4-62.3
@@ -724,7 +858,8 @@ impl Sim {
     }
 
     /// Grow the per-slot tables (`players`, `assist`, `magnet`,
-    /// `reticle_pick`, `spawn_choice`, `prev_spawn_bits`) so `slot` is addressable. They are
+    /// `reticle_pick`, `spawn_choice`, `prev_spawn_bits`, `spawn_post_choice`)
+    /// so `slot` is addressable. They are
     /// kept the same length so a slot index is valid in all of them.
     fn reserve_slot(&mut self, slot: usize) {
         if self.players.len() <= slot {
@@ -733,7 +868,8 @@ impl Sim {
         self.sync_slot_tables();
     }
 
-    /// Re-align `assist`/`magnet`/`reticle_pick`/`spawn_choice`/`prev_spawn_bits` with
+    /// Re-align `assist`/`magnet`/`reticle_pick`/`spawn_choice`/`prev_spawn_bits`/
+    /// `spawn_post_choice` with
     /// `players` (callers may assign into `players` directly — it is a public
     /// field).
     pub fn sync_slot_tables(&mut self) {
@@ -753,6 +889,65 @@ impl Sim {
         if self.prev_spawn_bits.len() != n {
             self.prev_spawn_bits.resize(n, 0);
         }
+        if self.spawn_post_choice.len() != n {
+            self.spawn_post_choice.resize(n, None);
+        }
+        if self.spawn_stage.len() != n {
+            self.spawn_stage.resize(n, SpawnStage::Accepted);
+        }
+        if self.side_choice.len() != n {
+            self.side_choice.resize(n, SideChoice::Team1);
+        }
+    }
+
+    /// Card SSELA: put human slot `slot` behind the spawn screens - the game
+    /// binary's level start. Turns [`Sim::spawn_screens`] on and takes the
+    /// slot's live unit OFF the field without spending a reinforcement (as
+    /// [`Sim::vacate_player_slot`] does), but the slot keeps it: the held
+    /// dead unit is what the class accept brings to life
+    /// ([`Sim::respawn_slot`]), so the slot is never without a unit to point
+    /// at. The screens open on the side select when `side_choice` (the PS2's
+    /// "can switch sides": Instant Action), else on the spawn map (the
+    /// campaign, `B2:392469-392471`). `false` when the slot has no live unit.
+    pub fn open_spawn_screens(&mut self, slot: usize, side_choice: bool) -> bool {
+        let Some(h) = self.players.get(slot).copied().flatten() else {
+            return false;
+        };
+        let Some(u) = self.unit(h) else {
+            return false;
+        };
+        let team = u.team;
+        let i = h.index as usize;
+        self.units[i].alive = false;
+        self.units[i].respawn_at = None;
+        self.units[i].spawn_slot = None;
+        let t = &mut self.battle.teams[usize::from(team.min(1))];
+        t.alive_players = t.alive_players.saturating_sub(1);
+        self.events.push(Event::Despawn { unit: h });
+        self.unseat_unit(h);
+        crate::squad::on_unit_died(self, h);
+        self.spawn_screens = true;
+        self.sync_slot_tables();
+        self.side_choice[slot] = SideChoice::Team1;
+        if side_choice {
+            self.spawn_stage[slot] = SpawnStage::Side;
+        } else {
+            self.open_spawn_map(slot, team);
+        }
+        true
+    }
+
+    /// Open slot `s`'s spawn map for `team`: its post is the one it chose
+    /// while that is still the team's, else the nearest (the PS2 copies the
+    /// member's chosen post, keep-or-nearest `FUN_0036ca08`, re-spawn-flow
+    /// §1 / §3), else the team's first spawn post - the PS2's default pick
+    /// `FUN_0036cca0` is not read (PROVISIONAL).
+    pub(super) fn open_spawn_map(&mut self, s: usize, team: u8) {
+        self.spawn_stage[s] = SpawnStage::Map;
+        let post = self.spawn_post_choice[s]
+            .and_then(|c| self.keep_or_nearest_post(team, c))
+            .or_else(|| self.player_spawn_posts(team).first().map(|q| q.0));
+        self.spawn_post_choice[s] = post;
     }
 
     /// How likely each class of `team` is to be the next AI spawn (the maintainer,
@@ -830,7 +1025,7 @@ impl Sim {
             yaw,
             Controller::Ai,
             c,
-            self.difficulty.base_skill(),
+            self.difficulty_of(team).base_skill(),
         );
         let h = self.spawn(&spec)?;
         self.ai_spawned[t] += 1;
@@ -841,14 +1036,22 @@ impl Sim {
     ///
     /// A BOT spawns at one node of the post it drew
     /// ([`Sim::keep_or_draw_spawn_post`], card BSPN): post first, then node,
-    /// so a post's share of the spawns does not grow with its node count. A
-    /// HUMAN still draws one node from the flat list of every post's
-    /// ([`Sim::spawn_points`]) until the spawn map gives him the pick (card
-    /// SPSEL).
+    /// so a post's share of the spawns does not grow with its node count.
+    /// A HUMAN spawns at a node of the post the spawn map selected for the
+    /// slot, through keep-or-nearest (card SPSEL, [`Sim::keep_or_nearest_post`]);
+    /// one who never picked still draws a node from the flat list of every
+    /// post's ([`Sim::spawn_points`]).
     pub(super) fn respawn_slot(&mut self, i: usize) {
         let team = self.units[i].team;
         let is_player = self.units[i].is_player;
-        let points = if is_player {
+        let slot = self.units[i].spec.player_slot.map(usize::from);
+        let chosen = slot.and_then(|s| self.spawn_post_choice.get(s).copied().flatten());
+        let points = if let (Some(s), Some(chosen)) = (slot, chosen) {
+            // The PS2 writes the kept-or-nearest post back to the member.
+            let post = self.keep_or_nearest_post(team, chosen);
+            self.spawn_post_choice[s] = post;
+            post.map_or_else(Vec::new, |p| self.spawn_post_nodes(team, p))
+        } else if is_player {
             self.spawn_points(team)
         } else {
             match self.keep_or_draw_spawn_post(i) {
@@ -876,6 +1079,7 @@ impl Sim {
             && old.controller == Controller::Ai
             && !self.classes[usize::from(old.team.min(1))].is_empty())
         .then(|| self.ai_class(old.team));
+        let base = self.difficulty_of(old.team).base_skill();
         let table = &self.classes[usize::from(old.team.min(1))];
         let spec = match old.player_slot.filter(|_| !table.is_empty()) {
             Some(slot) => {
@@ -885,24 +1089,10 @@ impl Sim {
                     .copied()
                     .unwrap_or(0);
                 let c = usize::from(c).min(table.len() - 1);
-                table[c].spec(
-                    old.team,
-                    pos,
-                    yaw,
-                    old.controller,
-                    c as u8,
-                    self.difficulty.base_skill(),
-                )
+                table[c].spec(old.team, pos, yaw, old.controller, c as u8, base)
             }
             None => match ai_class {
-                Some(c) => table[usize::from(c)].spec(
-                    old.team,
-                    pos,
-                    yaw,
-                    old.controller,
-                    c,
-                    self.difficulty.base_skill(),
-                ),
+                Some(c) => table[usize::from(c)].spec(old.team, pos, yaw, old.controller, c, base),
                 None => UnitSpec { pos, yaw, ..old },
             },
         };
@@ -910,7 +1100,7 @@ impl Sim {
         // An AI respawn re-derives the tier's skill (D2): a difficulty change
         // between deaths reaches the bot at its next life, and a bot never
         // comes back with a stale level.
-        unit.skill = crate::skill_for(spec.controller, self.difficulty.base_skill());
+        unit.skill = crate::skill_for(spec.controller, self.difficulty_of(spec.team).base_skill());
         unit.spec.skill = unit.skill;
         unit.soldier.pos.y = self.spawn_ground(pos);
         unit.kills = self.units[i].kills;
@@ -943,13 +1133,41 @@ impl Sim {
     ///
     /// A slot with no unit at all takes team 0's table — the only team a
     /// fresh sim's first slot can belong to.
+    ///
+    /// The POST bits (`SPAWN_POST_*`, card SPSEL) move the slot's
+    /// `spawn_post_choice` the same way, edge-triggered: the arms held this
+    /// tick combine into one push (Right +x, Down +z on the map — BF2 Hoth's
+    /// spawn map, `lead_tmp/spsel/fit_dir.py`: every map angle within −12° to
+    /// +26° of that fits the live presses; the PS2 turns the push by the map's
+    /// angle, `FUN_003a8bb0`, not read: 0 is PROVISIONAL), taken from the
+    /// selected post by [`Sim::pick_spawn_post`]. A slot that never picked
+    /// pushes from the post nearest its body, and takes that post when none
+    /// is ahead.
+    ///
+    /// With [`Sim::spawn_screens`] on (card SSELA) the bits go to the screen
+    /// the slot has up instead ([`Sim::spawn_screen_input`]), and
+    /// `SPAWN_ACCEPT` / `SPAWN_BACK` join the edge mask.
     pub(super) fn spawn_select(&mut self, pads: &[PadState]) {
-        if self.spawn_choice.len() != self.players.len() {
+        if self.spawn_choice.len() != self.players.len()
+            || self.spawn_post_choice.len() != self.players.len()
+            || self.spawn_stage.len() != self.players.len()
+        {
             self.sync_slot_tables();
         }
-        const MASK: u32 = buttons::SPAWN_CLASS_NEXT | buttons::SPAWN_CLASS_PREV;
+        const CLASS: u32 = buttons::SPAWN_CLASS_NEXT | buttons::SPAWN_CLASS_PREV;
+        const POST: u32 = buttons::SPAWN_POST_UP
+            | buttons::SPAWN_POST_DOWN
+            | buttons::SPAWN_POST_LEFT
+            | buttons::SPAWN_POST_RIGHT;
+        const SCREEN: u32 = buttons::SPAWN_ACCEPT | buttons::SPAWN_BACK;
+        let mask = if self.spawn_screens {
+            CLASS | POST | SCREEN
+        } else {
+            CLASS | POST
+        };
         for s in 0..self.players.len() {
-            let bits = pads.get(s).map_or(0, |p| p.buttons) & MASK;
+            let held = pads.get(s).map_or(0, |p| p.buttons);
+            let bits = held & mask;
             let rose = bits & !self.prev_spawn_bits[s];
             self.prev_spawn_bits[s] = bits;
             if rose == 0 {
@@ -962,8 +1180,16 @@ impl Sim {
                 _ => {}
             }
             let team = unit.map_or(0, |u| u.team);
+            let body = unit.map(|u| u.soldier.pos);
+            if self.spawn_screens {
+                self.spawn_screen_input(s, team, body, bits, rose, held);
+                continue;
+            }
+            if rose & POST != 0 {
+                self.spawn_post_push(s, team, body, bits);
+            }
             let n = self.classes[usize::from(team.min(1))].len() as u32;
-            if n == 0 {
+            if n == 0 || rose & CLASS == 0 {
                 continue;
             }
             let c = u32::from(self.spawn_choice[s]).min(n - 1);
@@ -974,6 +1200,127 @@ impl Sim {
             };
         }
     }
+
+    /// Card SSELA: one tick's rising bits `rose` (held: `bits`, the whole pad
+    /// `held`) on the screen slot `s` has up, the PS2's table
+    /// (re-spawn-flow §1-§4): X accepts (side -> map; map -> class only with
+    /// a post selected; class -> the spawn, this same tick), Triangle backs
+    /// only on the class screen, and only while X is not rising. Side: Up /
+    /// Down over team 1, team 2, Auto Assign. Map: the post push. Class:
+    /// D-pad Left = next class, Right = previous (the PS2's carousel), and
+    /// `SPAWN_CLASS_NEXT` / `PREV` as before.
+    fn spawn_screen_input(
+        &mut self,
+        s: usize,
+        team: u8,
+        body: Option<Vec3>,
+        bits: u32,
+        rose: u32,
+        held: u32,
+    ) {
+        let accept = rose & buttons::SPAWN_ACCEPT != 0;
+        let back = rose & buttons::SPAWN_BACK != 0;
+        match self.spawn_stage[s] {
+            SpawnStage::Side if accept => {
+                // Named deviation (re-spawn-flow §9, reversible): the PS2
+                // offline keeps team 1 on Auto Assign; the port flips the
+                // PS2's own coin (`FUN_0036fc40`: `((LCG >> 16) & 1) + 1`)
+                // on the sim's LCG, as the maintainer asked for "a side (or random)".
+                let team = match self.side_choice[s] {
+                    SideChoice::Team1 => 0,
+                    SideChoice::Team2 => 1,
+                    SideChoice::Auto => ((self.lcg.step() >> 16) & 1) as u8,
+                };
+                if let Some(h) = self.players[s] {
+                    let u = &mut self.units[h.index as usize];
+                    u.team = team;
+                    u.spec.team = team;
+                }
+                self.open_spawn_map(s, team);
+            }
+            SpawnStage::Side => {
+                let step = i32::from(rose & buttons::SPAWN_POST_DOWN != 0)
+                    - i32::from(rose & buttons::SPAWN_POST_UP != 0);
+                self.side_choice[s] = self.side_choice[s].moved(step);
+            }
+            SpawnStage::Map if accept => {
+                if self.spawn_post_selected(s).is_some() {
+                    self.spawn_stage[s] = SpawnStage::Class;
+                }
+            }
+            SpawnStage::Map => {
+                const POST: u32 = buttons::SPAWN_POST_UP
+                    | buttons::SPAWN_POST_DOWN
+                    | buttons::SPAWN_POST_LEFT
+                    | buttons::SPAWN_POST_RIGHT;
+                if rose & POST != 0 {
+                    self.spawn_post_push(s, team, body, bits);
+                }
+            }
+            SpawnStage::Class if accept => {
+                let Some(h) = self.players[s] else {
+                    return;
+                };
+                let i = h.index as usize;
+                self.respawn_slot(i);
+                if self.units[i].alive {
+                    self.spawn_stage[s] = SpawnStage::Accepted;
+                    // The X that spawned it is not the new soldier's jump.
+                    self.units[i].soldier.set_prev_buttons(held);
+                }
+            }
+            SpawnStage::Class if back => self.spawn_stage[s] = SpawnStage::Map,
+            SpawnStage::Class => {
+                let n = self.classes[usize::from(team.min(1))].len() as u32;
+                let next = rose & (buttons::SPAWN_CLASS_NEXT | buttons::SPAWN_POST_LEFT) != 0;
+                let prev = rose & (buttons::SPAWN_CLASS_PREV | buttons::SPAWN_POST_RIGHT) != 0;
+                if n == 0 || !(next || prev) {
+                    return;
+                }
+                let c = u32::from(self.spawn_choice[s]).min(n - 1);
+                self.spawn_choice[s] = if next {
+                    ((c + 1) % n) as u8
+                } else {
+                    ((c + n - 1) % n) as u8
+                };
+            }
+            SpawnStage::Accepted => {}
+        }
+    }
+
+    /// One spawn-map push for slot `s` of `team` from the arms held in
+    /// `bits` (see [`Sim::spawn_select`]).
+    fn spawn_post_push(&mut self, s: usize, team: u8, body: Option<Vec3>, bits: u32) {
+        let arm = |b: u32| if bits & b != 0 { 1.0 } else { 0.0 };
+        let dir = Vec2::new(
+            arm(buttons::SPAWN_POST_RIGHT) - arm(buttons::SPAWN_POST_LEFT),
+            arm(buttons::SPAWN_POST_DOWN) - arm(buttons::SPAWN_POST_UP),
+        );
+        let posts = self.player_spawn_posts(team);
+        let current = match self.spawn_post_choice[s] {
+            Some(c) => self.keep_or_nearest_post(team, c),
+            None => body.and_then(|at| nearest_post(&posts, at)),
+        };
+        let Some(current) = current.or_else(|| posts.first().map(|q| q.0)) else {
+            return;
+        };
+        let Some(origin) = posts.iter().find(|q| q.0 == current).map(|q| q.1) else {
+            return;
+        };
+        let pick = Self::pick_spawn_post(&posts, Some(current), origin, dir);
+        self.spawn_post_choice[s] = Some(pick.unwrap_or(current));
+    }
+}
+
+/// The post in `posts` nearest to `at` (the first on a tie).
+fn nearest_post(posts: &[(SpawnPost, Vec3)], at: Vec3) -> Option<SpawnPost> {
+    posts
+        .iter()
+        .min_by(|a, b| {
+            a.1.distance_squared(at)
+                .total_cmp(&b.1.distance_squared(at))
+        })
+        .map(|q| q.0)
 }
 
 #[cfg(test)]
@@ -1931,9 +2278,9 @@ mod tests {
         assert_eq!(s.units[i].spawn_post, None);
     }
 
-    /// The human is not changed by card BSPN: until the spawn map gives him
-    /// the pick (card SPSEL) he draws one node from the flat list of every
-    /// post's, so the 1 / 2 / 6-node posts take 1/9, 2/9 and 6/9.
+    /// A human who never picked a post on the spawn map (card SPSEL) draws
+    /// one node from the flat list of every post's, as before card BSPN, so
+    /// the 1 / 2 / 6-node posts take 1/9, 2/9 and 6/9.
     #[test]
     fn a_human_still_draws_from_the_flat_node_list() {
         let mut s = three_post_sim();
@@ -1945,5 +2292,467 @@ mod tests {
             assert!(d < want / 5, "post {k}: {posts:?}");
         }
         assert_eq!(s.units[i].spawn_post, None);
+    }
+
+    // ---- card SPSEL: the spawn map's post pick ----
+
+    fn at(x: f32, z: f32) -> Vec3 {
+        Vec3::new(x, 0.0, z)
+    }
+
+    const RIGHT: Vec2 = Vec2::new(1.0, 0.0);
+    const LEFT: Vec2 = Vec2::new(-1.0, 0.0);
+    const DOWN: Vec2 = Vec2::new(0.0, 1.0);
+    const UP: Vec2 = Vec2::new(0.0, -1.0);
+
+    /// The PS2's pick (re-command-walker-post §5): four posts on a plane,
+    /// each of the four pushes from post 0 takes the post the formula gives;
+    /// `along + 0.25 × perp²` lets a near post off the axis beat a far one on
+    /// it, and loses to it once the offset grows; nothing ahead = `None`.
+    #[test]
+    fn the_spawn_map_pick_is_along_plus_a_quarter_perp_squared() {
+        let p = |i: u16| SpawnPost::Post(i);
+        let posts = [
+            (p(0), at(0.0, 0.0)),
+            (p(1), at(100.0, 10.0)),
+            (p(2), at(-60.0, 50.0)),
+            (p(3), at(20.0, -90.0)),
+        ];
+        let pick = |d| Sim::pick_spawn_post(&posts, Some(p(0)), at(0.0, 0.0), d);
+        // Right: 1 = 100 + 25 against 3 = 20 + 2025.
+        assert_eq!(pick(RIGHT), Some(p(1)));
+        assert_eq!(pick(LEFT), Some(p(2)));
+        // Down: 2 = 50 + 900 against 1 = 10 + 2500.
+        assert_eq!(pick(DOWN), Some(p(2)));
+        assert_eq!(pick(UP), Some(p(3)));
+        // From post 2 nothing lies further left: the caller keeps 2.
+        assert_eq!(
+            Sim::pick_spawn_post(&posts, Some(p(2)), at(-60.0, 50.0), LEFT),
+            None
+        );
+        // A zero push picks nothing.
+        assert_eq!(pick(Vec2::ZERO), None);
+        // The quarter: (40, 25) scores 40 + 156.25 and beats (200, 0); at
+        // (40, 30) it scores 265 and loses.
+        for (z, want) in [(25.0, 2), (30.0, 1)] {
+            let posts = [
+                (p(0), at(0.0, 0.0)),
+                (p(1), at(200.0, 0.0)),
+                (p(2), at(40.0, z)),
+            ];
+            let got = Sim::pick_spawn_post(&posts, Some(p(0)), at(0.0, 0.0), RIGHT);
+            assert_eq!(got, Some(p(want)), "z {z}");
+        }
+    }
+
+    /// The live BF2 Hoth spawn map (`lead_tmp/cwsp/ps2/c2_s*.p2s`, the
+    /// Empire's posts read by `cp_ram2.py`, the AT-ATs at their live position
+    /// in the state BEFORE each press): from cp6 (list index 3) the presses
+    /// Right Right Right Down Down Left left the human member's chosen post
+    /// at 7 7 7 8 4 4. Right = +x, Down = +z; post 0 (no SpawnPath, no class
+    /// points) is not a spawn post and is not in the list.
+    #[test]
+    fn the_pick_replays_the_live_bf2_hoth_spawn_map() {
+        let p = |i: u16| SpawnPost::Post(i);
+        // (walker 7, walker 8) per state s00..s05.
+        let walkers = [
+            ((179.01, 63.19), (144.35, 121.01)),
+            ((136.37, 72.27), (105.64, 133.94)),
+            ((86.56, 82.76), (56.19, 143.30)),
+            ((36.37, 93.32), (7.25, 149.62)),
+            ((17.19, 97.36), (-27.09, 152.20)),
+            ((-8.46, 102.75), (-53.78, 153.65)),
+        ];
+        let presses = [RIGHT, RIGHT, RIGHT, DOWN, DOWN, LEFT];
+        let want = [7u16, 7, 7, 8, 4, 4];
+        let mut cur = p(3);
+        for (k, ((w7, w8), d)) in walkers.iter().zip(presses).enumerate() {
+            let posts = [
+                (p(3), at(16.3, -15.8)),
+                (p(4), at(-213.0, 192.0)),
+                (p(7), at(w7.0, w7.1)),
+                (p(8), at(w8.0, w8.1)),
+            ];
+            let origin = posts.iter().find(|q| q.0 == cur).unwrap().1;
+            cur = Sim::pick_spawn_post(&posts, Some(cur), origin, d).unwrap_or(cur);
+            assert_eq!(cur, p(want[k]), "press {k}");
+        }
+    }
+
+    fn dead_player_on_three_posts() -> (Sim, usize) {
+        let mut s = three_post_sim();
+        let i = s
+            .spawn(&UnitSpec::player(0, Vec3::new(-150.0, 0.0, 0.0)))
+            .unwrap()
+            .index as usize;
+        (s, i)
+    }
+
+    /// The post bits move the choice only while the player is dead, once per
+    /// press; the first push starts from the post nearest the body; a push
+    /// with nothing ahead keeps the selection.
+    #[test]
+    fn the_post_bits_move_the_choice_while_dead_on_the_edge() {
+        let (mut s, i) = dead_player_on_three_posts();
+        let p = |k: u16| Some(SpawnPost::Post(k));
+        s.step(&[press(buttons::SPAWN_POST_RIGHT)]);
+        assert_eq!(s.spawn_post_choice[0], None, "alive: no spawn map");
+        s.units[i].alive = false;
+        s.units[i].respawn_at = Some(u64::MAX);
+        // Held from before the death: no edge.
+        s.step(&[press(buttons::SPAWN_POST_RIGHT)]);
+        assert_eq!(s.spawn_post_choice[0], None);
+        s.step(&[PadState::default()]);
+        // Body at x = -150: nearest post 0, Right takes post 1.
+        for _ in 0..5 {
+            s.step(&[press(buttons::SPAWN_POST_RIGHT)]);
+        }
+        assert_eq!(s.spawn_post_choice[0], p(1), "held = one step");
+        s.step(&[PadState::default()]);
+        s.step(&[press(buttons::SPAWN_POST_RIGHT)]);
+        assert_eq!(s.spawn_post_choice[0], p(2));
+        s.step(&[PadState::default()]);
+        s.step(&[press(buttons::SPAWN_POST_RIGHT)]);
+        assert_eq!(s.spawn_post_choice[0], p(2), "nothing further right");
+        s.step(&[PadState::default()]);
+        s.step(&[press(buttons::SPAWN_POST_LEFT)]);
+        assert_eq!(s.spawn_post_choice[0], p(1));
+        assert_eq!(s.spawn_post_selected(0), Some(SpawnPost::Post(1)));
+        // Up / down: every post is on z = 0, nothing ahead, kept.
+        s.step(&[PadState::default()]);
+        s.step(&[press(buttons::SPAWN_POST_DOWN)]);
+        assert_eq!(s.spawn_post_choice[0], p(1));
+    }
+
+    /// A dead player with post K chosen comes back on a node of post K, for
+    /// each of the three posts; when K is taken before the respawn, at the
+    /// eligible post nearest K, and that becomes the choice.
+    #[test]
+    fn the_respawn_takes_the_chosen_post() {
+        for k in 0..3u16 {
+            let (mut s, i) = dead_player_on_three_posts();
+            s.spawn_post_choice[0] = Some(SpawnPost::Post(k));
+            let (posts, _) = respawn_shares(&mut s, i, 60);
+            let mut want = [0u32; 3];
+            want[usize::from(k)] = 60;
+            assert_eq!(posts, want, "chosen post {k}");
+        }
+        let (mut s, i) = dead_player_on_three_posts();
+        s.spawn_post_choice[0] = Some(SpawnPost::Post(2));
+        s.cps[2].owner = Some(1);
+        let (posts, _) = respawn_shares(&mut s, i, 30);
+        assert_eq!(posts, [0, 30, 0], "post 2 lost: the nearest, post 1");
+        assert_eq!(s.spawn_post_choice[0], Some(SpawnPost::Post(1)));
+    }
+
+    /// The choice is hashed once it leaves `None` (and not before, so the
+    /// pinned hashes of players who never touch the spawn map hold); a pad
+    /// log with two post changes replays to the same hash, and differs from
+    /// the same log without them.
+    #[test]
+    fn the_post_choice_is_hashed_and_replays() {
+        let (mut s, _) = dead_player_on_three_posts();
+        let base = s.hash();
+        s.spawn_post_choice[0] = Some(SpawnPost::Post(1));
+        let one = s.hash();
+        assert_ne!(one, base, "a pick is hashed");
+        s.spawn_post_choice[0] = Some(SpawnPost::Post(2));
+        let two = s.hash();
+        assert_ne!(two, base);
+        assert_ne!(two, one, "and which post it is");
+        s.spawn_post_choice[0] = None;
+        assert_eq!(s.hash(), base, "no pick, nothing eaten");
+
+        let run = |log: &InputLog| {
+            let (mut s, i) = dead_player_on_three_posts();
+            s.units[i].alive = false;
+            s.units[i].respawn_at = Some(40);
+            s.battle.teams[0].alive_players -= 1;
+            for pads in log.frames() {
+                s.step(pads);
+            }
+            (s.hash(), s.units[i].soldier.pos)
+        };
+        let mut log = InputLog {
+            seed: 23,
+            slots: 1,
+            ticks: vec![PadState::default(); 60],
+        };
+        let idle = run(&log);
+        log.ticks[5] = press(buttons::SPAWN_POST_RIGHT);
+        log.ticks[9] = press(buttons::SPAWN_POST_RIGHT);
+        let a = run(&log);
+        assert_eq!(a, run(&log), "replays");
+        assert_ne!(a.0, idle.0);
+        assert_eq!((a.1.x / 100.0).round(), 2.0, "spawned at post 2: {:?}", a.1);
+    }
+
+    // ---- Card SSELA: the spawn screens -------------------------------------
+
+    /// Two teams, two posts each (team 0 at x = 0 and 100, team 1 at
+    /// x = -300 and -200, in that list order), two classes per team (weapon
+    /// 0 and 1); slot 0's player held behind the screens, the side screen up
+    /// when `side`.
+    fn screens_sim(seed: u32, side: bool) -> Sim {
+        let mut s = Sim::empty(seed);
+        s.heightfield = Some(flat_ground());
+        s.add_weapon_class(WeaponClass::bf2_rifle());
+        for t in 0..2 {
+            s.classes[t] = vec![class_w(1, None, 0), class_w(1, None, 1)];
+        }
+        for (x, team) in [(0.0, 0u8), (100.0, 0), (-300.0, 1), (-200.0, 1)] {
+            let pos = Vec3::new(x, 0.0, 0.0);
+            s.add_cp(
+                CpDef {
+                    name: format!("cp{x}"),
+                    pos,
+                    capture: Region::sphere(pos, 8.0),
+                    control: None,
+                    value_bleed: 1,
+                    value_atk: [1, 1],
+                    value_def: [1, 1],
+                    spawn_nodes: vec![(pos + Vec3::new(0.0, 0.0, 1.0), 0.0)],
+                    capture_time: 10.0,
+                    neutralize_time: 10.0,
+                },
+                Some(team),
+            );
+        }
+        s.spawn(&UnitSpec::player_in_slot(0, 0, Vec3::new(50.0, 0.0, 30.0)))
+            .unwrap();
+        assert!(s.open_spawn_screens(0, side));
+        s
+    }
+
+    /// One press of `bit` on its own tick, then a released tick (an edge each
+    /// time); returns whether slot 0 was on the field after the press tick.
+    fn tap(s: &mut Sim, bit: u32) -> bool {
+        s.step(&[press(bit)]);
+        let on = s.units[s.players[0].unwrap().index as usize].alive;
+        s.step(&[PadState::default()]);
+        on
+    }
+
+    fn slot0(s: &Sim) -> &crate::unit::Unit {
+        &s.units[s.players[0].unwrap().index as usize]
+    }
+
+    /// Acceptance 1: a slot that never accepts is not on the field after
+    /// 60 s and has cost nothing; Down, Accept (team 2), Right + Accept
+    /// (post), Back, Accept, Left + Accept (class) puts it on team 2 at the
+    /// chosen post as the chosen class ON the tick of the last accept.
+    #[test]
+    fn a_slot_is_off_the_field_until_it_accepts_side_post_and_class() {
+        let mut s = screens_sim(5, true);
+        let tickets = [s.battle.teams[0].tickets(), s.battle.teams[1].tickets()];
+        assert_eq!(s.spawn_stage[0], SpawnStage::Side);
+        for _ in 0..60 * crate::TICK_HZ {
+            s.step(&[PadState::default()]);
+        }
+        assert!(!slot0(&s).alive, "never accepted: no unit on the field");
+        assert_eq!(
+            s.battle.teams[0].alive_players + s.battle.teams[1].alive_players,
+            0
+        );
+        let now = [s.battle.teams[0].tickets(), s.battle.teams[1].tickets()];
+        assert_eq!(now, tickets, "no reinforcement spent");
+        // Back does nothing on the side screen.
+        tap(&mut s, buttons::SPAWN_BACK);
+        assert_eq!(s.spawn_stage[0], SpawnStage::Side);
+        tap(&mut s, buttons::SPAWN_POST_DOWN);
+        assert_eq!(s.side_choice[0], SideChoice::Team2);
+        assert!(!tap(&mut s, buttons::SPAWN_ACCEPT));
+        assert_eq!(s.spawn_stage[0], SpawnStage::Map);
+        assert_eq!(slot0(&s).team, 1, "the side accept sets the team");
+        // The map opens on team 2's first post; Right takes the other.
+        assert_eq!(s.spawn_post_selected(0), Some(SpawnPost::Post(2)));
+        tap(&mut s, buttons::SPAWN_POST_RIGHT);
+        assert_eq!(s.spawn_post_selected(0), Some(SpawnPost::Post(3)));
+        // Back does nothing on the spawn map (offline).
+        tap(&mut s, buttons::SPAWN_BACK);
+        assert_eq!(s.spawn_stage[0], SpawnStage::Map);
+        assert!(!tap(&mut s, buttons::SPAWN_ACCEPT));
+        assert_eq!(s.spawn_stage[0], SpawnStage::Class);
+        // Back on the class screen returns to the map, the post kept.
+        assert!(!tap(&mut s, buttons::SPAWN_BACK));
+        assert_eq!(s.spawn_stage[0], SpawnStage::Map);
+        assert_eq!(s.spawn_post_selected(0), Some(SpawnPost::Post(3)));
+        assert!(!tap(&mut s, buttons::SPAWN_ACCEPT));
+        // The carousel: Left = the next class.
+        tap(&mut s, buttons::SPAWN_POST_LEFT);
+        assert_eq!(s.spawn_choice[0], 1);
+        assert_eq!(
+            now,
+            [s.battle.teams[0].tickets(), s.battle.teams[1].tickets()]
+        );
+        assert!(
+            tap(&mut s, buttons::SPAWN_ACCEPT),
+            "on the field on the accept's tick"
+        );
+        let u = slot0(&s);
+        assert_eq!(s.spawn_stage[0], SpawnStage::Accepted);
+        assert_eq!((u.team, u.spec.class, u.weapon_class), (1, 1, 1));
+        assert!(
+            (u.soldier.pos.x + 200.0).abs() < 0.01,
+            "at post 3: {:?}",
+            u.soldier.pos
+        );
+        assert_eq!(s.battle.teams[1].alive_players, 1);
+    }
+
+    /// Acceptance 2: after a death the slot is not back before 4.0 s nor
+    /// without the class accept, and IS back on the accept's tick while its
+    /// team's spawn wave is not ready (the human skips the wave); the post
+    /// and the class of the last life are kept.
+    #[test]
+    fn after_a_death_the_timer_then_map_and_class_and_no_wave() {
+        let mut s = screens_sim(6, false);
+        assert_eq!(
+            s.spawn_stage[0],
+            SpawnStage::Map,
+            "no side choice: the map first"
+        );
+        tap(&mut s, buttons::SPAWN_POST_RIGHT);
+        tap(&mut s, buttons::SPAWN_ACCEPT);
+        tap(&mut s, buttons::SPAWN_CLASS_NEXT);
+        assert!(tap(&mut s, buttons::SPAWN_ACCEPT));
+        let h = s.players[0].unwrap();
+        s.kill_environment(h, crate::sim::DeathCause::Fall);
+        let died = s.tick;
+        let wave_slot = slot0(&s).spawn_slot.expect("a death takes a wave slot");
+        let delay = u64::from(4 * crate::TICK_HZ);
+        // Accept pressed on every other tick while the timer runs: nothing.
+        while s.tick + 1 < died + delay {
+            assert!(!tap(&mut s, buttons::SPAWN_ACCEPT), "back before 4.0 s");
+            assert_eq!(s.spawn_stage[0], SpawnStage::Accepted);
+        }
+        for _ in 0..3 {
+            s.step(&[PadState::default()]);
+        }
+        assert_eq!(
+            s.spawn_stage[0],
+            SpawnStage::Map,
+            "the timer opened the map"
+        );
+        for _ in 0..crate::TICK_HZ {
+            s.step(&[PadState::default()]);
+        }
+        assert!(!slot0(&s).alive, "not without the accepts");
+        assert_eq!(
+            s.spawn_post_selected(0),
+            Some(SpawnPost::Post(1)),
+            "post kept"
+        );
+        assert!(!tap(&mut s, buttons::SPAWN_ACCEPT));
+        assert_eq!(s.spawn_stage[0], SpawnStage::Class);
+        assert_eq!(s.spawn_choice[0], 1, "class kept");
+        assert!(!s.waves[0].ready(wave_slot), "the wave is not ready");
+        assert!(
+            tap(&mut s, buttons::SPAWN_ACCEPT),
+            "back on the accept's tick"
+        );
+        let u = slot0(&s);
+        assert!((u.soldier.pos.x - 100.0).abs() < 0.01 && u.spec.class == 1);
+    }
+
+    /// Without the screens (the referees, `--spawn`) a dead human still
+    /// comes back by itself when its timer runs out - and does not wait for
+    /// the spawn wave either.
+    #[test]
+    fn auto_accept_respawns_on_the_timer_without_the_wave() {
+        let mut s = spawn_select_sim();
+        let h = s.players[0].unwrap();
+        s.kill_environment(h, crate::sim::DeathCause::Fall);
+        let slot = slot0(&s).spawn_slot.unwrap();
+        for _ in 0..4 * crate::TICK_HZ + 1 {
+            s.step(&[PadState::default()]);
+        }
+        assert!(slot0(&s).alive, "back after 4.0 s");
+        assert!(!s.waves[0].ready(slot), "while its wave is not ready");
+    }
+
+    /// Acceptance 3: Auto Assign flips the PS2's coin on the sim's LCG -
+    /// over 32 seeds both teams occur; the X that spawns is not a jump.
+    #[test]
+    fn auto_assign_draws_both_teams_over_32_seeds() {
+        let mut teams = [0u32; 2];
+        for seed in 0..32 {
+            let mut s = screens_sim(seed, true);
+            tap(&mut s, buttons::SPAWN_POST_UP);
+            assert_eq!(
+                s.side_choice[0],
+                SideChoice::Auto,
+                "Up wraps to Auto Assign"
+            );
+            tap(&mut s, buttons::SPAWN_ACCEPT);
+            let t = slot0(&s).team;
+            teams[usize::from(t)] += 1;
+            assert_eq!(
+                s.spawn_post_selected(0),
+                Some(SpawnPost::Post(if t == 0 { 0 } else { 2 }))
+            );
+            // Held X through the spawn: the soldier does not jump.
+            tap(&mut s, buttons::SPAWN_ACCEPT);
+            let both = buttons::SPAWN_ACCEPT | buttons::JUMP;
+            s.step(&[press(both)]);
+            s.step(&[press(both)]);
+            assert!(slot0(&s).alive);
+            assert!(slot0(&s).soldier.grounded, "seed {seed}: the accept jumped");
+        }
+        assert!(teams[0] > 0 && teams[1] > 0, "both teams: {teams:?}");
+    }
+
+    /// Acceptance 4: stage, side row and the switch are hashed (two
+    /// different set values apart, not only set against unset); a pad log
+    /// through the screens replays to the same hash, and two logs that pick
+    /// different sides hash apart.
+    #[test]
+    fn the_screens_are_hashed_and_replay() {
+        let mut s = spawn_select_sim();
+        let base = s.hash();
+        s.sync_slot_tables();
+        assert_eq!(s.hash(), base, "defaults eat nothing");
+        s.side_choice[0] = SideChoice::Team2;
+        let a = s.hash();
+        s.side_choice[0] = SideChoice::Auto;
+        let b = s.hash();
+        assert!(a != base && b != base && a != b, "the side row");
+        s.side_choice[0] = SideChoice::Team1;
+        s.spawn_stage[0] = SpawnStage::Map;
+        let m = s.hash();
+        s.spawn_stage[0] = SpawnStage::Class;
+        let c = s.hash();
+        assert!(m != base && c != base && m != c, "the stage");
+        s.spawn_stage[0] = SpawnStage::Accepted;
+        assert_eq!(s.hash(), base);
+        s.spawn_screens = true;
+        assert_ne!(s.hash(), base, "the switch");
+
+        let run = |log: &InputLog| {
+            let mut s = screens_sim(log.seed, true);
+            for pads in log.frames() {
+                s.step(pads);
+            }
+            (s.hash(), slot0(&s).team, slot0(&s).alive)
+        };
+        let mut log = InputLog {
+            seed: 41,
+            slots: 1,
+            ticks: vec![PadState::default(); 40],
+        };
+        for (t, b) in [
+            (4, buttons::SPAWN_ACCEPT),
+            (8, buttons::SPAWN_ACCEPT),
+            (12, buttons::SPAWN_ACCEPT),
+        ] {
+            log.ticks[t] = press(b);
+        }
+        let one = run(&log);
+        assert_eq!(one, run(&log), "replays");
+        assert_eq!((one.1, one.2), (0, true));
+        log.ticks[2] = press(buttons::SPAWN_POST_DOWN);
+        let two = run(&log);
+        assert_eq!((two.1, two.2), (1, true));
+        assert_ne!(one.0, two.0, "two sides hash apart");
     }
 }

@@ -25,6 +25,7 @@ fn seg(texture: &str, flags: u32) -> Segment {
         spec_color: 0,
         textures: vec![(0, texture.into())],
         bone: None,
+        group: None,
         bmap: Vec::new(),
         bind: Vec::new(),
         wght: Vec::new(),

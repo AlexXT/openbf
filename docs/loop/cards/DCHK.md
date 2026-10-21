@@ -2,7 +2,7 @@
 id: DCHK
 title: Droid soldiers blow apart as the PS2's do (BF1 CW, BF2): a class with chunk geometry rolls ChunkFrequency 0.6 at every push call - no push and a sticky mark, or pushed with a dead one's health set to -4 - and again at its death: the chunk death (ExplosionName's effect at the body, the class's chunk thrown at 0.1 + 0.018 x overkill, no corpse) - today a droid is pushed every time and always leaves a corpse
 milestone: M3
-value: 3
+value: 4
 phase: build
 status: todo
 deps: KNOCK
@@ -48,3 +48,4 @@ corpse.
 ## Notes
 - Filed 2026-10-07 by KNOCK's RE. BF2's droid classes: check `unit-audit-bf2.md` for which author the two keys before
   building the BF2 half.
+- 2026-10-20 (the maintainer): in BF2 a CIS droid killed by an explosion or a headshot bursts into a small fire / disintegrates with a noise (the explosion does no damage); every class had its own death noise (UCRY has the noises). This card is the droid break-up; whether the PS2 has other death-TYPE effects (a headshot, a burn, a dissolve) is open - RE them here or file a sibling card.

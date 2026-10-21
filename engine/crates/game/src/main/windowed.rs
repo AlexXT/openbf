@@ -151,6 +151,20 @@ fn note_sounds(
 }
 
 /// Autosave the settings a menu action changed.
+/// The window's first size: 1280x720 logical, or `OPENBF_WINDOW_SIZE=WxH`
+/// physical pixels (a measurement knob, card ISPD: the same frame at a
+/// laptop panel's resolution).
+fn window_size() -> winit::dpi::Size {
+    let want = std::env::var("OPENBF_WINDOW_SIZE").ok().and_then(|s| {
+        let (w, h) = s.split_once('x')?;
+        Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
+    });
+    match want {
+        Some((w, h)) if w > 0 && h > 0 => winit::dpi::PhysicalSize::new(w, h).into(),
+        _ => winit::dpi::LogicalSize::new(1280, 720).into(),
+    }
+}
+
 fn persist_setting(profile: &mut game::profile::Profile, a: ui::menu::MenuAction, walk: &WalkSim) {
     use ui::menu::MenuAction;
     match a {
@@ -393,8 +407,6 @@ struct App {
     feed: game::event_feed::EventFeed,
     paused: bool,
     menu_cursor: usize,
-    /// Spawn-screen cursor while the player is dead (UI only — `ui::spawn`).
-    spawn_cursor: usize,
     /// Placeholder muzzle/impact effects (visual only — `game::fx`).
     fx: game::fx::Fx,
     /// The map's precipitation and wind (visual only — `game::weather`).
@@ -417,12 +429,21 @@ struct App {
     snapshot_requested: bool,
     /// Quit chosen in the pause menu; handled after the frame.
     quit_clicked: bool,
+    /// The frame record (dev mode, card HITCH) and `OPENBF_FRAME_PROFILE=<csv>`'s
+    /// row of CPU / GPU ms per battle frame (`game::frame_profile`).
+    frame_profile: Option<game::frame_profile::FrameProfile>,
     profile: game::profile::Profile,
     round_recorded: bool,
     /// Previous frame's menu-relevant buttons (edge detection).
     prev_menu_buttons: u32,
     /// One click of L3 sprints (`input::SprintLatch`).
     sprint_latch: input::SprintLatch,
+    /// `OPENBF_AUTOPILOT=1` in dev mode: [`autopilot_pad`] drives the player.
+    autopilot: bool,
+    /// `OPENBF_QUIT_AT=<s>` in dev mode: the game quits (as the window's
+    /// close does) when the battle's clock reaches it - an unattended run's
+    /// end with its exit snapshot and frame summary.
+    quit_at: Option<u64>,
     /// PS2 BF2 Morse cheat recogniser — process lifetime, never reset (authentic).
     morse: ui::menu::MorseCheats,
     /// `hud` cheat: HUD hidden.
@@ -435,6 +456,8 @@ struct App {
     walk: Option<(WalkSim, MeshHandle)>,
     /// Animated soldier models (per team) — `None` before a battle starts.
     soldier_vis: Option<game::soldier_vis::SoldierVisuals>,
+    /// The spawn screens' 3-D soldiers (card SSELB).
+    spawn_preview: game::spawn_preview::Preview,
     /// The battle's vehicle models (card VDRAW) — empty before a battle.
     vehicle_vis: game::viewer::VehicleVisuals,
     gilrs: Option<gilrs::Gilrs>,
@@ -442,6 +465,51 @@ struct App {
     /// on every screen until a pad that resolves replaces it (card PADM).
     pad_warning: Option<String>,
     last: std::time::Instant,
+}
+
+/// `OPENBF_AUTOPILOT=1` (dev, card HITCH): the player's pad walks forward,
+/// wanders left and right, fires in bursts and presses the spawn screens'
+/// accept and the use button now and then, so an unattended windowed run
+/// moves the view over the map (the frame recorder's replays). A function of
+/// the sim tick only.
+fn autopilot_pad(tick: u64) -> PadState {
+    use core::sim::buttons as b;
+    let t = tick as f32 * core::TICK_DT;
+    let mut buttons = 0;
+    if t % 5.0 < 1.5 {
+        buttons |= b::FIRE;
+    }
+    if t % 0.5 < 0.25 {
+        buttons |= b::SPAWN_ACCEPT;
+    }
+    if t % 7.0 < 0.2 {
+        buttons |= b::ACTION;
+    }
+    PadState {
+        lx: 0,
+        ly: PadState::quantize(1.0),
+        rx: PadState::quantize(
+            0.35 * core::fmath::sin_cos(t * 0.4).0 + 0.1 * core::fmath::sin_cos(t * 1.7).0,
+        ),
+        ry: 0,
+        buttons,
+    }
+}
+
+/// Decode every take the battle can play, behind the loading (card HITCH:
+/// a take decoded at its first play cost its frame up to 5 ms).
+fn preload_sounds(sl: &mut game::sounds::SoundLib) {
+    let (n, bytes, ms) = sl.preload();
+    println!(
+        "sounds: {n} takes decoded at load ({:.1} MB, {ms:.0} ms)",
+        bytes as f64 / (1024.0 * 1024.0)
+    );
+}
+
+/// `OPENBF_QUIT_AT=<seconds>` (dev mode): the battle tick the game quits at.
+fn quit_at() -> Option<u64> {
+    let s: f32 = std::env::var("OPENBF_QUIT_AT").ok()?.parse().ok()?;
+    game::dev::on().then_some((s * core::TICK_HZ as f32) as u64)
 }
 
 /// Open gilrs through `input::open_gilrs` and log how each pad resolved.
@@ -492,9 +560,9 @@ pub(super) fn run_windowed(v: ViewerArgs) -> Result<()> {
         paused: false,
         menu_cursor: 0,
         quit_clicked: false,
+        frame_profile: game::frame_profile::FrameProfile::from_env(),
         profile: game::profile::Profile::load_or_default(),
         round_recorded: false,
-        spawn_cursor: 0,
         fx: game::fx::Fx::default(),
         weather: None,
         holos: game::holo::Holos::default(),
@@ -507,6 +575,8 @@ pub(super) fn run_windowed(v: ViewerArgs) -> Result<()> {
         snapshot_requested: false,
         prev_menu_buttons: 0,
         sprint_latch: input::SprintLatch::default(),
+        autopilot: game::dev::on() && std::env::var("OPENBF_AUTOPILOT").is_ok_and(|v| v == "1"),
+        quit_at: quit_at(),
         morse: ui::menu::MorseCheats::new(),
         hud_hidden: false,
         sfx_slow: false,
@@ -515,6 +585,7 @@ pub(super) fn run_windowed(v: ViewerArgs) -> Result<()> {
         gpu: None,
         walk: None,
         soldier_vis: None,
+        spawn_preview: Default::default(),
         vehicle_vis: Default::default(),
         gilrs,
         pad_warning,
@@ -811,6 +882,7 @@ impl App {
             game::ambience::Ambience::load(&scene.manifest, &scene.dir, &setup.classes_dir);
         if let Some(sl) = self.sounds.as_mut() {
             sl.for_walk(&scene.dir, &walk);
+            preload_sounds(sl);
         }
         self.blackbox = start_blackbox(&scene, &walk, &self.mode, &setup, self.sounds.as_mut());
         self.feed = game::event_feed::EventFeed::for_walk(
@@ -824,6 +896,7 @@ impl App {
             &scene.manifest.source_game,
             &walk,
         );
+        self.fx.preload(renderer);
         self.weather = game::weather::Weather::load(
             &scene.manifest,
             &self.assets_dir,
@@ -851,6 +924,9 @@ impl App {
             &self.assets_dir,
             &walk.vehicle_geometry,
         );
+        // What the battle can show later, behind the loading (card HITCH).
+        self.vehicle_vis.preload(renderer, &walk.sim);
+        self.bolts.preload(renderer, &walk);
         walk.sim.assist_intensity = self.profile.settings.assist_intensity;
         walk.fov_scale = self.profile.settings.fov_scale;
         if let Some(m) = walk.music.as_mut() {
@@ -864,6 +940,7 @@ impl App {
         if let Some(cap) = self.profile.settings.ai_alive_cap {
             walk.sim.ai_alive_cap = cap;
         }
+        super::battle::open_spawn_screens(&mut walk, setup.mission.as_ref());
         self.profile.settings.last_map = Some(name);
         self.profile.settings.last_mode = Some(self.mode.clone());
         self.profile.settings.last_teams = Some(teams);
@@ -877,10 +954,26 @@ impl App {
         self.outcome_reported = false;
         self.round_recorded = false;
         self.screen = Screen::Battle;
+        self.start_frame_record();
     }
 
-    /// The black box's `exit` snapshot, written before the battle goes.
+    /// A battle's first frame is next: the frame record starts over and the
+    /// black box writes it into its snapshots (card HITCH).
+    fn start_frame_record(&mut self) {
+        if let Some(p) = self.frame_profile.as_mut() {
+            p.reset();
+            if let Some(bb) = self.blackbox.as_mut() {
+                bb.frame_record(p.record());
+            }
+        }
+    }
+
+    /// The black box's `exit` snapshot, written before the battle goes, and
+    /// the frame record's summary line.
     fn blackbox_exit(&mut self) {
+        if let Some(h) = self.frame_profile.as_ref().and_then(|p| p.hitches()) {
+            println!("frame record: {}", h.summary());
+        }
         if let (Some(bb), Some((walk, _))) = (self.blackbox.as_mut(), self.walk.as_ref()) {
             bb.write("exit", Some(walk), true);
         }
@@ -931,6 +1024,12 @@ impl App {
                         now |= bit;
                     }
                 }
+                // The left stick presses the same arms as the D-pad.
+                now |= input::stick_arms(
+                    pad.value(gilrs::Axis::LeftStickX),
+                    pad.value(gilrs::Axis::LeftStickY),
+                    self.prev_menu_buttons & 15,
+                );
             }
         }
         let edges = now & !self.prev_menu_buttons;
@@ -1006,7 +1105,6 @@ pub(super) fn run_shell(assets_dir: PathBuf, missions_dir: PathBuf) -> Result<()
     let (gilrs, pad_warning) = open_pads();
     let mut app = App {
         map: None,
-        spawn_cursor: 0,
         fx: game::fx::Fx::default(),
         weather: None,
         holos: game::holo::Holos::default(),
@@ -1059,10 +1157,13 @@ pub(super) fn run_shell(assets_dir: PathBuf, missions_dir: PathBuf) -> Result<()
         menu_cursor: 0,
         prev_menu_buttons: 0,
         sprint_latch: input::SprintLatch::default(),
+        autopilot: game::dev::on() && std::env::var("OPENBF_AUTOPILOT").is_ok_and(|v| v == "1"),
+        quit_at: quit_at(),
         morse: ui::menu::MorseCheats::new(),
         hud_hidden: false,
         sfx_slow: false,
         quit_clicked: false,
+        frame_profile: game::frame_profile::FrameProfile::from_env(),
         profile: game::profile::Profile::load_or_default(),
         round_recorded: false,
         window: None,
@@ -1070,6 +1171,7 @@ pub(super) fn run_shell(assets_dir: PathBuf, missions_dir: PathBuf) -> Result<()
         gpu: None,
         walk: None,
         soldier_vis: None,
+        spawn_preview: Default::default(),
         vehicle_vis: Default::default(),
         gilrs,
         pad_warning,
@@ -1089,7 +1191,7 @@ impl winit::application::ApplicationHandler for App {
                 .create_window(
                     winit::window::Window::default_attributes()
                         .with_title("openbf")
-                        .with_inner_size(winit::dpi::LogicalSize::new(1280, 720)),
+                        .with_inner_size(window_size()),
                 )
                 .expect("create window"),
         );
@@ -1140,6 +1242,7 @@ impl winit::application::ApplicationHandler for App {
                     );
                     if let Some(sl) = self.sounds.as_mut() {
                         sl.for_walk(&scene.dir, &walk);
+                        preload_sounds(sl);
                     }
                     self.blackbox = start_blackbox(
                         &scene,
@@ -1159,6 +1262,7 @@ impl winit::application::ApplicationHandler for App {
                         &scene.manifest.source_game,
                         &walk,
                     );
+                    self.fx.preload(&mut renderer);
                     self.weather = game::weather::Weather::load(
                         &scene.manifest,
                         &self.assets_dir,
@@ -1186,6 +1290,10 @@ impl winit::application::ApplicationHandler for App {
                         &self.assets_dir,
                         &walk.vehicle_geometry,
                     );
+                    // What the battle can show later, behind the loading
+                    // (card HITCH).
+                    self.vehicle_vis.preload(&mut renderer, &walk.sim);
+                    self.bolts.preload(&mut renderer, &walk);
                     // Profile settings + remember the session for next time.
                     walk.sim.assist_intensity = self.profile.settings.assist_intensity;
                     walk.fov_scale = self.profile.settings.fov_scale;
@@ -1215,6 +1323,7 @@ impl winit::application::ApplicationHandler for App {
                         self.profile.career.deaths
                     );
                     self.walk = Some((walk, cube));
+                    self.start_frame_record();
                 }
                 self.gpu = Some(gpu);
             }
@@ -1292,6 +1401,9 @@ impl winit::application::ApplicationHandler for App {
                     return;
                 }
 
+                if let Some(p) = self.frame_profile.as_mut() {
+                    p.begin();
+                }
                 let mut extra: Vec<DrawCmd> = Vec::new();
                 let mut skinned: Vec<render::SkinnedDrawCmd> = Vec::new();
                 // The loaded map's own clear colour (its fog, where it authors
@@ -1319,7 +1431,10 @@ impl winit::application::ApplicationHandler for App {
                                     w.soldier().stance == core::soldier::Stance::Sprint,
                                 )
                             });
-                        let pad = self.sample_pad();
+                        let pad = match self.autopilot {
+                            true => autopilot_pad(self.walk.as_ref().map_or(0, |w| w.0.sim.tick)),
+                            false => self.sample_pad(),
+                        };
                         self.sprint_latch.apply(pad, on_foot, sprinting)
                     };
                     let paused = self.paused;
@@ -1413,6 +1528,7 @@ impl winit::application::ApplicationHandler for App {
                             w as f32 / h.max(1) as f32
                         });
                         walk.advance_with(dt, std::slice::from_ref(&pad), |walk| {
+                            let hook_t0 = std::time::Instant::now();
                             self.fx.ingest(walk);
                             let effect_sounds = self.fx.take_sounds();
                             if let Some(vis) = self.soldier_vis.as_mut() {
@@ -1439,7 +1555,14 @@ impl winit::application::ApplicationHandler for App {
                                 stuck_alarm |= bb.tick(walk, Some(pad));
                                 note_sounds(bb, self.sounds.as_mut(), walk.sim.tick);
                             }
+                            if let Some(p) = self.frame_profile.as_mut() {
+                                let hook = hook_t0.elapsed().as_secs_f64() * 1000.0;
+                                p.tick(walk.sim.ai_wall_ms, hook);
+                            }
                         });
+                        if let Some(p) = self.frame_profile.as_mut() {
+                            p.lap("sim_ms");
+                        }
                         self.fx.update(dt);
                         if let Some(w) = self.weather.as_mut() {
                             w.update(dt);
@@ -1535,6 +1658,9 @@ impl winit::application::ApplicationHandler for App {
                             );
                         }
                     }
+                    if let Some(p) = self.frame_profile.as_mut() {
+                        p.lap("update_ms");
+                    }
                     let models = self
                         .soldier_vis
                         .as_ref()
@@ -1569,23 +1695,9 @@ impl winit::application::ApplicationHandler for App {
                     if let Some(m) = hud.as_mut().filter(|_| paused) {
                         m.capture = None;
                     }
-                    // Spawn screen while dead: the d-pad moves the cursor (UI
-                    // only — the sim still picks the node, see ui::spawn).
-                    spawn = spawn_model(walk, self.spawn_cursor);
-                    match &spawn {
-                        Some(m) if !m.posts.is_empty() && !paused => {
-                            let n = m.posts.len();
-                            if edges & 1 != 0 {
-                                self.spawn_cursor = (self.spawn_cursor + n - 1) % n;
-                            }
-                            if edges & 2 != 0 {
-                                self.spawn_cursor = (self.spawn_cursor + 1) % n;
-                            }
-                            spawn = spawn_model(walk, self.spawn_cursor);
-                        }
-                        // Alive again (or no posts): the cursor starts over.
-                        _ => self.spawn_cursor = 0,
-                    }
+                    // Spawn screen while dead: the post and class it shows
+                    // are the sim's (card SPSEL), moved by the pad bits.
+                    spawn = spawn_model(walk, &self.feed);
                     walk.camera()
                 } else {
                     self.drive_fly_camera(dt);
@@ -1651,6 +1763,18 @@ impl winit::application::ApplicationHandler for App {
                         None => gpu.draws.clone(),
                     };
                     draws.append(&mut extra);
+                    // The PS2's spawn screens (the HUD pass's, card SSELB):
+                    // the soldier standing in the camera shot.
+                    let page = spawn
+                        .as_ref()
+                        .and_then(|s| s.page.as_ref())
+                        .filter(|_| self.hud_view.is_some() && !self.hud_hidden);
+                    if let Some(vis) = self.soldier_vis.as_ref() {
+                        let step = if self.paused { 0.0 } else { dt };
+                        let (body, gun) = self.spawn_preview.draws(vis, page, &camera, step);
+                        skinned.extend(body);
+                        draws.extend(gun);
+                    }
                     let hud_hidden = self.hud_hidden;
                     let pad_warning = self.pad_warning.clone();
                     // BF2's own HUD under the egui lines and the spawn
@@ -1667,6 +1791,9 @@ impl winit::application::ApplicationHandler for App {
                         }
                         _ => None,
                     };
+                    if let Some(p) = self.frame_profile.as_mut() {
+                        p.lap("draws_ms");
+                    }
                     let result = match (&mut self.overlay, &self.window, hud) {
                         (Some(overlay), Some(window), Some(model)) => {
                             let mut clicked: Vec<ui::menu::MenuAction> = Vec::new();
@@ -1682,7 +1809,18 @@ impl winit::application::ApplicationHandler for App {
                                     };
                                     ui::hud::draw_hud(ctx, &m);
                                     if let Some(s) = &spawn {
-                                        ui::spawn::draw_spawn(ctx, s);
+                                        // The PS2's screen is the HUD pass's;
+                                        // without one the panel stands in.
+                                        match hud_view.is_some() {
+                                            true => ui::spawn::draw_spawn(ctx, s),
+                                            false => ui::spawn::draw_spawn(
+                                                ctx,
+                                                &ui::spawn::SpawnModel {
+                                                    page: None,
+                                                    ..s.clone()
+                                                },
+                                            ),
+                                        }
                                     }
                                 }
                                 if let Some(m) = &menu {
@@ -1692,6 +1830,10 @@ impl winit::application::ApplicationHandler for App {
                                     ui::hud::draw_pad_warning(ctx, w);
                                 }
                             });
+                            let (n, bytes) = paint.texture_uploads();
+                            if n > 0 {
+                                render::made::note("egui texture", Some("egui"), bytes, 0.0);
+                            }
                             if let Some((walk, _)) = self.walk.as_mut() {
                                 for a in clicked {
                                     apply_menu_action(walk, a, &mut self.paused, event_loop);
@@ -1716,10 +1858,18 @@ impl winit::application::ApplicationHandler for App {
                         }
                         _ => r.render_frame(&camera, &draws, &skinned, clear, None),
                     };
+                    if let Some(p) = self.frame_profile.as_mut() {
+                        p.lap("render_ms");
+                        let tick = self.walk.as_ref().map_or(0, |w| w.0.sim.tick);
+                        p.end(f64::from(dt) * 1000.0, tick, r);
+                    }
                     if let Err(e) = result {
                         eprintln!("render: {e}");
                         event_loop.exit();
                     }
+                }
+                if let (Some(at), Some((walk, _))) = (self.quit_at, self.walk.as_ref()) {
+                    self.quit_clicked |= walk.sim.tick >= at;
                 }
                 if self.quit_clicked {
                     self.quit_clicked = false;

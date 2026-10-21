@@ -371,6 +371,33 @@ fn only_the_jet_pack_classes_are_jet() {
     assert_eq!(bf2.prop_f32("rep_inf_ep3_jettrooper", "JetJump"), Some(5.0));
 }
 
+/// Card RKEX: the rocket launchers' ordnance carries its impact explosion
+/// from the disc - BF2's by `ExplosionName` (Damage 400, DamageRadiusInner
+/// 2, Outer 4, VehicleScale 0), BF1's (a `bullet` ordnance) by
+/// `ExplosionImpact` (300, 0.5, 2.5) - and a rifle's none.
+#[test]
+fn the_rocket_launchers_carry_their_impact_explosion() {
+    let Some(dir) = classes_dir() else { return };
+    let ex = |game: &str, weapon: &str| {
+        let db = game::roster::load_classdb(&dir, game, &FOUR).expect("db");
+        game::roster::weapon_from_db(&db, weapon)
+            .expect(weapon)
+            .ordnance
+            .explosion
+            .map(|e| (e.damage, e.damage_inner, e.damage_outer, e.scales[3]))
+    };
+    assert_eq!(
+        ex("bf2", "rep_weap_inf_rocket_launcher"),
+        Some((400.0, 2.0, 4.0, 0.0))
+    );
+    assert_eq!(
+        ex("bf1", "rep_weap_inf_rocket_launcher"),
+        Some((300.0, 0.5, 2.5, 0.0))
+    );
+    assert_eq!(ex("bf2", "rep_weap_inf_rifle"), None);
+    assert_eq!(ex("bf1", "rep_weap_inf_rifle"), None);
+}
+
 /// The BF2 GCW case, which used to be the reason the fallback rule existed:
 /// tat2's mission names BF2 classes, and against the db its own disc supplies
 /// every one of them resolves — no skip, no fallback.
@@ -655,9 +682,11 @@ fn battle_classes_hold_their_own_weapon_model() {
                     weapon_geometry: c.weapon_geometry.clone(),
                     weapon_hud: c.weapon_hud.clone(),
                     held_hud: Vec::new(),
+                    held_models: Vec::new(),
                     foley_class: c.foley_class,
                     cries: c.cries.clone(),
                     anim: c.anim.clone(),
+                    skins: c.skins.clone(),
                 })
                 .collect();
             t
@@ -701,6 +730,122 @@ fn battle_classes_hold_their_own_weapon_model() {
     assert!(wrong.is_empty(), "{wrong:#?}");
     // The rosters do hold the case: classes sharing a body, not a gun.
     assert!(tally.iter().all(|t| t.3 > 0), "{tally:?}");
+}
+
+/// Card WHELD acceptance 1-2: every class slot of every class a shipped
+/// mission or a default list fields, per disc, with the model its weapon
+/// is drawn as in the hand (`roster::weapon_model`) and whether the map's
+/// own side bake holds it. Every slot the sim can put in a soldier's hand
+/// (the primary and `held_slots`) must have its model baked: a slot whose
+/// weapon names no model draws none, as on the PS2. The table is printed
+/// (`-- --nocapture`); its rows are in the card.
+#[test]
+fn every_held_slots_hand_model_is_baked() {
+    let Some(dir) = classes_dir() else { return };
+    let baked = game::assets::baked_root();
+    if !baked.join("side_bf1/weapons").is_dir() || !baked.join("side_bf2/weapons").is_dir() {
+        eprintln!("SKIP: no side bakes under {}", baked.display());
+        return;
+    }
+    // A side bake from before card WHELD's `rebake.sh side` holds none of
+    // the models it added (land.py's branch ci runs on that bake before its
+    // rebake): skip. A bake holding some of them and not others fails below.
+    let added = [
+        "side_bf1/weapons/all_weap_inf_pistol.glb",
+        "side_bf1/weapons/imp_weap_inf_pistol.glb",
+        "side_bf1/weapons/rep_weap_inf_pistol.glb",
+        "side_bf1/weapons/cis_weap_inf_pistol.glb",
+        "side_bf1/weapons/com_weap_inf_grenadethermal.glb",
+        "side_bf2/weapons/com_weap_inf_grenadethermal.glb",
+    ];
+    if added.iter().all(|f| !baked.join(f).exists()) {
+        eprintln!("SKIP: the side bake predates card WHELD (run scripts/rebake.sh side)");
+        return;
+    }
+    let mut files: Vec<_> = std::fs::read_dir(missions_dir())
+        .expect("missions dir")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ron"))
+        .collect();
+    files.sort();
+    let mut fielded: Vec<(String, String)> = Vec::new();
+    let mut add = |game: &str, class: &str| {
+        let k = (game.to_owned(), class.to_ascii_lowercase());
+        if !fielded.contains(&k) {
+            fielded.push(k);
+        }
+    };
+    for game in ["bf1", "bf2"] {
+        for f in FOUR {
+            for class in game::roster::default_classes(game, f).into_iter().flatten() {
+                add(game, class);
+            }
+        }
+    }
+    for path in &files {
+        let m = MissionDef::load(path).expect("mission");
+        let f = m.factions();
+        let (rosters, _) = FactionRoster::pair(
+            &dir,
+            &m.source_game,
+            [f[0].as_str(), f[1].as_str()],
+            Some(&m),
+        )
+        .expect("rosters");
+        for r in &rosters {
+            for c in &r.classes {
+                add(&m.source_game, &c.class);
+            }
+        }
+    }
+    fielded.sort();
+    let dbs = [
+        ("bf1", load_classdb_all(&dir, "bf1")),
+        ("bf2", load_classdb_all(&dir, "bf2")),
+    ];
+    let (mut drawn, mut none, mut missing) = (0usize, 0usize, Vec::new());
+    for (game, class) in &fielded {
+        let db = &dbs.iter().find(|(g, _)| g == game).unwrap().1;
+        let Ok(c) = game::roster::ClassRoster::build(db, class, 0, None) else {
+            continue;
+        };
+        let run: Vec<u8> = std::iter::once(c.weapon_slot)
+            .chain(c.held.iter().map(|h| h.slot))
+            .collect();
+        for s in db.weapon_slots(class) {
+            let name = db.resolve(&s.weapon).unwrap_or(&s.weapon).to_owned();
+            let model = game::roster::weapon_model(db, &name);
+            let has = model
+                .as_deref()
+                .map(|g| baked.join(format!("side_{game}/weapons/{g}.glb")).exists());
+            let runs = run.contains(&s.slot);
+            println!(
+                "WHELD {game} {class:<26} slot {} ch{} {:<34} model {:<30} baked {:<5} sim {}",
+                s.slot + 1,
+                s.channel,
+                name,
+                model.as_deref().unwrap_or("-"),
+                has.map_or("-", |b| if b { "yes" } else { "NO" }),
+                if runs { "yes" } else { "no" },
+            );
+            if !runs {
+                continue;
+            }
+            match (model, has) {
+                (Some(_), Some(true)) => drawn += 1,
+                (None, _) => none += 1,
+                (Some(g), _) => missing.push(format!("{game} {class} slot {}: {g}", s.slot + 1)),
+            }
+        }
+    }
+    println!(
+        "WHELD: {} classes; slots the sim runs: {drawn} with a baked model, {none} with none, {} unbaked",
+        fielded.len(),
+        missing.len()
+    );
+    missing.sort();
+    missing.dedup();
+    assert!(missing.is_empty(), "unbaked hand models: {missing:#?}");
 }
 
 /// Card ZOOM acceptance 1, data-gated: the press sequence the PS2 gave live
@@ -1707,5 +1852,27 @@ fn the_baked_launchers_are_missiles_for_vehicles() {
             slot("cis_weap_inf_wrist_rocket").expect("the wrist rocket"),
         );
         assert!(blaster < rocket, "{blaster} {rocket}");
+    }
+}
+
+/// Card USKN (re-soldier-skeleton-skins 3, 5): a class with its own
+/// skeleton carries its SkeletonRootScale to the animator (the PS2 RAM's
+/// bone_root values), a human-rig class 1; a scale on a human-rig class
+/// would not count (the setters test SkeletonName first).
+#[test]
+fn own_skeleton_classes_carry_their_root_scale() {
+    let Some(dir) = classes_dir() else { return };
+    for (game, class, scale) in [
+        ("bf1", "all_inf_smuggler", 1.15),
+        ("bf1", "cis_inf_assault", 1.0),
+        ("bf1", "rep_inf_trooper", 1.0),
+        ("bf2", "cis_inf_officer", 1.24),
+        ("bf2", "all_inf_wookiee", 1.15),
+        ("bf2", "all_inf_sniper", 0.95),
+        ("bf2", "rep_inf_ep3_rifleman", 1.0),
+    ] {
+        let db = load_classdb_all(&dir, game);
+        let anim = game::roster::class_anim(&db, class, &db.weapon_slots(class));
+        assert_eq!(anim.root_scale, scale, "{game} {class}");
     }
 }

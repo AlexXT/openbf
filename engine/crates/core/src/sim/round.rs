@@ -32,7 +32,21 @@ impl Sim {
         // The playable level is walked from the posts (`sim/bounds.rs`).
         self.resolve_nav_floors();
         self.resolve_spawn_seats();
+        self.build_flank();
         self.cps.len() - 1
+    }
+
+    /// Card FLNK: (re)build the flank table between the posts' hubs
+    /// (`nav::flank`), each route's share drawn from the sim's seed - the
+    /// generator's state, read and not advanced, so no draw moves.
+    pub fn build_flank(&mut self) {
+        let posts: Vec<u16> = self.cps.iter().filter_map(|c| c.nav_hub).collect();
+        let seed = self.rng.state();
+        self.flank = self
+            .nav
+            .as_ref()
+            .map(|g| g.flank_table(&posts, seed))
+            .unwrap_or_default();
     }
 
     /// D12's team handicap: at Elite, a team that HAS a human whose

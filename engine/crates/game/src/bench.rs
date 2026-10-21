@@ -149,6 +149,46 @@ pub struct Report {
     pub stats: SceneStats,
     pub tick: Samples,
     pub frame: Samples,
+    /// GPU ms per section of the frame (`OPENBF_GPU_TIMING=1`; empty off).
+    pub gpu: Sections,
+}
+
+/// GPU ms per section of a frame (`Renderer::gpu_sections`), summed over the
+/// timed frames: (section, total ms, frames it appeared in), in first-seen
+/// order.
+#[derive(Default, Clone)]
+pub struct Sections {
+    rows: Vec<(&'static str, f64, u32)>,
+    frames: u32,
+}
+
+impl Sections {
+    /// Add one timed frame's sections (an empty slice is no frame).
+    pub fn add(&mut self, frame: &[(&'static str, f64)]) {
+        if frame.is_empty() {
+            return;
+        }
+        self.frames += 1;
+        for &(label, ms) in frame {
+            match self.rows.iter_mut().find(|r| r.0 == label) {
+                Some(r) => {
+                    r.1 += ms;
+                    r.2 += 1;
+                }
+                None => self.rows.push((label, ms, 1)),
+            }
+        }
+    }
+
+    /// (section, mean ms per timed frame) - a section a frame did not draw
+    /// counts 0 there - and the timed frame count.
+    pub fn means(&self) -> (Vec<(&'static str, f64)>, u32) {
+        let n = f64::from(self.frames.max(1));
+        (
+            self.rows.iter().map(|r| (r.0, r.1 / n)).collect(),
+            self.frames,
+        )
+    }
 }
 
 /// The fixed-tick budget one `Sim::step` has to fit inside (30 Hz, audit A5).
@@ -216,6 +256,15 @@ impl Report {
                 1000.0 / self.frame.mean().max(1e-6)
             );
         }
+        let (gpu, frames) = self.gpu.means();
+        if frames > 0 {
+            let total: f64 = gpu.iter().map(|g| g.1).sum();
+            let parts: Vec<String> = gpu.iter().map(|(l, ms)| format!("{l} {ms:.2}")).collect();
+            println!(
+                "gpu ms         total {total:.2} = {}   ({frames} timed frames)",
+                parts.join(", ")
+            );
+        }
     }
 
     pub const CSV_HEADER: &'static str =
@@ -255,6 +304,17 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sections_average_over_timed_frames() {
+        let mut s = Sections::default();
+        s.add(&[("sky", 1.0), ("models", 3.0)]);
+        s.add(&[]);
+        s.add(&[("sky", 2.0), ("hud", 4.0)]);
+        let (m, n) = s.means();
+        assert_eq!(n, 2);
+        assert_eq!(m, vec![("sky", 1.5), ("models", 1.5), ("hud", 2.0)]);
+    }
 
     #[test]
     fn percentiles_are_real_samples() {

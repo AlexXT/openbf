@@ -772,3 +772,601 @@ fn a_direction_falls_in_its_own_sector() {
     assert_eq!(sector_bit(Vec2::new(a.cos(), a.sin())), 1);
     assert_eq!(sector_bit(Vec2::ZERO), 0);
 }
+
+// ── Card TPOSR (AUDIT TPOS): the Tactician on a target out of sight, and
+// the rules no test refereed (the audit's 15 surviving mutations).
+
+/// The crate scene's bot at its covered position, then a wall 3 m high
+/// between it and its target: the target out of its sight, its record kept
+/// fresh (as hearing keeps it). The position held, `i`.
+fn hidden_scene() -> (Sim, UnitHandle, UnitHandle, u32) {
+    use crate::collision::{Body, Shape};
+    let enemy = Vec3::new(0.0, 0.0, -25.0);
+    let (mut sim, h, e) = crate_scene(Vec3::new(0.3, 0.0, 0.3), enemy);
+    run(&mut sim, e, 400, |_| {});
+    let u = sim.unit(h).expect("bot");
+    assert_eq!(u.ai.fight.mode, FightState::COVER, "at its position");
+    assert!(u.ai.tpos.covered, "with cover");
+    let i = u.ai.tpos.held.expect("a position");
+    sim.collision.push_body(Body::new(
+        glam::Mat4::from_translation(Vec3::new(0.0, 1.5, -22.0)),
+        Shape::Box {
+            half: Vec3::new(4.0, 1.5, 0.3),
+        },
+    ));
+    (sim, h, e, i)
+}
+
+/// One tick of the hidden scene: the bot's record of the target stamped
+/// now, as a sound would (`perception::hear`).
+fn heard(sim: &mut Sim, h: UnitHandle, e: UnitHandle, ticks: u32, mut each: impl FnMut(&Sim)) {
+    for _ in 0..ticks {
+        let t = sim.tick;
+        if let Some(u) = sim.unit_mut(h) {
+            for c in u.ai.contacts.iter_mut().flatten() {
+                if c.handle == e {
+                    c.last_seen = t;
+                }
+            }
+        }
+        run(sim, e, 1, &mut each);
+    }
+}
+
+/// A bot hidden at its position whose target is out of its sight runs its
+/// position as one in sight (the PS2's cover state machine runs every
+/// update): 20 s on, the position is still its own and reserved every tick,
+/// and its hide / fire swaps come within a think of their time (AUDIT TPOS:
+/// a hidden spell ran 94 s, 20 % of held time went unreserved).
+#[test]
+fn a_hidden_bot_keeps_its_reservation_and_its_cycle() {
+    let (mut sim, h, e, i) = hidden_scene();
+    sim.unit_mut(h).expect("bot").ai.tpos.next_at = u64::MAX / 2;
+    let (mut unseen, mut late, mut lapsed, mut lost) = (0u32, Vec::new(), Vec::new(), Vec::new());
+    let mut swaps = 0u32;
+    let mut was = None;
+    heard(&mut sim, h, e, 600, |s| {
+        let u = s.unit(h).expect("bot");
+        let c = crate::perception::contact_of(&u.ai, e).expect("remembered");
+        unseen += u32::from(!c.seen_now);
+        if u.ai.tpos.held != Some(i) || u.ai.fight.mode != FightState::COVER {
+            lost.push(s.tick);
+            return;
+        }
+        if u.ai.tpos.until <= s.tick {
+            lapsed.push(s.tick);
+        }
+        if s.tick > u.ai.tpos.phase_until + crate::ai::THINK_PERIOD {
+            late.push(s.tick);
+        }
+        swaps += u32::from(was.is_some_and(|f| f != u.ai.tpos.firing));
+        was = Some(u.ai.tpos.firing);
+    });
+    assert!(unseen >= 570, "out of sight: {unseen} of 600 ticks");
+    assert!(lost.is_empty(), "the position left at {lost:?}");
+    assert!(lapsed.is_empty(), "unreserved at {lapsed:?}");
+    assert!(late.is_empty(), "swaps over a think late at {late:?}");
+    assert!(swaps >= 4, "{swaps} swaps in 20 s");
+}
+
+/// ...and its leave tests run: hit twice out of sight of its target, it
+/// leaves the position at the next think and does not ask for it again;
+/// its 5-12 s timer is asked within a think of running out.
+#[test]
+fn a_hidden_bot_runs_its_leave_tests() {
+    let (mut sim, h, e, i) = hidden_scene();
+    sim.unit_mut(h).expect("bot").ai.tpos.next_at = u64::MAX / 2;
+    heard(&mut sim, h, e, 60, |_| {});
+    let (mut second, mut left) = (None, None);
+    let mut watch = |s: &Sim| {
+        let u = s.unit(h).expect("bot");
+        if second.is_none() && u.ai.tpos.hits >= 2 {
+            second = Some(s.tick);
+        }
+        if left.is_none() && u.ai.tpos.held != Some(i) {
+            left = Some(s.tick);
+        }
+        assert_ne!(
+            u.ai.tpos.held.filter(|_| left.is_some()),
+            Some(i),
+            "taken again"
+        );
+    };
+    for _ in 0..2 {
+        let t = sim.tick;
+        sim.unit_mut(h).expect("bot").last_hit = Some((e, t - 1));
+        heard(&mut sim, h, e, REACT_GAP as u32, &mut watch);
+    }
+    heard(&mut sim, h, e, 60, &mut watch);
+    let u = sim.unit(h).expect("bot");
+    assert!(
+        !crate::perception::contact_of(&u.ai, e)
+            .expect("remembered")
+            .seen_now,
+        "still out of sight"
+    );
+    let second = second.expect("hit twice");
+    let left = left.expect("it left the position hit twice");
+    assert!(
+        left <= second + crate::ai::THINK_PERIOD,
+        "left at {left}, hit twice by {second}"
+    );
+    assert!(u.ai.tpos.bad.contains(&Some(i)), "not asked for again");
+
+    // The timer, in a fresh scene.
+    let (mut sim, h, e, _) = hidden_scene();
+    heard(&mut sim, h, e, 30, |_| {});
+    let t0 = sim.tick;
+    sim.unit_mut(h).expect("bot").ai.tpos.next_at = t0;
+    heard(&mut sim, h, e, crate::ai::THINK_PERIOD as u32 + 1, |_| {});
+    let u = sim.unit(h).expect("bot");
+    assert!(
+        u.ai.tpos.next_at > sim.tick || !u.ai.fight.tactician() || u.ai.tpos.at > t0,
+        "the timer was not asked: next_at {} at {}",
+        u.ai.tpos.next_at,
+        sim.tick
+    );
+}
+
+/// Flat ground (`l_sim`), the bot at `bot` facing an enemy at `enemy`, and
+/// the position table replaced by `table`.
+fn flat_scene(bot: Vec3, enemy: Vec3, table: Vec<Position>) -> (Sim, UnitHandle, UnitHandle) {
+    let (mut sim, h) = super::super::tests::l_sim();
+    let e = sim.spawn(&UnitSpec::trooper(1, enemy)).expect("enemy");
+    let u = sim.unit_mut(h).expect("bot");
+    u.soldier.pos = bot;
+    u.soldier.yaw = crate::ai::yaw_toward(enemy - bot);
+    let stats = sim.positions.stats;
+    sim.positions = PositionTable::index(table, stats);
+    (sim, h, e)
+}
+
+/// A position at `p` with LOW cover (shut at crouch height, open over it)
+/// toward `toward`.
+fn low_toward(p: Vec3, toward: Vec3) -> Position {
+    let bits = sector_pair(xz(toward - p));
+    Position {
+        pos: p,
+        source: Source::Edge,
+        facing: Vec2::ZERO,
+        stance: 0,
+        stance2: 0,
+        hub: u16::MAX,
+        low: bits,
+        corner: 0,
+        shut: bits,
+        tall: 0,
+    }
+}
+
+/// Bot `h`'s Tactician asked once, against its seen enemy `e`.
+fn ask(sim: &Sim, h: UnitHandle, e: UnitHandle, leaving: Option<(u32, bool)>) -> Option<Pick> {
+    let u = sim.unit(h).expect("bot");
+    let tk = crate::ai::behave::Tick {
+        me: h,
+        u,
+        eye: u.muzzle(),
+        wc: &sim.weapon_classes[u.weapon_class],
+        tier: sim.difficulty.tier(),
+        skill: sim.difficulty.skill_at(u.skill),
+    };
+    let mut nt = NavTick::default();
+    let foe = Foe::seen(sim.unit(e).expect("enemy"));
+    choose(sim, &tk, &u.ai, &foe, leaving, false, &mut nt)
+}
+
+/// A position just LEFT stays reserved [`FREE_AFTER`] (the PS2's hint
+/// rule): a teammate that left the crate's covered point a moment ago keeps
+/// the bot off it and off every point within [`SPACING`] of it; once the 2 s
+/// are over the bot takes the cover.
+#[test]
+fn a_position_just_left_stays_reserved() {
+    let (mut sim, h, e) = two_hub_scene();
+    let cov = covered_at_a(&sim);
+    let centre = *cov
+        .iter()
+        .min_by(|a, b| {
+            let p = |i: u32| sim.positions.positions[i as usize].pos.length();
+            p(**a).total_cmp(&p(**b))
+        })
+        .expect("a covered point");
+    let c = sim.positions.positions[centre as usize].pos;
+    let m = sim
+        .spawn(&UnitSpec::trooper(0, Vec3::new(30.0, 0.0, 30.0)))
+        .expect("mate");
+    // Every tick the mate holds the centre and leaves it (`release`).
+    let leave = |s: &mut Sim| {
+        let t = s.tick;
+        let mu = s.unit_mut(m).expect("mate");
+        mu.ai.tpos.held = Some(centre);
+        release(&mut mu.ai, t);
+    };
+    let mut near = Vec::new();
+    for _ in 0..240 {
+        leave(&mut sim);
+        run(&mut sim, e, 1, |s| {
+            let u = s.unit(h).expect("bot");
+            if let Some(q) =
+                u.ai.tpos
+                    .held
+                    .map(|i| s.positions.positions[i as usize].pos)
+            {
+                if nav::xz_dist(q, c) < SPACING {
+                    near.push(s.tick);
+                }
+            }
+        });
+    }
+    assert!(
+        near.is_empty(),
+        "held within {SPACING} m of a left position at {near:?}"
+    );
+    let u = sim.unit_mut(h).expect("bot");
+    assert_eq!(u.ai.fight.mode, FightState::COVER, "at an open position");
+    u.ai.tpos.next_at = u64::MAX / 2;
+    // The mate's last leave is over its 2 s at the bot's next ask.
+    let mut covered = false;
+    run(&mut sim, e, (FREE_AFTER + 2 * RETRY) as u32, |s| {
+        let u = s.unit(h).expect("bot");
+        covered |= u.ai.tpos.held.is_some() && u.ai.tpos.covered;
+    });
+    assert!(covered, "it took the cover once the 2 s were over");
+}
+
+/// A Cover hint covers from a target its arrow points at only from the
+/// bot's side of that target (the PS2's `(H - T).(T - me) < 0`,
+/// re-soldier-ai 4.6): of two hints pointing at the target, the one on the
+/// far side is no cover.
+#[test]
+fn a_cover_hint_covers_only_on_the_bots_side_of_the_target() {
+    let (enemy, bot) = (Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0));
+    let hint = |p: Vec3| Position {
+        pos: p,
+        source: Source::Cover,
+        facing: xz(enemy - p).normalize(),
+        stance: 0,
+        stance2: 0,
+        hub: u16::MAX,
+        low: 0,
+        corner: 0,
+        shut: 0,
+        tall: 0,
+    };
+    // Near: 7.2 m from the bot, on its side; far: 14.6 m, beyond the target.
+    let table = vec![
+        hint(Vec3::new(4.0, 0.0, 4.0)),
+        hint(Vec3::new(-4.0, 0.0, 4.0)),
+    ];
+    let (sim, h, e) = flat_scene(bot, enemy, table);
+    let p = ask(&sim, h, e, None).expect("a position");
+    let at = sim.positions.positions[p.idx as usize].pos;
+    assert_eq!(
+        (at, p.covered),
+        (Vec3::new(4.0, 0.0, 4.0), true),
+        "the near side's hint, as cover"
+    );
+}
+
+/// The tier's "move" share of hits leaves the position on ONE hit (card
+/// REACT's row): with the share at 1 every hit does, at 0 none does.
+#[test]
+fn the_tiers_move_share_leaves_on_one_hit() {
+    let enemy = Vec3::new(0.0, 0.0, -25.0);
+    let (mut sim, h, e) = crate_scene(Vec3::new(0.3, 0.0, 0.3), enemy);
+    run(&mut sim, e, 400, |_| {});
+    for (share, hits) in [(1.0, 2), (0.0, 1)] {
+        let u = sim.unit(h).expect("bot");
+        assert_eq!(u.ai.fight.mode, FightState::COVER);
+        let mut tier = sim.difficulty.tier();
+        tier.react[2] = share;
+        let tk = crate::ai::behave::Tick {
+            me: h,
+            u,
+            eye: u.muzzle(),
+            wc: &sim.weapon_classes[u.weapon_class],
+            tier,
+            skill: sim.difficulty.skill_at(u.skill),
+        };
+        let mut st = u.ai;
+        st.tpos.hits = 0;
+        hit(&sim, &tk, &mut st);
+        assert_eq!(st.tpos.hits, hits, "share {share}");
+    }
+}
+
+/// A CORNER position (shut at both heights toward the target) leans out to
+/// whichever side has the line: a pillar in front of it and to its right,
+/// the left step's.
+#[test]
+fn a_corner_leans_to_the_side_with_the_line() {
+    use crate::collision::{Body, Shape};
+    let (enemy, at) = (Vec3::new(0.0, 0.0, -15.0), Vec3::ZERO);
+    let mut q = low_toward(at, enemy);
+    (q.low, q.corner, q.tall) = (0, q.shut, q.shut);
+    let (mut sim, h, e) = flat_scene(Vec3::new(0.0, 0.0, 3.0), enemy, vec![q]);
+    // (The lean side +1 is +x here: `firing_eye`.)
+    sim.collision.push_body(Body::new(
+        glam::Mat4::from_translation(Vec3::new(0.3, 1.5, -1.5)),
+        Shape::Box {
+            half: Vec3::new(1.0, 1.5, 0.3),
+        },
+    ));
+    assert!(!line_open(
+        &sim,
+        firing_eye(at, enemy, 1),
+        sim.unit(e).expect("e").muzzle()
+    ));
+    let p = ask(&sim, h, e, None).expect("a position");
+    assert_eq!((p.covered, p.lean), (true, -1));
+}
+
+/// A position in a teammate's line of fire (within [`LINE`] of it) is not
+/// chosen; out of it, it is.
+#[test]
+fn a_position_in_a_friends_line_of_fire_is_not_chosen() {
+    let (enemy, p) = (Vec3::new(0.0, 0.0, -20.0), Vec3::new(0.0, 0.0, -6.0));
+    let (mut sim, h, e) = flat_scene(Vec3::new(4.0, 0.0, -4.0), enemy, vec![low_toward(p, enemy)]);
+    assert!(ask(&sim, h, e, None).is_some(), "no friend: taken");
+    let m = sim
+        .spawn(&UnitSpec::trooper(0, Vec3::new(0.0, 0.0, 4.0)))
+        .expect("mate");
+    let t = sim.tick;
+    let mu = sim.unit_mut(m).expect("mate");
+    mu.ai.target = Some(e);
+    mu.ai.contacts[0] = Some(crate::perception::Contact {
+        handle: e,
+        first_seen: t,
+        last_seen: t,
+        last_pos: enemy,
+        seen_now: true,
+        heard: false,
+        told: false,
+    });
+    assert!(ask(&sim, h, e, None).is_none(), "in the mate's line");
+}
+
+/// A position by a grenade on the ground (inside its warning radius) is
+/// not chosen.
+#[test]
+fn a_position_by_a_grenade_is_not_chosen() {
+    let (enemy, p) = (Vec3::new(0.0, 0.0, -20.0), Vec3::new(0.0, 0.0, -6.0));
+    let (mut sim, h, e) = flat_scene(Vec3::new(4.0, 0.0, -4.0), enemy, vec![low_toward(p, enemy)]);
+    assert!(ask(&sim, h, e, None).is_some(), "no grenade: taken");
+    sim.hazards.push(crate::sim::Hazard {
+        pos: p + Vec3::new(1.0, 0.0, 0.0),
+        radius: 3.0,
+        since: 0,
+        until: u64::MAX,
+        owner: None,
+    });
+    assert!(ask(&sim, h, e, None).is_none(), "by the grenade");
+}
+
+/// The weapon's band is grown OUTWARD by [`BAND_GROW`] at both edges: a
+/// position 2 m inside its inner edge is still a candidate.
+#[test]
+fn the_band_is_grown_at_its_inner_edge() {
+    let enemy = Vec3::new(0.0, 0.0, -20.0);
+    let (sim, h, e) = flat_scene(Vec3::new(3.0, 0.0, -10.0), enemy, Vec::new());
+    let wc = &sim.weapon_classes[sim.unit(h).expect("bot").weapon_class];
+    let [lo, opt, _] = wc.ai_range;
+    let edge = opt.min(lo + 3.0);
+    // (Never on the target's own feet: a body stands within 1.5 m.)
+    let d = (edge - 2.0).max(CROWD + 0.5);
+    assert!(d < edge && d > edge - BAND_GROW, "edge {edge}, d {d}");
+    let p = enemy + Vec3::new(0.0, 0.0, d);
+    let (sim, h, e2) = flat_scene(
+        Vec3::new(3.0, 0.0, -10.0),
+        enemy,
+        vec![low_toward(p, enemy)],
+    );
+    let _ = e;
+    assert!(
+        ask(&sim, h, e2, None).is_some(),
+        "{d} m from the target, edge {edge}"
+    );
+}
+
+/// The confirming ray: a position whose firing point has no line to the
+/// target (a wall in front, whatever its masks say) is not chosen.
+#[test]
+fn a_position_with_no_line_to_the_target_is_not_chosen() {
+    use crate::collision::{Body, Shape};
+    let (enemy, p) = (Vec3::new(0.0, 0.0, -20.0), Vec3::new(0.0, 0.0, -6.0));
+    let (mut sim, h, e) = flat_scene(Vec3::new(4.0, 0.0, -4.0), enemy, vec![low_toward(p, enemy)]);
+    assert!(ask(&sim, h, e, None).is_some(), "a line: taken");
+    sim.collision.push_body(Body::new(
+        glam::Mat4::from_translation(Vec3::new(0.0, 2.0, -9.0)),
+        Shape::Box {
+            half: Vec3::new(2.0, 2.0, 0.3),
+        },
+    ));
+    assert!(ask(&sim, h, e, None).is_none(), "a wall in the line");
+}
+
+/// Another position, when one is left (not with the target round its
+/// cover), lies [`MOVE_MIN`] from it: a covered one 2 m off is not taken.
+#[test]
+fn a_position_two_metres_from_the_one_left_is_not_taken() {
+    let enemy = Vec3::new(0.0, 0.0, -20.0);
+    let (left, next) = (Vec3::new(0.0, 0.0, -2.0), Vec3::new(2.0, 0.0, -2.0));
+    let table = vec![low_toward(left, enemy), low_toward(next, enemy)];
+    let (sim, h, e) = flat_scene(Vec3::new(2.0, 0.0, 0.0), enemy, table);
+    let idx = |p: Vec3| {
+        (0..sim.positions.positions.len() as u32)
+            .find(|&i| sim.positions.positions[i as usize].pos == p)
+            .expect("in the table")
+    };
+    let (l, n) = (idx(left), idx(next));
+    assert!(ask(&sim, h, e, None).is_some(), "asked afresh: one of them");
+    assert_eq!(ask(&sim, h, e, Some((l, false))), None, "leaving the first");
+    assert_eq!(
+        ask(&sim, h, e, Some((l, true))).map(|p| p.idx),
+        Some(n),
+        "the target round its cover: any other"
+    );
+}
+
+/// B12's counter: fighting at its position with cover from its target -
+/// within [`NEAR_ENOUGH`] of the position, the target on its shut side.
+#[test]
+fn covered_from_target_counts_only_at_the_position_and_its_cover() {
+    let enemy = Vec3::new(0.0, 0.0, -25.0);
+    let (mut sim, h, e) = crate_scene(Vec3::new(0.3, 0.0, 0.3), enemy);
+    run(&mut sim, e, 400, |_| {});
+    let u = sim.unit(h).expect("bot");
+    let q = sim.positions.positions[u.ai.tpos.held.expect("a position") as usize].pos;
+    for (off, toward, yes) in [
+        (1.0, enemy, true),
+        (3.0, enemy, false),
+        (1.0, Vec3::new(0.0, 0.0, 25.0), false),
+    ] {
+        let u = sim.unit_mut(h).expect("bot");
+        u.soldier.pos = q + Vec3::new(off, 0.0, 0.0);
+        for c in u.ai.contacts.iter_mut().flatten() {
+            c.last_pos = toward;
+        }
+        let u = sim.unit(h).expect("bot");
+        assert_eq!(u.ai.fight.mode, FightState::COVER);
+        assert_eq!(
+            covered_from_target(&sim, u),
+            yes,
+            "{off} m off, target at {toward}"
+        );
+    }
+}
+
+/// A position more than [`CLIMB`] above the bot is walked onto only when
+/// its floor is its hub's: one 2 m up with no hub is not chosen, one 1 m up
+/// is.
+#[test]
+fn a_position_two_metres_up_off_its_hub_is_not_chosen() {
+    let enemy = Vec3::new(0.0, 0.0, -20.0);
+    for (dy, yes) in [(2.0, false), (1.0, true)] {
+        let p = Vec3::new(0.0, dy, -6.0);
+        let (sim, h, e) = flat_scene(Vec3::new(4.0, 0.0, -4.0), enemy, vec![low_toward(p, enemy)]);
+        assert_eq!(ask(&sim, h, e, None).is_some(), yes, "{dy} m up");
+    }
+}
+
+/// A walk to a position is given its straight length at [`TAKE_SPEED`] and
+/// [`TAKE_SLACK`] more: 7.3 s for the crate's 13 m (a pinned bot's walk
+/// ends by the mover's own 2 s give-up first, so the deadline is read where
+/// it is drawn).
+#[test]
+fn a_walk_to_a_position_is_given_its_length_at_3_m_a_second_and_3_s() {
+    let (mut sim, h, e) = two_hub_scene();
+    let mut took = None;
+    run(&mut sim, e, 120, |s| {
+        let u = s.unit(h).expect("bot");
+        if took.is_none() && u.ai.fight.mode == FightState::TAKE {
+            took = Some((u.ai.tpos.at, u.ai.tpos.best, u.ai.tpos.phase_until));
+        }
+    });
+    let (t0, travel, deadline) = took.expect("it took a position to walk to");
+    assert!(travel > 10.0, "{travel} m");
+    // Hard-coded: 3 m/s and 3 s at 30 ticks a second.
+    let due = t0 + ((travel / 3.0 + 3.0) * 30.0) as u64;
+    assert!(
+        deadline.abs_diff(due) <= 1,
+        "deadline {deadline}, due {due} ({travel} m)"
+    );
+}
+
+/// A bot at its Tactician's position does not step out of a friend's line
+/// (card FFLN's step is the fallback stander's): with a teammate standing in
+/// its line to the target, no step is taken - its goal stays where it stands
+/// and the step's own marks on the hold (the commit time, the side) are the
+/// take's. (The cycle puts a stepped goal back on the same think; the marks
+/// stay with a bot that falls back to its own fight. A bot walking to its
+/// position is not a holder: no step either way.)
+#[test]
+fn a_bot_at_its_position_does_not_step_out_of_a_friends_line() {
+    let enemy = Vec3::new(0.0, 0.0, -25.0);
+    let (mut sim, h, e) = crate_scene(Vec3::new(0.3, 0.0, 0.3), enemy);
+    run(&mut sim, e, 400, |_| {});
+    let u = sim.unit(h).expect("bot");
+    assert_eq!(u.ai.fight.mode, FightState::COVER);
+    let i = u.ai.tpos.held.expect("a position");
+    let stand = u.ai.tpos.stand;
+    let marks = u.ai.hold.map(|hs| (hs.commit_until, hs.strafe_side));
+    sim.unit_mut(h).expect("bot").ai.tpos.next_at = u64::MAX / 2;
+    // A friend 6 m down the line, standing.
+    let mid = stand + (enemy - stand).normalize() * 6.0;
+    let _m = sim
+        .spawn(&UnitSpec::trooper(0, Vec3::new(mid.x, 0.0, mid.z)))
+        .expect("mate");
+    let (mut at, mut off) = (0u32, Vec::new());
+    run(&mut sim, e, 240, |s| {
+        let u = s.unit(h).expect("bot");
+        if u.ai.tpos.held != Some(i) {
+            return;
+        }
+        at += 1;
+        let hs = u.ai.hold.expect("a hold");
+        if nav::xz_dist(hs.goal, stand) > LEAN + 0.1
+            || Some((hs.commit_until, hs.strafe_side)) != marks
+        {
+            off.push(s.tick);
+        }
+    });
+    assert!(at >= 200, "at its position {at} ticks");
+    assert!(off.is_empty(), "stepped at {off:?}");
+}
+
+/// The hidden scene's target known only from a friend (a told record: no
+/// rule of the fight runs on it, card TEAM) from the tick before a think:
+/// the position stays reserved every tick it is still held, and a position
+/// hit twice is left at the next think, not when the hold runs out.
+#[test]
+fn a_bot_on_a_told_record_keeps_its_reservation_and_leaves_hit_twice() {
+    for hit_twice in [false, true] {
+        let (mut sim, h, e, i) = hidden_scene();
+        sim.unit_mut(h).expect("bot").ai.tpos.next_at = u64::MAX / 2;
+        heard(&mut sim, h, e, 30, |_| {});
+        while sim.unit(h).expect("bot").ai.next_think != sim.tick + 1 {
+            heard(&mut sim, h, e, 1, |_| {});
+        }
+        let t0 = sim.tick;
+        let (mut lapsed, mut left) = (Vec::new(), None);
+        for k in 0..120u64 {
+            let t = sim.tick;
+            let u = sim.unit_mut(h).expect("bot");
+            for c in u.ai.contacts.iter_mut().flatten() {
+                if c.handle == e {
+                    (c.last_seen, c.told) = (t, true);
+                }
+            }
+            if hit_twice && k == 2 {
+                u.ai.tpos.hits = 2;
+            }
+            run(&mut sim, e, 1, |s| {
+                let u = s.unit(h).expect("bot");
+                if u.ai.tpos.held == Some(i) && u.ai.fight.tactician() {
+                    if u.ai.tpos.until <= s.tick {
+                        lapsed.push(s.tick);
+                    }
+                } else if left.is_none() {
+                    left = Some(s.tick);
+                }
+            });
+        }
+        let left = left.expect("the hold ran out");
+        assert!(
+            lapsed.is_empty(),
+            "held unreserved at {lapsed:?} (from {t0})"
+        );
+        if hit_twice {
+            assert!(
+                left <= t0 + 3 + crate::ai::THINK_PERIOD,
+                "hit twice at {}, left at {left}",
+                t0 + 2
+            );
+        } else {
+            assert!(
+                left > t0 + crate::ai::THINK_PERIOD,
+                "kept a while: left at {left}"
+            );
+        }
+    }
+}

@@ -150,3 +150,132 @@ fn a_battle_beside_an_idle_player_prints_only_post_lines_and_his_own_death() {
     println!("the idle player's statistics: {st:?}");
     assert_eq!(st.kills, 0);
 }
+
+/// The spawn screen's class names come from the discs' text (card SPSEL):
+/// every class the six showcase missions field resolves `entity.<side>.<rest>`
+/// in its own game's table — BF2 Hoth's Snowtrooper, BF1 Naboo's Rebels'
+/// "Wookiee Smuggler" — never the roster's `UnitType` fallback.
+#[test]
+fn every_showcase_class_has_the_discs_name() {
+    if !has_text() || !assets().join("common_bf1/locl/english.ron").is_file() {
+        return;
+    }
+    let missions = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../missions"));
+    for file in [
+        "bf1_nab1_con.ron",
+        "tat1_con.ron",
+        "bf1_yav2_con.ron",
+        "bf2_uta1_con.ron",
+        "bf2_myg1_con.ron",
+        "bf2_hot1_con.ron",
+    ] {
+        let m = MissionDef::load(&missions.join(file)).expect("mission");
+        let texts = game::event_feed::Texts::load(&assets(), &m.source_game);
+        for team in &m.teams {
+            let names: Vec<String> = team
+                .classes
+                .iter()
+                .map(|c| {
+                    texts
+                        .class_name(&c.0)
+                        .unwrap_or_else(|| panic!("{file}: {} has no name", c.0))
+                })
+                .collect();
+            println!("{file} {}: {}", team.faction, names.join(", "));
+        }
+    }
+    let texts = game::event_feed::Texts::load(&assets(), "bf2");
+    assert_eq!(
+        texts.class_name("imp_inf_rifleman_snow").as_deref(),
+        Some("Snowtrooper")
+    );
+    assert_eq!(
+        texts.class_name("rep_inf_ep3_sniper").as_deref(),
+        Some("Clone Sharpshooter")
+    );
+    let texts = game::event_feed::Texts::load(&assets(), "bf1");
+    assert_eq!(
+        texts.class_name("all_inf_smuggler").as_deref(),
+        Some("Wookiee Smuggler")
+    );
+    assert_eq!(texts.class_name("nosuchside"), None);
+}
+
+/// Card SPSEL on a baked map (shares this suite's battle helper): BF2 Hoth's
+/// player dies, one D-pad Right on the spawn map takes the post the PS2's
+/// rule gives from the post nearest his body, the spawn screen shows it, and
+/// he comes back on one of THAT post's nodes.
+#[test]
+fn a_dead_player_picks_a_post_on_hoth_and_spawns_there() {
+    let Some((mut walk, game)) = battle("bf2_hot1", "bf2_hot1_con.ron") else {
+        return;
+    };
+    let _ = game;
+    let i = walk.player.index as usize;
+    let team = walk.sim.units[i].team;
+    let body = walk.sim.units[i].soldier.pos;
+    walk.sim.units[i].alive = false;
+    walk.sim.units[i].respawn_at = Some(walk.sim.tick + 30);
+    walk.sim.battle.teams[usize::from(team)].alive_players -= 1;
+    let posts = walk.sim.player_spawn_posts(team);
+    assert!(posts.len() >= 2, "{posts:?}");
+    let nearest = posts
+        .iter()
+        .min_by(|a, b| a.1.distance(body).total_cmp(&b.1.distance(body)))
+        .unwrap();
+    // The push that has a post ahead of the nearest one.
+    let arms = [
+        (core::sim::buttons::SPAWN_POST_RIGHT, glam::Vec2::X),
+        (core::sim::buttons::SPAWN_POST_LEFT, -glam::Vec2::X),
+        (core::sim::buttons::SPAWN_POST_DOWN, glam::Vec2::Y),
+        (core::sim::buttons::SPAWN_POST_UP, -glam::Vec2::Y),
+    ];
+    let (bit, want) = arms
+        .iter()
+        .find_map(|&(bit, d)| {
+            core::sim::Sim::pick_spawn_post(&posts, Some(nearest.0), nearest.1, d).map(|p| (bit, p))
+        })
+        .expect("some post lies some way");
+    let press = core::sim::PadState {
+        buttons: bit,
+        ..Default::default()
+    };
+    walk.step_tick(std::slice::from_ref(&press));
+    assert_eq!(walk.sim.spawn_post_selected(0), Some(want));
+    let row = spawn_screen_row(&walk);
+    assert!(row.is_some(), "the spawn screen highlights the pick");
+    println!(
+        "posts {posts:?}; pushed {bit:#x} from {:?} to {want:?}; screen row {row:?}",
+        nearest.0
+    );
+    let idle = core::sim::PadState::default();
+    for _ in 0..600 {
+        if walk.sim.units[i].alive {
+            break;
+        }
+        walk.step_tick(std::slice::from_ref(&idle));
+    }
+    let me = &walk.sim.units[i];
+    assert!(me.alive, "respawned");
+    let nodes = walk.sim.spawn_post_nodes(team, want);
+    let d = nodes
+        .iter()
+        .map(|(n, _)| glam::Vec2::new(n.x - me.soldier.pos.x, n.z - me.soldier.pos.z).length())
+        .fold(f32::INFINITY, f32::min);
+    println!(
+        "spawned at {:?}, {d:.2} m from the nearest of the post's {} nodes",
+        me.soldier.pos,
+        nodes.len()
+    );
+    assert!(d < 1.0, "{d} m off post {want:?}'s nodes");
+}
+
+/// The spawn screen's highlighted row, as the game builds it: the sim's
+/// pick's index in `player_spawn_posts` (what `spawn_model` shows).
+fn spawn_screen_row(walk: &WalkSim) -> Option<usize> {
+    let team = walk.sim.units[walk.player.index as usize].team;
+    let list = walk.sim.player_spawn_posts(team);
+    walk.sim
+        .spawn_post_selected(0)
+        .and_then(|p| list.iter().position(|q| q.0 == p))
+}

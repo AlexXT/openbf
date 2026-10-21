@@ -57,9 +57,9 @@ use std::sync::{Arc, Mutex, Weak};
 /// steering's own direction (`walk*`), the hold / boarding fields, the build's
 /// commit, each trail's last tick. 3 (card SNDB): the sound rows. 4 (card
 /// OBST2): a unit's behaviour and its going-round commitment. 5 (card
-/// CPBAR): a post's units inside per team and its two times. An older file
-/// still reads.
-pub const SCHEMA: u32 = 5;
+/// CPBAR): a post's units inside per team and its two times. 6 (card HITCH):
+/// the frame record (`hitches`). An older file still reads.
+pub const SCHEMA: u32 = 6;
 /// Ticks between two unit frames (0.5 s).
 pub const UNIT_PERIOD: u64 = core::TICK_HZ as u64 / 2;
 /// Ticks between two world frames (2 s).
@@ -549,6 +549,11 @@ pub struct Snapshot {
     /// before card SNDB, by a headless round or with no sound device).
     #[serde(default)]
     pub sounds: Vec<SoundRow>,
+    /// The battle's frame record (card HITCH, `game::frame_profile`): the
+    /// frame times' summary and the slow frames with their breakdown. None
+    /// before schema 6, in a headless round or with the record off.
+    #[serde(default)]
+    pub hitches: Option<crate::frame_profile::Hitches>,
 }
 
 /// The stuck alarm's watch on the human.
@@ -592,6 +597,8 @@ pub struct Ring {
     human: i32,
     focus: Focus,
     alarm: Alarm,
+    /// The windowed game's frame record (card HITCH), read at a snapshot.
+    hitches: Option<Arc<Mutex<crate::frame_profile::Record>>>,
 }
 
 fn r2(v: f32) -> f32 {
@@ -667,6 +674,7 @@ impl Ring {
                 ..Focus::default()
             },
             alarm: Alarm::default(),
+            hitches: None,
         }
     }
 
@@ -1113,6 +1121,7 @@ impl Ring {
             ("trails", "each unit's last 10 s of positions at 4 Hz, oldest first, ending at its own tick: header.trail_tick for a unit alive then, earlier for one that died (its slot not yet respawned); gen is that life's generation"),
             ("header", "build_commit / build_dirty: the commit the BINARY was built from (the code that ran); commit / dirty: the checkout's HEAD when the battle started; build_time: the executable's mtime, s since the epoch"),
             ("sounds", "every one-shot the mixer was handed in the last 60 s, oldest first: tick, name (names.sounds: the property), take (names.takes: the file under the baked root), gain (linear, the level by distance included), ears (what each ear got [left, right]: the gain x the bus, a 3-D sound split by the PS2's per-ear law, card MIXH), pitch (playback rate), dist (m from the listener, 0 = a 2-D line), voices (one-shots still sounding by their length + engine loops), secs (the take's length at that pitch). Not in it: the engine loops themselves and the music"),
+            ("hitches", "the windowed game's frame record (card HITCH): frames, the seconds they span, p50 / p99 / worst ms (a frame = its start to the next frame's start), over = frames longer than limit_ms past the battle's first settle_s seconds, per_min of them, made_frames = frames that made GPU objects; slow = the newest frames over limit_ms, worst = the longest past settle_s; a row: t (s since the battle's first frame), tick, ms, laps (the frame's phases in order: sim = the ticks with their hook, update, draws, render = render_frame with its image wait acquire_ms, other = the time outside them), ticks run, ai_ms / hook_ms (inside sim), gpu_ms (with OPENBF_GPU_TIMING=1, a frame or two old), made (kind, label, bytes of each GPU object made)"),
             ("focus", "what the human looked at when it was written: unit slot, how it was picked, the eye, the view direction, the world point under the reticle"),
         ] {
             legend.insert(k.to_owned(), v.to_owned());
@@ -1155,6 +1164,11 @@ impl Ring {
                     }
                 })
                 .collect(),
+            // `try_lock`: the panic hook may run while a frame holds it.
+            hitches: self
+                .hitches
+                .as_ref()
+                .and_then(|h| h.try_lock().ok().map(|r| r.hitches())),
         }
     }
 }
@@ -1472,6 +1486,11 @@ impl BlackBox {
         let mut r = locked(&self.ring);
         *r.frame_ms.next() = dt * 1000.0;
         r.window = window;
+    }
+
+    /// The frame record its snapshots carry (card HITCH; None = none).
+    pub fn frame_record(&mut self, rec: Option<Arc<Mutex<crate::frame_profile::Record>>>) {
+        locked(&self.ring).hitches = rec;
     }
 
     /// The commander said `line`.

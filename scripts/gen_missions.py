@@ -942,7 +942,8 @@ def facts_from_calls(seq):
          "death_regions": [], "attacking": None, "spawn": None,
          "cps": [], "posts": [], "killed": [], "layers": [], "numbots": None,
          "vo_bleed": [], "vo_low": [], "vo_oob": [],
-         "mus_amb": [], "mus_vic": [], "mus_def": [], "sound": []}
+         "mus_amb": [], "mus_vic": [], "mus_def": [], "sound": [],
+         "shots": []}
 
     def ti(v):
         return int(v) if isinstance(v, float) and v == int(v) else None
@@ -1044,6 +1045,13 @@ def facts_from_calls(seq):
             if t:
                 d["mus_vic" if c.name == "SetVictoryMusic"
                   else "mus_def"].append((t, a[1]))
+        # The spawn screens' backdrops (card SSELB, re-spawn-flow 1.1):
+        # AddCameraShot(qw, qx, qy, qz, x, y, z); the PS2 keeps the first 16
+        # (B2:31916).
+        elif c.name == "AddCameraShot" and len(a) >= 7 and \
+                all(isinstance(v, float) for v in a[:7]):
+            if len(d["shots"]) < 16:
+                d["shots"].append(tuple(a[:7]))
         # The sound sub-levels the script loads (card SNDE):
         # ReadDataFile("sound\\kas.lvl;kas2gcw") -> ("kas", "kas2gcw").
         elif c.name == "ReadDataFile" and a and isinstance(a[0], str) and \
@@ -1105,6 +1113,7 @@ def build(key, game, planet, era, pc_stem, ps2_name):
     m.mus_vic = (ps2 or {}).get("mus_vic", [])
     m.mus_def = (ps2 or {}).get("mus_def", [])
     m.sound = (ps2 or {}).get("sound", [])
+    m.shots = (ps2 or {}).get("shots", [])
     m.strings = set(consts(f, str)) if f is not None else set()
     m.arc_blocks = arc_calls50(f) if f is not None and game == "bf2" else []
     m.barriers = barrier_calls50(f) if f is not None and game == "bf2" else []
@@ -1350,6 +1359,14 @@ def ron(m):
                      % (key, ", ".join('(%d, "%s")' % (t, n)
                                        for t, n in rows)))
         L.append("    ),")
+    if m.shots:
+        L.append("    // The spawn screens' backdrops: AddCameraShot(qw, qx, qy, qz, "
+                 "x, y, z) in call")
+        L.append("    // order, the first 16 (the PS2's cap).")
+        L.append("    camera_shots: [")
+        for sh in m.shots:
+            L.append("        (%s)," % ", ".join(f32_text(v) for v in sh))
+        L.append("    ],")
     if m.locals:
         L.append("    // locals = (first AddUnitClass of team %d, its "
                  "SetUnitCount)." % m.locals_team)

@@ -15,7 +15,8 @@
 #           the bake's own output files, bake_trees() below), the older literal names lead_tmp/<name>/{baked,bake,before,
 #           bake_before,bake_after,smoke,full_after,baked_after,c2_before,c2_after,goldens_committed,nd,base,spot1..6,…}, lead_tmp/roster_bake,
 #           and the superseded s13 scratch bake + pre-s13 walkabout set (s13/baked, s13/walkabout_before) — regenerable from scripts/scratch_bake.sh (recipes are in the
-#           branch READMEs). Skipped while a branch/worktree named <name> exists or a card <NAME>.md is not done.
+#           branch READMEs). Skipped while a branch/worktree named <name> exists, a card <NAME>.md is not done, or a file
+#           in the top three levels of lead_tmp/<name>/ changed in the last 3 hours (a running session's scratch).
 #   Tier C  small stale files the audit verified unreferenced: the session-8 copy of NEXT_SESSION_PROMPT.md
 #           at the artifacts root, briefs/*.bak_*, loose lead_tmp/*.log, lead_tmp/ordnance, __pycache__ dirs.
 # What it NEVER touches: engine/assets_baked, engine/goldens, engine/target, engine/artifacts/{loop,briefs
@@ -53,18 +54,22 @@ case "${1:-}" in
     mk "$T/engine/artifacts/loop/cards/OPENC.md"; printf -- '---\nid: OPENC\nstatus: todo\n---\n' > "$T/engine/artifacts/loop/cards/OPENC.md"
     mk "$L/openc/pics/a.png"; mkdir -p "$L/openc/pics/side_bf1/soldiers"   # not: an open card's evidence, branch or none
     printf -- '---\nid: DONEC\nstatus: done\n---\n' > "$T/engine/artifacts/loop/cards/DONEC.md"; mk "$L/donec/bake/tat1/manifest.ron"   # listed: landed
+    mk "$L/donec/pics/a.png"; mkdir -p "$L/donec/pics/side_bf1/soldiers"   # a landed card's pictures stay; only the bake group beside them is listed
     mk "$D/models/bf1_hot1_hoth_cannon/manifest.ron"              # not: a single-model export
     ln -s "$T/engine/assets_baked" "$D/link_to_shipped"           # not: find does not follow it
     ln -s "$T/engine/assets_baked" "$D/bake"                      # a literal name, but it resolves into assets_baked
     ln -s "$T/engine/assets_baked/common_bf1" "$D/land/bake_x/common_bf2"   # an overlay's link: --yes drops the LINK only
+    find "$T" -exec touch -h -d '-1 day' {} +                      # the fixture is old, but for one fresh dir:
+    mk "$L/fresh/smoke/x.log"                                      # not: a running session's scratch (a literal name, no card)
     got="$(env -u OPENBF_LOOP_DIR -u OPENBF_LEAD_TMP bash "$T/scripts/cleanse_delete.sh" --dry-run | awk -F'\t' 'NF == 2 { sub(".*/lead_tmp/", "", $2); print $2 }' | sort)"
-    want="$(printf '%s\n' deadbr/bake-z deadbr/bake_whatever deadbr/bake_y deadbr/land/bake_x deadbr_target donec/bake | sort)"
+    want="$(printf '%s\n' deadbr/bake-z deadbr/bake_whatever deadbr/bake_y deadbr/land/bake_x deadbr_target donec/bake donec/pics/side_bf1 | sort)"
     if [ "$got" = "$want" ]; then
       env -u OPENBF_LOOP_DIR -u OPENBF_LEAD_TMP bash "$T/scripts/cleanse_delete.sh" --yes >/dev/null
       if [ -f "$T/engine/assets_baked/common_bf1/common.ron" ] && [ ! -e "$D/land/bake_x" ] && [ -f "$D/sheets/a.png" ] \
          && [ -f "$L/livebr/bake_x/common_bf1/common.ron" ] && [ ! -e "$L/deadbr_target" ] && [ -d "$L/livebr_target" ] \
-         && [ -f "$D/bake_inuse/common_bf1/common.ron" ] && [ -d "$L/inuse_target/release" ]; then
-        echo "self-test: PASS (4 bake trees + 1 dead target listed and deleted, nothing else; the two in use and the shipped tree untouched)"; exit 0
+         && [ -f "$D/bake_inuse/common_bf1/common.ron" ] && [ -d "$L/inuse_target/release" ] \
+         && [ -f "$L/donec/pics/a.png" ] && [ ! -e "$L/donec/pics/side_bf1" ] && [ -f "$L/fresh/smoke/x.log" ]; then
+        echo "self-test: PASS (the bake trees + 1 dead target listed and deleted, nothing else; the two in use, the shipped tree and a picture set beside a bake group untouched)"; exit 0
       fi
       echo "self-test: FAIL (--yes)" >&2; exit 1
     fi
@@ -84,6 +89,9 @@ is_live() { local n; for n in "${LIVE[@]}"; do [ "$n" = "$1" ] && return 0; done
 # a card <NAME>.md that is not done: its work has not landed, so its lead_tmp/<name>/ is evidence, not a copy (cleanse 18:
 # lead_tmp/uskn/pics held side_bf1/soldiers beside the 34 pictures card USKN cites, and USKN, a todo card, has no branch)
 card_open() { local c="$ART/loop/cards/${1^^}.md"; [ -f "$c" ] && ! grep -q '^status: *done' "$c"; }
+# a file in its top three levels changed in the last 3 hours: a session is working there (cleanse 19: a running audit's
+# lead_tmp/audit-flnk/smoke, a literal name with no branch, worktree or card of that name, was listed)
+recent() { [ -n "$(find "$1" -maxdepth 3 -newermt '-3 hours' -print -quit 2>/dev/null)" ]; }
 
 # A scratch bake tree, at ANY depth under a landed branch's lead_tmp/<name>/ (CLN4): a directory holding one of the
 # bake's own output files — common_bf{1,2}/common.ron, <map>/manifest.ron for a map group (tat1, tat2, bf1_kam1 …),
@@ -92,10 +100,15 @@ card_open() { local c="$ART/loop/cards/${1^^}.md"; [ -f "$c" ] && ! grep -q '^st
 # manifest.ron) fails the map-name pattern. Copied PICTURE sets are left alone deliberately: they are the evidence a
 # report's sheets were cut from, and a name or layout cannot tell a disposable copy from a kept render.
 # find never follows a symlink (-P), and only the topmost tree is listed (a bake inside a bake is the same delete).
+# A tree whose top holds pictures (lead_tmp/uskn/pics: 34 cited PNGs beside a scratch side_bf1/) lists only its bake groups,
+# so the pictures stay (cleanse 19).
 bake_trees() {
   find "$1" -mindepth 3 \( -path '*/common_bf[12]/common.ron' -o -path '*/classes/bf[12]_all.ron' \
       -o -path '*/side_bf[12]/soldiers' -o -regextype posix-extended -regex '.*/(tat[12]|bf[12]_[a-z]{3}[0-9])/manifest\.ron' \) \
-      2>/dev/null | while IFS= read -r m; do dirname "$(dirname "$m")"; done | sort -u |
+      2>/dev/null | while IFS= read -r m; do
+        g="$(dirname "$m")"; r="$(dirname "$g")"
+        if compgen -G "$r/*.png" >/dev/null; then echo "$g"; else echo "$r"; fi
+      done | sort -u |
     awk '{ for (i = 1; i <= n; i++) if (index($0, top[i] "/") == 1) next; top[++n] = $0; print }'
 }
 
@@ -110,6 +123,7 @@ for d in "$LT"/*/; do
   case "$name" in tools|s[0-9]*|*_target) continue ;; esac
   is_live "$name" && { echo "keep (live): $d"; continue; }
   card_open "$name" && { echo "keep (open card): $d"; continue; }
+  recent "${d%/}" && { echo "keep (recent): $d"; continue; }
   # the old literal names stay as a fallback, so nothing collected before CLN4 stops being collected
   for sub in baked baked_before bake_before bake_after smoke full_after baked_after ogg_ctl1 ogg_ctl2 before c2_before c2_after goldens_committed nd base spot1 spot2 spot3 spot4 spot5 spot6 bake bake_nopc; do add "$d$sub"; done
   while IFS= read -r t; do add "$t"; done < <(bake_trees "${d%/}")

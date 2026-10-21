@@ -676,7 +676,16 @@ pub fn draw(hud: &Hud, art: &HudArt, size: [f32; 2]) -> HudFrame {
     };
     let scale = frame_scale(size);
     let box_w = 4.0 / 3.0 * size[1];
-    let mut order: Vec<usize> = hud.roots.clone();
+    // A spawn screen (card SSELB) dims the backdrop under everything; the
+    // page says whether the tree still draws under it.
+    let tree = match &hud.spawn {
+        Some(page) => {
+            ctx.spawn_veil(size);
+            page.keeps_tree()
+        }
+        None => true,
+    };
+    let mut order: Vec<usize> = if tree { hud.roots.clone() } else { Vec::new() };
     order.reverse();
     order.sort_by_key(|c| std::cmp::Reverse(hud.elems[*c].z_order));
     for r in order {
@@ -705,12 +714,15 @@ pub fn draw(hud: &Hud, art: &HudArt, size: [f32; 2]) -> HudFrame {
         ctx.element(r, &parent, &screen);
     }
     // The capture icon: a root group of the PS2's own (card CPBAR).
-    if let Some(icon) = &hud.capture {
+    if let Some(icon) = hud.capture.as_ref().filter(|_| tree) {
         ctx.capture(icon, size);
     }
     // BF1's squad order cross: over everything, like the PS2's own group.
-    if let Some(sq) = &hud.squad {
+    if let Some(sq) = hud.squad.as_ref().filter(|_| tree) {
         ctx.squad(sq, size);
+    }
+    if let Some(page) = &hud.spawn {
+        ctx.spawn_page(page, size);
     }
     ctx.out
 }

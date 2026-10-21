@@ -588,6 +588,9 @@ pub struct Hud {
     /// The command-post capture icon this frame (`crate::hud_capture`);
     /// `None` draws none.
     pub capture: Option<crate::hud_capture::CaptureIcon>,
+    /// The spawn screen up this frame (`crate::spawn_draw`, card SSELB);
+    /// `None` draws none.
+    pub spawn: Option<crate::spawn_draw::SpawnPage>,
     /// Per font: each glyph's pen advance in texels (what a MultiLineText
     /// wraps its words by). Empty until [`Hud::set_fonts`].
     advances: HashMap<String, HashMap<u32, f32>>,
@@ -698,6 +701,7 @@ impl Hud {
             map: None,
             squad: None,
             capture: None,
+            spawn: None,
             advances: HashMap::new(),
         };
         for n in &layout.nodes {

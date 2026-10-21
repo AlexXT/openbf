@@ -241,7 +241,7 @@ orange today.
    `dynamic` term gets no sun on BF1.
 5. **Remove `look::ps2_light_vector`**: it becomes the identity. The water reads `sun_dir` directly.
 6. **Fix the tests and docs that pin the old conventions:**
-   - tests: `mungefs::sky::tests::geo1_sun_angle_matches_its_light_quaternion`, `mungefs/tests/tat1_lvl.rs`'s
+   - tests: `mungefs::sky::tests::geo1_sun_angle_matches_its_light_quaternion`, `mungefs/tests/suite/tat1_lvl.rs`'s
      `direction_to_sun`, the `bake::lighting` sun tests, and `look.rs`'s `the_water_shading_is_the_overlays_constant_block`;
    - module docs: `mungefs::sky`, `mungefs::light`, `bake::lighting`, and `re-sky-lighting.md` §4 (banner added).
 7. **Rebake and goldens.** Rebake every map; every lit golden moves. The specular pass reads the same `sun_dir` and

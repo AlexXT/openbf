@@ -449,6 +449,7 @@ active in Instant Action.
 
 ### 7.3 Stations
 `powerupstation` (the health and ammo droids) uses the same give functions (callers in `check_absent.txt`).
+Its reach, rate, team rule, tips and animation: `analysis/re-powerup-station.md` (card PWST, 2026-10-20).
 
 ## 8. PCSX2 live (2026-10-02, software renderer, RAM read through /dev/shm, nothing written)
 

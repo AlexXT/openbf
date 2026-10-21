@@ -152,10 +152,13 @@ if want side; then
   # BF2's pistols are baked for the HUD's weapon row (card HUDW): the PS2
   # shows a weapon's own model there, and every BF2 side's second weapon is
   # its pistol (IMP's has been baked since the officer's primary names it).
-  "$BAKE" weapon  "$B1/SIDE/ALL.LVL" all_weap_inf_bowcaster,all_weap_inf_launcher,all_weap_inf_rifle,all_weap_inf_seeker,all_weap_inf_sniperrifle "$OUT/side_bf1"
-  "$BAKE" weapon  "$B1/SIDE/IMP.LVL" imp_weap_inf_launcher,imp_weap_inf_rifle,imp_weap_inf_sniperrifle "$OUT/side_bf1"
-  "$BAKE" weapon  "$B1/SIDE/REP.LVL" rep_weap_inf_launcher,rep_weap_inf_rifle,rep_weap_inf_sniperrifle "$OUT/side_bf1"
-  "$BAKE" weapon  "$B1/SIDE/CIS.LVL" cis_weap_inf_launcher,cis_weap_inf_sniperrifle "$OUT/side_bf1"
+  # BF1's pistols too since card WHELD: a soldier holds the model of the
+  # weapon in his hand, and every class slot the sim can switch to must have
+  # its model (game/tests/suite/roster.rs `every_held_slots_hand_model_is_baked`).
+  "$BAKE" weapon  "$B1/SIDE/ALL.LVL" all_weap_inf_bowcaster,all_weap_inf_launcher,all_weap_inf_pistol,all_weap_inf_rifle,all_weap_inf_seeker,all_weap_inf_sniperrifle "$OUT/side_bf1"
+  "$BAKE" weapon  "$B1/SIDE/IMP.LVL" imp_weap_inf_launcher,imp_weap_inf_pistol,imp_weap_inf_rifle,imp_weap_inf_sniperrifle "$OUT/side_bf1"
+  "$BAKE" weapon  "$B1/SIDE/REP.LVL" rep_weap_inf_launcher,rep_weap_inf_pistol,rep_weap_inf_rifle,rep_weap_inf_sniperrifle "$OUT/side_bf1"
+  "$BAKE" weapon  "$B1/SIDE/CIS.LVL" cis_weap_inf_launcher,cis_weap_inf_pistol,cis_weap_inf_sniperrifle "$OUT/side_bf1"
   "$BAKE" weapon  "$B2/SIDE/REP.LVL" rep_weap_inf_chaingun,rep_weap_inf_launcher,rep_weap_inf_pistol,rep_weap_inf_rifle,rep_weap_inf_sniperrifle "$OUT/side_bf2" ${PCSIDE_REP:+"$PCSIDE_REP"}
   "$BAKE" weapon  "$B2/SIDE/CIS.LVL" cis_weap_inf_launcher,cis_weap_inf_pistol,cis_weap_inf_rifle,cis_weap_inf_sniperrifle "$OUT/side_bf2" ${PCSIDE_CIS:+"$PCSIDE_CIS"}
   "$BAKE" weapon  "$B2/SIDE/ALL.LVL" all_weap_inf_bowcaster,all_weap_inf_launcher,all_weap_inf_pistol,all_weap_inf_rifle,all_weap_inf_seeker,all_weap_inf_sniperrifle "$OUT/side_bf2"
@@ -165,8 +168,11 @@ if want side; then
   # whose `modl` is in each game's common LVL and in no side LVL (measured:
   # `bake weapon SIDE/ALL.LVL com_weap_inf_torpedo` -> "modl not found",
   # COMMON.LVL/INGAME.LVL -> 474 verts, 494 tris).
-  "$BAKE" weapon  "$A1"              com_weap_inf_torpedo "$OUT/side_bf1"
-  "$BAKE" weapon  "$B2/INGAME.LVL"   com_weap_inf_torpedo "$OUT/side_bf2"
+  # So is the thermal detonator's (card WHELD: drawn in the hand while a
+  # throw is wound up and before HideOnFire hides it), every side's
+  # `*_weap_inf_thermaldetonator` naming `com_weap_inf_grenadethermal`.
+  "$BAKE" weapon  "$A1"              com_weap_inf_torpedo,com_weap_inf_grenadethermal "$OUT/side_bf1"
+  "$BAKE" weapon  "$B2/INGAME.LVL"   com_weap_inf_torpedo,com_weap_inf_grenadethermal "$OUT/side_bf2"
   # Every vehicle class of the four sides (card VBAKE): models (every LOD),
   # destruction chunks, collision, textures -> side_<game>/vehicles/<side>/.
   for s in all cis imp rep; do

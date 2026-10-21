@@ -94,10 +94,10 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
     let eye = u.muzzle();
     let wc = &sim.weapon_classes[u.weapon_class];
 
-    let tier = sim.difficulty.tier();
+    let tier = sim.difficulty_of(u.team).tier();
     // This unit's own skill vector, under the tier's overrides (D1/D9). It is
     // DERIVED per think, never stored: `Unit.skill` is the state.
-    let skill = sim.difficulty.skill_at(u.skill);
+    let skill = sim.difficulty_of(u.team).skill_at(u.skill);
 
     let thinking = sim.tick >= st.next_think;
     if thinking {
@@ -110,6 +110,8 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
         // out of what this unit actually perceives — never out of the sim's
         // omniscient unit list, which is what `ENGAGE_RANGE` + `visible` did.
         let (held, heard) = perception::scan(sim, me, st, tier);
+        // Card TEAM: then what the friends near by see.
+        nt.told = perception::tell(sim, me, st, tier);
         nt.acquired = u8::from(match super::man::arc_of(sim, u) {
             Some(holds) => perception::choose_target_with(sim, me, st, tier, holds),
             None => perception::choose_target(sim, me, st, tier),
@@ -225,7 +227,8 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
         // the fight is over and the bot advances; else it keeps the hint's
         // stance and, every few seconds, may step to another spot near by.
         if let Some(mut h) = st.hold.filter(|h| sim.tick < h.until) {
-            if held > 0 {
+            // (Card TEAM: what a friend tells keeps nobody on a position.)
+            if held > 0 && st.contacts.iter().flatten().any(|c| !c.told) {
                 h.last_contact = sim.tick;
             }
             if let Some((_, p)) = hunt {
@@ -238,6 +241,30 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
                 // position are the Tactician's, `tactic::fight`.)
                 st.want_stance = stance_hold(st.want_stance, h.stance_mask, me, sim.tick);
             }
+            st.hold = Some(h);
+        }
+        // Card TEAM: a bot with the COVER role (`team::board`) guards its
+        // position, facing the approach, while no fight holds it.
+        if let Some(g) = guard_post(sim, st) {
+            let q = &sim.positions.positions[st.role.at as usize];
+            let mut h = st
+                .hold
+                .filter(|h| sim.tick < h.until && h.spot == g)
+                .unwrap_or(HoldState {
+                    spot: g,
+                    goal: g,
+                    commit_until: sim.tick + HOLD_COMMIT,
+                    ..HoldState::default()
+                });
+            h.until = sim.tick + THINK_PERIOD + HOLD_CLOSE;
+            h.last_contact = sim.tick;
+            h.look = st.role.look;
+            let d = st.role.look - g;
+            h.stance_mask = if q.shields_toward(Vec2::new(d.x, d.z)) {
+                crate::commander::MASK_CROUCH
+            } else {
+                0
+            };
             st.hold = Some(h);
         }
     }
@@ -569,10 +596,25 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
     // hide phase's point - and it keeps the position while it remembers it
     // (without this the fight lapsed 2 s into the hide and the bot walked
     // off, then back: the maintainer's Kamino scene).
-    if st.fight.mode == FightState::COVER && memory.is_some() && free {
-        if let Some(h) = st.hold.as_mut() {
+    // Card TEAM: not on a told record - a friend's sight is aimed at, it
+    // does not keep the bot at a position it cannot fire from.
+    // Card TPOSR: and the Tactician runs on the remembered target as on a
+    // seen one - the walk there, the hide / fire cycle, the leave tests (hit
+    // twice, round its cover, out of the band, the 5-12 s timer): the PS2's
+    // cover state machine runs every update, its walk and hidden states
+    // keeping the target (re-soldier-ai 4.6; AUDIT TPOS: a bot hit twice kept
+    // its position 22 s, hidden, while its target was out of sight).
+    if let (true, Some(c), true, Some(mut h)) = (
+        st.fight.tactician(),
+        held.filter(|c| !c.seen_now && !c.told),
+        free,
+        st.hold,
+    ) {
+        let foe = super::tactic::Foe::remembered(c.last_pos);
+        if super::tactic::fight(sim, &tk, st, &foe, &mut h, thinking, &mut nt) {
             h.until = h.until.max(sim.tick + HOLD_CLOSE);
         }
+        st.hold = Some(h);
     }
     let manning = boarding.is_some()
         && st
@@ -590,6 +632,8 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
         }
         None => {}
     }
+    // Card TPOSR: the position held stays reserved while it is held.
+    super::tactic::keep(sim, st, thinking, &mut nt);
     // Card RCYC: who the last resort (the mover's progress watch) never
     // gives up — a bot on a held position, fighting an enemy it sees,
     // running from a grenade or under a squad order.
@@ -700,6 +744,8 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
         _ if ret.is_some() => Behaviour::Recover,
         _ if flee.is_some() => Behaviour::Evade,
         _ if super::snipe::holds(st, holding) => Behaviour::Overwatch,
+        // Card TEAM: on its guard position (the Cover role).
+        _ if holding.is_some_and(|h| guard_post(sim, st) == Some(h.spot)) => Behaviour::Guard,
         _ if holding.is_some() || ring.is_some() => Behaviour::Fight,
         _ if walk_kind == WalkAsk::BOARD || boarding.is_some() => Behaviour::Board,
         _ if st.cmd.is_some() => Behaviour::Follow,
@@ -735,6 +781,16 @@ pub fn think(sim: &Sim, me: UnitHandle, st: &mut AiState) -> (PadState, NavTick)
     };
     nt.dwell = st.unreachable_dwell;
     (pad, nt)
+}
+
+/// Card TEAM: the guard position of a bot with the Cover role, while no
+/// fight holds it.
+fn guard_post(sim: &Sim, st: &AiState) -> Option<Vec3> {
+    st.role
+        .post
+        .filter(|_| st.fight.mode == 0)
+        .and_then(|_| sim.positions.positions.get(st.role.at as usize))
+        .map(|q| q.pos)
 }
 
 /// Card MOVR — RECOVER (`analysis/bot-design.md` 6.3): the walk has FAILED
@@ -864,7 +920,15 @@ fn fight_position(
     h.until = h.until.max(sim.tick + HOLD_CLOSE);
     // Card TPOS: the Tactician's position, when the table has one for this
     // fight; else the bot's own style below.
-    if super::tactic::fight(sim, tk, st, e, &mut h, thinking, nt) {
+    if super::tactic::fight(
+        sim,
+        tk,
+        st,
+        &super::tactic::Foe::seen(e),
+        &mut h,
+        thinking,
+        nt,
+    ) {
         // (In the open, a croucher by style crouches.)
         if !st.tpos.covered && crouches && h.stance_mask == 0 {
             h.stance_mask = crate::commander::MASK_CROUCH;
@@ -884,6 +948,20 @@ fn fight_position(
             h.blocked = 0;
             st.fight.mode = FightState::WALK;
             // Over the graph to the point's hub, straight at it from there.
+            super::route::retarget_board(sim, me, st, p, nt);
+        }
+        // Card TEAM: no ring point, and the target out of the trigger's
+        // reach - walk at the target itself. Pausing for a ring point here
+        // stood the last four soldiers of BF1 Kashyyyk (Hard, seed 2) 57 m
+        // apart in the shallows, none in reach, the water refusing every
+        // point: the round never ended.
+        None if nav::xz_dist(pos, e.soldier.pos) >= wc.ai_range[2] => {
+            let p = e.soldier.pos;
+            h.spot = p;
+            h.goal = p;
+            h.commit_until = sim.tick + HOLD_COMMIT;
+            h.blocked = 0;
+            st.fight.mode = FightState::WALK;
             super::route::retarget_board(sim, me, st, p, nt);
         }
         None => {
@@ -959,8 +1037,8 @@ fn style(sim: &Sim, tk: &Tick) -> (bool, bool, bool) {
     if let Some((stands, anywhere)) = super::tests::STYLE.with(std::cell::Cell::get) {
         return (stands, false, anywhere);
     }
-    let Tick { me, wc, .. } = *tk;
-    let (stander, crouches) = style_of(me, sim.difficulty, wc.ai_distance_table());
+    let Tick { me, u, wc, .. } = *tk;
+    let (stander, crouches) = style_of(me, sim.difficulty_of(u.team), wc.ai_distance_table());
     (stander, crouches, false)
 }
 
@@ -1950,6 +2028,44 @@ mod tests {
         );
         let modes = modes_at(45.0, [0.0, 15.0, 30.0], false);
         assert_eq!(modes[0], 600, "at MaxRange + 15: {modes:?}");
+    }
+
+    /// Card TEAM: a circler whose target is past the trigger's reach and
+    /// that finds no ring point (water over the ground refuses every one)
+    /// walks at its target until it is in reach and fires; it no longer
+    /// pauses where it stands for good (BF1 Kashyyyk at Hard, seed 2: four
+    /// last soldiers 57 m apart, the round never ended).
+    #[test]
+    fn a_circler_with_no_ring_point_walks_at_a_target_out_of_reach() {
+        use crate::sim::{Event, PadState};
+        let _style = all_circle();
+        let (mut sim, bots, e) = fight_scene(1, 0.0);
+        let reach = {
+            let u = sim.unit(bots[0]).expect("bot");
+            sim.weapon_classes[u.weapon_class].ai_range[2]
+        };
+        let start = reach + 5.0;
+        sim.unit_mut(e).expect("enemy").soldier.pos = Vec3::new(0.0, 0.0, -start);
+        sim.water_level = Some(1.0);
+        // (Hard's sight, 61 m standing, sees it - Normal's 49 m does not.)
+        sim.difficulty = crate::skill::Difficulty::Hard;
+        let (mut near, mut shots) = (start, 0u32);
+        for _ in 0..450 {
+            sim.step(&[PadState::default()]);
+            sim.unit_mut(e).expect("enemy").health.cur = 300.0;
+            let u = sim.unit(bots[0]).expect("alive");
+            near = near.min(nav::xz_dist(u.soldier.pos, Vec3::new(0.0, 0.0, -start)));
+            shots += sim
+                .events
+                .iter()
+                .filter(|v| matches!(v, Event::Shot { unit, .. } if *unit == bots[0]))
+                .count() as u32;
+        }
+        assert!(
+            near < reach,
+            "it walked into reach: {near} m (reach {reach})"
+        );
+        assert!(shots > 0, "and fired");
     }
 
     /// Card FGHTA: with a nav graph a ring point is taken INSIDE a hub — the

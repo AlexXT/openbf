@@ -166,6 +166,7 @@ fn tell(s: &mut Sim, e: UnitHandle) {
         last_pos: at,
         seen_now: true,
         heard: false,
+        told: false,
     });
 }
 
@@ -777,6 +778,7 @@ fn a_gunner_takes_the_target_inside_its_arc() {
             last_pos: at,
             seen_now: false,
             heard: false,
+            told: false,
         });
         sc.s.step(&[]);
         // From its first think in the seat (it may have seen him on foot).
@@ -854,4 +856,68 @@ fn tower_shot(at: Vec3) {
     let e = sc.enemy;
     let hit = until(&mut sc.s, 5 * HZ, |s| hits_on(s, e) > 0);
     assert!(hit.is_some(), "no bolt hit the soldier at {at} in 5 s");
+}
+
+/// Card TBRD: a bot boards a building turret from the PS2's board-agent
+/// reach (its body sphere within the turret's radius, 3 m, plus 1.5 m in BF2
+/// and 0.5 m in BF1, 3-D), not from the player's radius plus 5 m and the 2 m
+/// slack: its last tick on foot is at most 5.5 m (BF2) / 4.5 m (BF1) from
+/// the turret's origin, where it used to be about 10 m.
+#[test]
+fn a_bot_boards_a_building_turret_only_once_it_has_walked_up_to_it() {
+    for (rules, pad) in [
+        (crate::soldier::GroundRules::Bf2, crate::ai::BOARD_PAD_BF2),
+        (crate::soldier::GroundRules::Bf1, crate::ai::BOARD_PAD_BF1),
+    ] {
+        let mut sc = scene(
+            Vec3::new(3.0, 0.0, 12.0),
+            Vec3::new(4.0, 0.0, -30.0),
+            0,
+            None,
+        );
+        sc.s.ground_rules = rules;
+        let (b, v) = (sc.bot, sc.v);
+        let mut last = None;
+        let at = until(&mut sc.s, 15 * HZ, |s| {
+            let u = s.unit(b).unwrap();
+            if u.mount.is_none() {
+                let c = u.capsule();
+                last = Some((u.soldier.pos, c.center(), c.radius.max(c.height * 0.5)));
+            }
+            seated(s, b, v)
+        });
+        assert!(at.is_some(), "{rules:?}: never manned");
+        let (feet, centre, rs) = last.unwrap();
+        let gap = centre.length() - 3.0 - rs;
+        assert!(
+            gap <= pad + 0.01,
+            "{rules:?}: boarded {gap} m off the sphere"
+        );
+        let xz = feet.x.hypot(feet.z);
+        assert!(xz <= 4.0 + pad, "{rules:?}: boarded from {xz} m");
+    }
+}
+
+/// Card TBRD: a building turret 4 m over the walk (a balcony gun) is not
+/// boarded from below - the bot that walks under it gives its claim up at
+/// once (the walk did not reach it, `man_codes[6]`), long before the claim's
+/// 30 s clock; it was seated from the ground before the card.
+#[test]
+fn a_turret_on_another_floor_is_given_up_not_boarded_from_below() {
+    let mut sc = scene(
+        Vec3::new(3.0, 0.0, 12.0),
+        Vec3::new(4.0, 0.0, -30.0),
+        0,
+        None,
+    );
+    sc.s.vehicle_mut(sc.v).unwrap().pos.y = 4.0;
+    let (b, v) = (sc.bot, sc.v);
+    let gave_up = until(&mut sc.s, 20 * HZ, |s| s.nav_stats.man_codes[6] > 0);
+    assert!(gave_up.is_some(), "the claim was never given up");
+    assert!(
+        sc.s.nav_stats.man_offers >= 1,
+        "no offer: the scene tests nothing"
+    );
+    assert!(!seated(&sc.s, b, v), "boarded from the floor below");
+    assert_eq!(sc.s.nav_stats.man_boards, 0);
 }

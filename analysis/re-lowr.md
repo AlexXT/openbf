@@ -58,7 +58,7 @@ Tags: [V] read in the decomp/ELF/disc, [D] derived, [H] hypothesis.
 ## §1 The chunk (loader-verified; disc-verified by the census)
 
 Tree `tern → PCHS → { PTCH × n², LOWR → { INFO, PCHS → LPTC × grid² } }` (B1:546096 `0x52574f4c`, 546141
-`0x53484350`, 546146 `0x4354504c`; B2:703386/703436/703440). `mungefs/tests/tat1_lvl.rs:426–478` already pins the
+`0x53484350`, 546146 `0x4354504c`; B2:703386/703436/703440). `mungefs/tests/suite/tat1_lvl.rs:426–478` already pins the
 tree and TAT1's INFO. [V]
 
 **`LOWR INFO`** (B1:546101–546127; B2:703394–703408): `u32 grid` → obj+0x64 (546104), `u32 res` → +0x60 (546106),

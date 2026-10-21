@@ -2,17 +2,19 @@
 id: KNOCK
 title: Explosions throw soldiers as the PS2's do: BF1 pushes every gathered soldier not thrown / tumbling / getting up / mounted by (normalize(d)+(0,0.6,0))·Push·f - thrown at g 13.5, a tumble, a get-up, a 1.93 s lock; a kill by a blast or a direct hit kicks the body 5 m/s, the blast-killed fly and die at the landing, corpses keep a moving body for 4 s; BF2 pushes only the dead unless the class authors PushDeadOnly 0 - today a blast only damages and a dead unit freezes
 milestone: M3
-value: 4
+value: 5
 phase: build
 status: todo
 deps: VDTH
 files: engine/crates/core/src/sim/blast.rs,engine/crates/core/src/sim/combat.rs,engine/crates/core/src/sim/step.rs,engine/crates/core/src/soldier.rs,engine/crates/core/src/soldier/tests.rs,engine/crates/core/src/unit.rs,engine/crates/core/src/weapon.rs,engine/crates/game/src/soldier_vis.rs,engine/crates/game/src/animator.rs
 declares: sim; sweep; arena
 needs:
+effort:
 branch:
 resume: RE done (analysis/re-knockback.md, 6f52332 + 95f4e25; rows in lead_tmp/knock/out/). Build in three commits, tests first from the PS2 rows of section 6: (1) the dead keep a body - a dead unit stays in the tick for 4.0 s with a velocity (gravity 18, the brake of section 3 / 4), is in Sim::explode's gather, and a kill by a bolt or a blast adds the 5 m/s kick (combat.rs, blast.rs); (2) the push in Sim::explode (blast.rs's marked spot; ExplosionClass reads PushDeadOnly, BF1 classes false) + Soldier stances Thrown / Tumble / GetUp with the lock, the blast-killed thrown and dying at the landing; (3) game: the corpse's draw follows the body, the thrown / tumble / rest clips if the baked sets hold them. Droids: card DCHK.
 created: 2026-09-28
 alpha: yes
+first: 9
 ---
 
 ## Why (build, rewritten 2026-10-07 after the RE: `analysis/re-knockback.md`)
@@ -68,3 +70,4 @@ In the port a blast only damages, and a dead unit freezes where it stood.
 - 2026-10-07 RE (manual run, the workflow trial): report `reports/20261007_1731_card_KNOCK.md`. The card's "no BF2
   class sets PushDeadOnly 0" was wrong (two do); the five skipped states are thrown, tumble, get-up and the two
   mounted ones.
+- 2026-10-20 (the maintainer): grenades and rockets in the originals have a radius that both damages and PUSHES soldiers inside it, so a grenade can throw you without killing you, depending on health and distance. The port's blasts only damage (RKEX builds the rocket's explosion and uses this push). Build both games' rules as read in the resume.

@@ -617,6 +617,37 @@ impl SoundLib {
         self.for_battle(map_dir, f, &walk.sound_levels);
     }
 
+    /// Decode every take the battle can play (card HITCH): each sample of
+    /// the map's and the core bank, and each segment a property of either
+    /// names, into the cache - at the battle's load, so no first shot,
+    /// footstep or line decodes a file inside a frame. Returns the takes,
+    /// their decoded bytes and the ms it took.
+    pub fn preload(&mut self) -> (usize, u64, f32) {
+        let t0 = std::time::Instant::now();
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for bank in std::iter::once(&self.map).chain(self.core.as_ref()) {
+            paths.extend(bank.sample_paths.values().map(|rel| bank.dir.join(rel)));
+            let props = bank.props.values().chain(bank.by_level.values());
+            let segs: Vec<u32> = props.flat_map(|p| p.segments.iter().map(|s| s.0)).collect();
+            paths.extend(segs.into_iter().filter_map(|id| self.segment_path(id)));
+        }
+        paths.sort();
+        paths.dedup();
+        let (mut n, mut bytes) = (0, 0u64);
+        for path in paths {
+            if self.cache.contains_key(&path) {
+                continue;
+            }
+            // A take that will not decode stays out, as at its first play.
+            if let Ok(data) = audio::decode(&path) {
+                n += 1;
+                bytes += data.frames() as u64 * 8;
+                self.cache.insert(path, data);
+            }
+        }
+        (n, bytes, t0.elapsed().as_secs_f32() * 1000.0)
+    }
+
     /// `<map dir>/sounds/sounds.ron`, or None when the map has no sounds baked.
     /// Without a battle the sub-levels are the map's own, as
     /// `crate::foley::sublevels` orders them for no faction.
@@ -1223,9 +1254,8 @@ impl SoundLib {
         if self.cache.contains_key(path) {
             return Ok(());
         }
-        let data = audio
-            .load_sound(path)
-            .with_context(|| format!("decode {}", path.display()))?;
+        let _ = audio;
+        let data = decode_noted(path).with_context(|| format!("decode {}", path.display()))?;
         self.cache.insert(path.to_path_buf(), data);
         Ok(())
     }
@@ -1245,7 +1275,7 @@ impl SoundLib {
                 .and_then(|id| self.segment_path(id)),
         }?;
         if !self.cache.contains_key(&path) {
-            let data = audio::decode(&path)
+            let data = decode_noted(&path)
                 .map_err(|e| eprintln!("decode {}: {e:#}", path.display()))
                 .ok()?;
             self.cache.insert(path.clone(), data);
@@ -1398,7 +1428,7 @@ impl SoundLib {
         let pitch = self.find(hash)?.0.pitch.max(0.05);
         let path = self.take_path_by_hash(hash, usize::from(nth))?;
         if !self.cache.contains_key(&path) {
-            let data = audio::decode(&path)
+            let data = decode_noted(&path)
                 .map_err(|e| eprintln!("decode {}: {e:#}", path.display()))
                 .ok()?;
             self.cache.insert(path.clone(), data);
@@ -1574,10 +1604,10 @@ impl SoundLib {
         }
     }
 
-    /// A take decoded without the mixer, for its length ([`audio::decode`]).
+    /// A take decoded without the mixer, for its length ([`decode_noted`]).
     fn decoded(&mut self, path: &Path) -> Option<&audio::SoundData> {
         if !self.cache.contains_key(path) {
-            let data = audio::decode(path).ok()?;
+            let data = decode_noted(path).ok()?;
             self.cache.insert(path.to_path_buf(), data);
         }
         self.cache.get(path)
@@ -1741,6 +1771,23 @@ impl SoundLib {
     }
 }
 
+/// Decode a take ([`audio::decode`]) and, for the frame recorder (card
+/// HITCH), note it with its bytes and ms (`render::made`: a take decoded in
+/// a battle frame is that frame's cost).
+fn decode_noted(path: &Path) -> anyhow::Result<audio::SoundData> {
+    let t0 = std::time::Instant::now();
+    let data = audio::decode(path)?;
+    if render::made::on() {
+        let name = path.file_name().map(|n| n.to_string_lossy());
+        render::made::note(
+            "sound",
+            name.as_deref(),
+            data.frames() as u64 * 8,
+            t0.elapsed().as_secs_f32() * 1000.0,
+        );
+    }
+    Ok(data)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

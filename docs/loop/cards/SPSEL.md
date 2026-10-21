@@ -4,14 +4,14 @@ title: The player's spawn POST lives in the sim: the PS2's spawn-map pick (a pus
 milestone: M3
 value: 5
 phase: build
-status: todo
+status: done
 deps: CWSP,BSPN
 files: engine/crates/core/src/sim/spawn.rs,engine/crates/core/src/sim/input.rs,engine/crates/core/src/sim/state.rs,engine/crates/game/src/main/battle.rs,engine/crates/game/src/main/windowed.rs,engine/crates/ui/src/spawn.rs
 declares: goldens=tat1_spawn.png
 needs:
 effort:
-branch:
-resume:
+branch: spsel
+resume: landed 6dc5a68 2026-10-20 (code 806b7f8); report reports/20261020_0158_card_SPSEL.md
 created: 2026-09-25
 alpha: yes
 first: 4

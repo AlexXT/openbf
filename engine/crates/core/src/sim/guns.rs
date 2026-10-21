@@ -392,7 +392,11 @@ impl Sim {
         let team = self.units[i].team;
         let infinite_cheat = self.cheats.infinite_ammo && is_player;
         // On foot's D9 spread multiplier and the fairness record (step 4).
-        let ai_spread_mult = ai.then(|| self.difficulty.skill_at(self.units[i].skill).spread_mult);
+        let ai_spread_mult = ai.then(|| {
+            self.difficulty_of(team)
+                .skill_at(self.units[i].skill)
+                .spread_mult
+        });
         let perceived = !ai || {
             let st = &self.units[i].ai;
             st.target

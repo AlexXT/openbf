@@ -187,7 +187,7 @@ pub fn skin_glb(skel: &Skeleton, bank: Option<&AnimBank<'_>>) -> anyhow::Result<
                     continue;
                 };
                 let Ok(d) = bank.decode_clip(k) else { continue };
-                let (tracks, _) = crate::soldier::clip_to_tracks(&d, skel);
+                let (tracks, _) = crate::soldier::clip_to_tracks(&d, skel, None);
                 let mut kept: Vec<crate::skin_glb::ClipTrack> = Vec::new();
                 for t in tracks {
                     kept.retain(|k| k.bone != t.bone);

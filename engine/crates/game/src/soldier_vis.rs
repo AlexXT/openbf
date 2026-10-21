@@ -37,6 +37,15 @@
 //! on the PS2 (§3; FEEL_NOTES). Only the guns a soldier holds flash — the
 //! weapon loader gives none to sabres and thrown weapons (§5), and vehicle
 //! and turret guns never reach this draw.
+//!
+//! **The weapon in the hand is the one in hand** (card WHELD): the soldier
+//! render draws the ACTIVE weapon at `hp_weapons` (`re-muzzle-flash.md` §5,
+//! `re-grenades.md` §2.3 item 4) - channel 1's current weapon while that
+//! channel has the soldier, else channel 0's current one, which a switch
+//! swaps ([`weapon_in_hand`]) - as its own `GeometryName` (none = nothing
+//! drawn), and a thrown weapon whose `HideOnFire` is set is not drawn from
+//! its throw's fire state through its reload (§3.2). The fire point and the
+//! flash follow that weapon too.
 
 use crate::animator::{AnimInput, Animator, ClassAnim, Rig};
 use crate::assets::{load_skinned_glb, SkinnedAsset};
@@ -89,6 +98,30 @@ pub struct SoldierAsset {
     /// Skeleton index of `hp_weapons`: where the class's [`WeaponAsset`] is
     /// drawn.
     pub hp_weapons: Option<usize>,
+    /// Per part of `meshes`: the model group its texture is drawn in
+    /// (`soldiers/<model>.skins.ron`, [`part_groups`]); a class's override
+    /// of that group replaces the part's texture (card USKN).
+    pub groups: Vec<Option<String>>,
+}
+
+/// The model group of each part, by its texture: the groups file lists
+/// the textures of the model's segments in each override group (the bake's
+/// `bake::soldier::ModelSkins`). A part with no texture, or one no group
+/// lists, has none.
+pub fn part_groups(
+    textures: &[Option<&str>],
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<Option<String>> {
+    textures
+        .iter()
+        .map(|t| {
+            let t = (*t)?.to_ascii_lowercase();
+            groups
+                .iter()
+                .find(|(_, list)| list.contains(&t))
+                .map(|(g, _)| g.clone())
+        })
+        .collect()
 }
 
 /// A hand weapon model (static, drawn at the body's `hp_weapons`), cached by
@@ -137,7 +170,13 @@ pub struct DrawPlan {
     pub weapons: Vec<String>,
     /// `per_class[team][class]`, index-aligned with `TeamTemplate::classes`.
     pub per_class: [Vec<ClassDraw>; 2],
+    /// `held[team][class]`: the class's other slots' models (card WHELD),
+    /// `(slot, index into weapons)`; a slot not listed holds the primary's.
+    pub held: [Vec<HeldDraws>; 2],
 }
+
+/// A class's other slots and the hand model each draws (`None` = none).
+pub type HeldDraws = Vec<(u8, Option<usize>)>;
 
 impl DrawPlan {
     pub fn of(teams: &[TeamTemplate; 2]) -> Self {
@@ -156,6 +195,12 @@ impl DrawPlan {
                     weapon: slot(&mut plan.weapons, c.weapon_geometry.as_deref()),
                 };
                 plan.per_class[i].push(draw);
+                let held = c
+                    .held_models
+                    .iter()
+                    .map(|(s, g)| (*s, slot(&mut plan.weapons, g.as_deref())))
+                    .collect();
+                plan.held[i].push(held);
             }
         }
         plan
@@ -165,6 +210,62 @@ impl DrawPlan {
     pub fn weapon_of(&self, team: usize, class: usize) -> Option<&str> {
         let w = self.per_class.get(team)?.get(class)?.weapon?;
         self.weapons.get(w).map(String::as_str)
+    }
+
+    /// The weapon model a class draws while its class slot `slot` is in hand
+    /// (card WHELD): a listed held slot's own, else the primary's.
+    pub fn weapon_in_slot(&self, team: usize, class: usize, slot: u8) -> Option<&str> {
+        let w = held_or_primary(
+            self.held.get(team)?.get(class)?,
+            self.per_class.get(team)?.get(class)?.weapon,
+            slot,
+        )?;
+        self.weapons.get(w).map(String::as_str)
+    }
+}
+
+/// The model index of class slot `slot`: a held slot's own entry (which may
+/// be no model), else the primary's.
+fn held_or_primary(
+    held: &[(u8, Option<usize>)],
+    primary: Option<usize>,
+    slot: u8,
+) -> Option<usize> {
+    held.iter()
+        .find(|(s, _)| *s == slot)
+        .map_or(primary, |(_, w)| *w)
+}
+
+/// What a soldier holds now (card WHELD, `re-grenades.md` §2.3): channel 1's
+/// current weapon while that channel has him, else channel 0's current one
+/// (`Unit::weapon`, which a switch swaps with a held slot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InHand {
+    /// Index into `Sim::weapon_classes`.
+    pub class: usize,
+    /// The class slot it came from.
+    pub slot: u8,
+    /// A thrown weapon with `HideOnFire` in its throw or its reload: the
+    /// soldier render draws no model (weapon+0xbc, §3.2).
+    pub hidden: bool,
+}
+
+/// [`InHand`] for `u`, its weapon classes `classes`.
+pub fn weapon_in_hand(u: &core::unit::Unit, classes: &[core::weapon::WeaponClass]) -> InHand {
+    let held = (u.active_channel == 1)
+        .then(|| u.held.get(usize::from(u.cur1?)))
+        .flatten();
+    let (class, slot, state) = held.map_or((u.weapon_class, u.weapon_slot, &u.weapon), |h| {
+        (h.class, h.slot, &h.state)
+    });
+    let hides = classes
+        .get(class)
+        .and_then(|c| c.thrown.as_ref())
+        .is_some_and(|t| t.hide_on_fire);
+    InHand {
+        class,
+        slot,
+        hidden: hides && (state.state == core::weapon::FireState::Firing || state.reloading()),
     }
 }
 
@@ -467,8 +568,14 @@ pub struct SoldierVisuals {
     /// `per_class[team][class]` -> indices into `assets` and `weapons`; a
     /// `None` body = marker box.
     pub per_class: [Vec<ClassDraw>; 2],
+    /// `held[team][class]`: the other slots' models ([`DrawPlan::held`]).
+    pub held: [Vec<HeldDraws>; 2],
     /// `anim[team][class]`: what picks each class's animation sets.
     pub anim: [Vec<ClassAnim>; 2],
+    /// `skins[team][class][part]`: the class's override texture for each
+    /// part of its body ([`SoldierAsset::groups`], card USKN); empty = the
+    /// model's own textures.
+    pub skins: [Vec<Vec<Option<TextureHandle>>>; 2],
     pub units: Vec<UnitVisual>,
     /// The map's game's muzzle flash model (card FXMF); `None` = none baked.
     pub flash: Option<FlashModel>,
@@ -530,11 +637,33 @@ impl SoldierVisuals {
         let weapons: Vec<WeaponAsset> = plan
             .weapons
             .iter()
-            .map(|wg| Self::load_weapon(r, assets_dir, game, wg, &mut cache))
+            .map(|wg| Self::load_weapon(Some(&mut *r), assets_dir, game, wg, &mut cache))
             .collect();
         let flash = FlashModel::load(r, assets_dir, game);
         let mut s = Self::assemble(plan, teams, bodies, weapons, flash);
         s.bf2 = game.eq_ignore_ascii_case("bf2");
+        // Each class's skins over its body's parts (card USKN).
+        let side = assets_dir.join(format!("side_{game}"));
+        for (team, t) in teams.iter().enumerate() {
+            let mut rows = Vec::new();
+            for (k, c) in t.classes.iter().enumerate() {
+                let body = s.per_class[team].get(k).and_then(|d| d.body);
+                let groups = body.map_or(&[][..], |b| s.assets[b].groups.as_slice());
+                let row: Vec<Option<TextureHandle>> = groups
+                    .iter()
+                    .map(|g| {
+                        let tex = c.skins.of_group(g.as_deref()?)?;
+                        Self::texture(r, &side, Some(tex), &mut cache)
+                    })
+                    .collect();
+                rows.push(if row.iter().any(Option::is_some) {
+                    row
+                } else {
+                    Vec::new()
+                });
+            }
+            s.skins[team] = rows;
+        }
         s
     }
 
@@ -597,7 +726,7 @@ impl SoldierVisuals {
     }
 
     /// The animators without a renderer (a census, a test): every body's
-    /// skeleton, clips and sets; nothing to draw.
+    /// skeleton, clips and sets, every hand weapon's nodes; nothing to draw.
     pub fn load_cpu(assets_dir: &Path, game: &str, teams: &[TeamTemplate; 2]) -> Self {
         let plan = DrawPlan::of(teams);
         let mut cache = HashMap::new();
@@ -606,7 +735,12 @@ impl SoldierVisuals {
             .iter()
             .map(|geometry| Self::load_body(None, assets_dir, game, geometry, &mut cache))
             .collect();
-        let mut s = Self::assemble(plan, teams, bodies, Vec::new(), None);
+        let weapons: Vec<WeaponAsset> = plan
+            .weapons
+            .iter()
+            .map(|wg| Self::load_weapon(None, assets_dir, game, wg, &mut cache))
+            .collect();
+        let mut s = Self::assemble(plan, teams, bodies, weapons, None);
         s.bf2 = game.eq_ignore_ascii_case("bf2");
         s
     }
@@ -650,9 +784,11 @@ impl SoldierVisuals {
             assets,
             weapons,
             per_class,
+            held: plan.held,
             anim: teams
                 .each_ref()
                 .map(|t| t.classes.iter().map(|c| c.anim.clone()).collect()),
+            skins: [Vec::new(), Vec::new()],
             units: Vec::new(),
             flash,
             turrets: Vec::new(),
@@ -704,9 +840,19 @@ impl SoldierVisuals {
             }
         };
         let mut meshes = Vec::new();
+        let mut groups = Vec::new();
         if let Some(r) = r {
             match crate::viewer::upload_skinned(r, &asset.mesh) {
                 Ok(parts) => {
+                    // The model's override groups; a model baked before
+                    // card USKN has none.
+                    let path = side.join("soldiers").join(format!("{geometry}.skins.ron"));
+                    let skins: manifest::SoldierSkins = pak::read_to_string(&path)
+                        .ok()
+                        .and_then(|t| ron::from_str(&t).ok())
+                        .unwrap_or_default();
+                    let mats: Vec<Option<&str>> = parts.iter().map(|p| p.1).collect();
+                    groups = part_groups(&mats, &skins.groups);
                     for (k, (mesh, mat, layer)) in parts.into_iter().enumerate() {
                         let tex = Self::texture(r, &side, mat, cache);
                         meshes.push((mesh, tex, layer, part_spec(r, asset.mesh.spec_pass(k))));
@@ -731,6 +877,7 @@ impl SoldierVisuals {
             meshes,
             rig,
             hp_weapons,
+            groups,
         })
     }
 
@@ -750,9 +897,10 @@ impl SoldierVisuals {
     }
 
     /// One hand weapon: a static GLB under weapons/, textures beside, and its
-    /// nodes. A model that is not baked gives no parts (no weapon drawn).
+    /// nodes. A model that is not baked gives no parts (no weapon drawn);
+    /// without a renderer only the nodes are read.
     fn load_weapon(
-        r: &mut Renderer,
+        r: Option<&mut Renderer>,
         assets_dir: &Path,
         game: &str,
         wg: &str,
@@ -761,17 +909,19 @@ impl SoldierVisuals {
         let side = assets_dir.join(format!("side_{game}"));
         let mut parts = Vec::new();
         let wpath = side.join("weapons").join(format!("{wg}.glb"));
-        match crate::assets::load_glb(&wpath) {
-            Ok(cpu) => match crate::viewer::upload_submeshes(r, &cpu) {
-                Ok(up) => {
-                    for (k, (mesh, mat, layer, _)) in up.into_iter().enumerate() {
-                        let tex = Self::texture(r, &side, mat, cache);
-                        parts.push((mesh, tex, layer, part_spec(r, cpu.spec_pass(k))));
+        if let Some(r) = r {
+            match crate::assets::load_glb(&wpath) {
+                Ok(cpu) => match crate::viewer::upload_submeshes(r, &cpu) {
+                    Ok(up) => {
+                        for (k, (mesh, mat, layer, _)) in up.into_iter().enumerate() {
+                            let tex = Self::texture(r, &side, mat, cache);
+                            parts.push((mesh, tex, layer, part_spec(r, cpu.spec_pass(k))));
+                        }
                     }
-                }
-                Err(e) => eprintln!("weapon {wg}: {e:#}"),
-            },
-            Err(e) => eprintln!("weapon {wg}: {e:#} (no weapon drawn)"),
+                    Err(e) => eprintln!("weapon {wg}: {e:#}"),
+                },
+                Err(e) => eprintln!("weapon {wg}: {e:#} (no weapon drawn)"),
+            }
         }
         let nodes = pak::read_to_string(manifest::weapon_nodes_path(&side, wg))
             .ok()
@@ -799,9 +949,17 @@ impl SoldierVisuals {
         self.assets.get(self.asset_index(team, class)?)
     }
 
-    /// The hand weapon a unit's class holds, if it has one.
-    fn weapon_for(&self, team: u8, class: u8) -> Option<&WeaponAsset> {
-        self.weapons.get(self.class_draw(team, class).weapon?)
+    /// The hand weapon a unit draws while its class slot `slot` is in hand,
+    /// if that slot has a model ([`DrawPlan::weapon_in_slot`]).
+    fn weapon_for(&self, team: u8, class: u8, slot: u8) -> Option<&WeaponAsset> {
+        let row = &self.held[usize::from(team.min(1))];
+        let i = usize::from(class).min(row.len().saturating_sub(1));
+        let held = row.get(i).map_or(&[][..], Vec::as_slice);
+        self.weapons.get(held_or_primary(
+            held,
+            self.class_draw(team, class).weapon,
+            slot,
+        )?)
     }
 
     pub fn has_model(&self, team: u8) -> bool {
@@ -988,11 +1146,11 @@ impl SoldierVisuals {
             .flatten();
         let (wc, weapon) = held.map_or((u.weapon_class, &u.weapon), |h| (h.class, &h.state));
         let class = walk.sim.weapon_classes.get(wc);
+        let team = &anim[usize::from(u.team.min(1))];
+        let anim = team.get(usize::from(u.spec.class).min(team.len().saturating_sub(1)));
         let set = match v.set {
             Some((c, set)) if c == wc => set,
             _ => {
-                let team = &anim[usize::from(u.team.min(1))];
-                let anim = team.get(usize::from(u.spec.class).min(team.len().saturating_sub(1)));
                 let bank = anim.zip(class).map_or("rifle", |(a, w)| a.bank_of(&w.name));
                 let set = rig.weapon_set(anim.map_or("human", |a| &a.family), bank);
                 v.set = Some((wc, set));
@@ -1005,6 +1163,7 @@ impl SoldierVisuals {
             vel: crate::animator::body_vel(s.vel, s.yaw),
             yaw: s.yaw,
             max_speed: u.consts.max_speed,
+            root_scale: anim.map_or(1.0, |a| a.root_scale),
             dead: !u.alive,
             set,
             fired: u.mount.is_none() && fired.contains(&(i as u32)),
@@ -1091,38 +1250,21 @@ impl SoldierVisuals {
             if u.mount.is_some() {
                 continue;
             }
-            let Some(weapon) = self.weapon_for(u.team, u.spec.class) else {
+            let hand = weapon_in_hand(u, &walk.sim.weapon_classes);
+            if hand.hidden {
+                continue;
+            }
+            let Some(weapon) = self.weapon_for(u.team, u.spec.class, hand.slot) else {
                 continue;
             };
             let m = model * palette[hp] * sa.asset.skeleton.global_bind[hp];
-            for (mesh, tex, layer, spec) in &weapon.parts {
-                // The weapon is a non-static draw with no shadow volume: the
-                // soldier's own character ambient on BF1 (re-model-lighting §12).
-                let light = render::LightPath::Character;
-                out.push(
-                    match tex {
-                        Some(t) if *layer == render::DrawLayer::Mask => {
-                            render::DrawCmd::textured_masked(*mesh, *t, m)
-                        }
-                        Some(t) => render::DrawCmd::textured(*mesh, *t, m),
-                        None => render::DrawCmd::flat(*mesh, [0.3, 0.3, 0.32, 1.0], m),
-                    }
-                    .with_light(light),
-                );
-                // The second pass rides only a textured draw: its add is
-                // weighted by the base texel's alpha (as the world's).
-                if let (Some(t), Some((rgb, power))) = (tex, spec) {
-                    out.push(
-                        render::DrawCmd::specular(*mesh, *t, *rgb, *power, m).with_light(light),
-                    );
-                }
-            }
+            weapon.part_draws(m, &mut out);
         }
         out
     }
 
     /// Every drawn unit's weapon fire point in the world, by unit index:
-    /// `hp_weapons` × its weapon's `FirePointName` node (the `hp_weapons`
+    /// `hp_weapons` × the weapon in hand's `FirePointName` node (the `hp_weapons`
     /// origin when the weapon model has no such node, §4.1). `None` for a
     /// unit drawn without a model or a hand node. Where the muzzle flash
     /// sits and the drawn bolt starts (`crate::bolt_vis`).
@@ -1131,14 +1273,15 @@ impl SoldierVisuals {
         for (i, sa, model, palette) in self.posed(walk) {
             if let (Some(hp), None) = (sa.hp_weapons, walk.sim.units[i].mount) {
                 let u = &walk.sim.units[i];
+                let in_hand = weapon_in_hand(u, &walk.sim.weapon_classes);
                 let name = walk
                     .sim
                     .weapon_classes
-                    .get(u.weapon_class)
+                    .get(in_hand.class)
                     .and_then(|w| w.flash.as_ref())
                     .map_or(core::flash::DEFAULT_FIRE_POINT, |f| f.fire_point.as_str());
                 let hand = model * palette[hp] * sa.asset.skeleton.global_bind[hp];
-                out[i] = Some(match self.weapon_for(u.team, u.spec.class) {
+                out[i] = Some(match self.weapon_for(u.team, u.spec.class, in_hand.slot) {
                     Some(w) => fire_point(hand, &w.nodes, name),
                     None => hand.transform_point3(Vec3::ZERO),
                 });
@@ -1165,7 +1308,7 @@ impl SoldierVisuals {
             let Some(look) = walk
                 .sim
                 .weapon_classes
-                .get(u.weapon_class)
+                .get(weapon_in_hand(u, &walk.sim.weapon_classes).class)
                 .and_then(|w| w.flash.as_ref())
                 .filter(|f| f.draws() && f.model.as_deref() == Some(model.name.as_str()))
             else {
@@ -1186,24 +1329,126 @@ impl SoldierVisuals {
     /// Soldier models face +Z; sim yaw 0 faces −Z, hence the extra π.
     pub fn draws(&self, walk: &WalkSim) -> Vec<SkinnedDrawCmd> {
         let mut out = Vec::new();
-        for (_, sa, model, palette) in self.posed(walk) {
-            for (mesh, tex, layer, spec) in &sa.meshes {
-                let base = SkinnedDrawCmd {
-                    mesh: *mesh,
-                    texture: *tex,
-                    color: [1.0; 4],
-                    model,
-                    palette: palette.clone(),
-                    layer: *layer,
-                    // BF2's local lights reach the soldier (card BPNT).
-                    lit: Some(crate::point_light::soldier_sphere(
-                        model.transform_point3(glam::Vec3::ZERO),
-                    )),
-                };
-                out.extend(with_spec(base, *spec));
-            }
+        for (i, sa, model, palette) in self.posed(walk) {
+            let u = &walk.sim.units[i];
+            self.body_draws(sa, u.team, u.spec.class, model, &palette, &mut out);
         }
         out
+    }
+
+    /// The parts of `team`'s class `class` (its skins over body `sa`) at
+    /// `model` posed by `palette`, each with its specular second pass.
+    fn body_draws(
+        &self,
+        sa: &SoldierAsset,
+        team: u8,
+        class: u8,
+        model: Mat4,
+        palette: &[Mat4],
+        out: &mut Vec<SkinnedDrawCmd>,
+    ) {
+        let row = &self.skins[usize::from(team.min(1))];
+        let skin = row
+            .get(usize::from(class).min(row.len().saturating_sub(1)))
+            .map_or(&[][..], Vec::as_slice);
+        for (k, (mesh, tex, layer, spec)) in sa.meshes.iter().enumerate() {
+            let base = SkinnedDrawCmd {
+                mesh: *mesh,
+                texture: skin.get(k).copied().flatten().or(*tex),
+                color: [1.0; 4],
+                model,
+                palette: palette.to_vec(),
+                layer: *layer,
+                // BF2's local lights reach the soldier (card BPNT).
+                lit: Some(crate::point_light::soldier_sphere(
+                    model.transform_point3(glam::Vec3::ZERO),
+                )),
+            };
+            out.extend(with_spec(base, *spec));
+        }
+    }
+
+    /// A soldier of `team`'s class `class` standing at `model` with his
+    /// primary weapon in hand, outside the sim (the spawn screens' preview
+    /// and line-up, card SSELB): `animator` is his own, stepped `dt` on the
+    /// standing clip of the primary's set. `None` when the class has no
+    /// model. Returns his body's draws and the weapon's.
+    pub fn still_draws(
+        &self,
+        animator: &mut Animator,
+        team: u8,
+        class: u8,
+        model: Mat4,
+        dt: f32,
+    ) -> Option<(Vec<SkinnedDrawCmd>, Vec<render::DrawCmd>)> {
+        let sa = self.asset_for(team, class)?;
+        if let Some(rig) = &sa.rig {
+            let row = &self.anim[usize::from(team.min(1))];
+            let anim = row.get(usize::from(class).min(row.len().saturating_sub(1)));
+            let bank = anim
+                .and_then(|a| a.banks.first())
+                .map_or("rifle", |(_, b)| b.as_str());
+            let input = AnimInput {
+                stance: core::soldier::Stance::Stand,
+                vel: glam::Vec2::ZERO,
+                yaw: 0.0,
+                max_speed: 1.0,
+                root_scale: anim.map_or(1.0, |a| a.root_scale),
+                dead: false,
+                set: rig.weapon_set(anim.map_or("human", |a| &a.family), bank),
+                fired: false,
+                reloading: false,
+                reload_time: 0.0,
+                alert: false,
+                aim: (0.0, 0.0),
+            };
+            animator.step(rig, &sa.asset.clips, &sa.asset.skeleton, &input, dt);
+        }
+        let palette = sa
+            .asset
+            .skeleton
+            .palette(&animator.pose(&sa.asset.skeleton).locals());
+        let mut body = Vec::new();
+        self.body_draws(sa, team, class, model, &palette, &mut body);
+        let mut gun = Vec::new();
+        let weapon = self
+            .class_draw(team, class)
+            .weapon
+            .and_then(|w| self.weapons.get(w));
+        if let (Some(hp), Some(w)) = (sa.hp_weapons, weapon) {
+            w.part_draws(
+                model * palette[hp] * sa.asset.skeleton.global_bind[hp],
+                &mut gun,
+            );
+        }
+        Some((body, gun))
+    }
+}
+
+impl WeaponAsset {
+    /// The weapon's parts at `m` (the hand's `hp_weapons` in the world),
+    /// each textured one with its specular second pass.
+    fn part_draws(&self, m: Mat4, out: &mut Vec<render::DrawCmd>) {
+        for (mesh, tex, layer, spec) in &self.parts {
+            // The weapon is a non-static draw with no shadow volume: the
+            // soldier's own character ambient on BF1 (re-model-lighting §12).
+            let light = render::LightPath::Character;
+            out.push(
+                match tex {
+                    Some(t) if *layer == render::DrawLayer::Mask => {
+                        render::DrawCmd::textured_masked(*mesh, *t, m)
+                    }
+                    Some(t) => render::DrawCmd::textured(*mesh, *t, m),
+                    None => render::DrawCmd::flat(*mesh, [0.3, 0.3, 0.32, 1.0], m),
+                }
+                .with_light(light),
+            );
+            // The second pass rides only a textured draw: its add is
+            // weighted by the base texel's alpha (as the world's).
+            if let (Some(t), Some((rgb, power))) = (tex, spec) {
+                out.push(render::DrawCmd::specular(*mesh, *t, *rgb, *power, m).with_light(light));
+            }
+        }
     }
 }
 
@@ -1228,6 +1473,63 @@ fn model_of(s: &core::soldier::Soldier) -> Mat4 {
 mod tests {
     use super::*;
 
+    /// Card USKN: a part takes its class's override of the group its
+    /// texture is listed under; parts in no group, and classes with no
+    /// override of that group, keep their own texture.
+    #[test]
+    fn a_part_takes_its_classs_override_of_its_group() {
+        let table: std::collections::BTreeMap<String, Vec<String>> = [
+            (
+                "override_texture".to_owned(),
+                vec!["all_inf_soldier".to_owned()],
+            ),
+            (
+                "override_texture2".to_owned(),
+                vec!["all_face01".to_owned()],
+            ),
+        ]
+        .into();
+        let groups = part_groups(
+            &[
+                Some("All_Inf_Soldier"),
+                Some("all_face01"),
+                Some("packs"),
+                None,
+            ],
+            &table,
+        );
+        assert_eq!(
+            groups,
+            [
+                Some("override_texture".to_owned()),
+                Some("override_texture2".to_owned()),
+                None,
+                None
+            ]
+        );
+        let skins = crate::roster::ClassSkins {
+            texture: Some("all_inf_soldier_hoth".into()),
+            texture2: Some("rebel_face02".into()),
+        };
+        let picked: Vec<Option<&str>> = groups
+            .iter()
+            .map(|g| skins.of_group(g.as_deref()?))
+            .collect();
+        assert_eq!(
+            picked,
+            [
+                Some("all_inf_soldier_hoth"),
+                Some("rebel_face02"),
+                None,
+                None
+            ]
+        );
+        let plain = crate::roster::ClassSkins::default();
+        assert!(groups
+            .iter()
+            .all(|g| g.as_deref().and_then(|g| plain.of_group(g)).is_none()));
+    }
+
     fn team(classes: &[(&str, Option<&str>, Option<&str>)]) -> TeamTemplate {
         let mut t = TeamTemplate::default_trooper();
         t.classes = classes
@@ -1239,9 +1541,11 @@ mod tests {
                 weapon_geometry: weapon.map(str::to_owned),
                 weapon_hud: Default::default(),
                 held_hud: Vec::new(),
+                held_models: Vec::new(),
                 foley_class: 0,
                 cries: Default::default(),
                 anim: Default::default(),
+                skins: Default::default(),
             })
             .collect();
         t
@@ -1323,6 +1627,183 @@ mod tests {
         assert_eq!(
             fire_point(hand, &nodes, "hp_other"),
             Vec3::new(10.0, 1.0, 0.0)
+        );
+    }
+
+    /// Card WHELD: a class slot draws its own weapon's model - a held slot
+    /// its own (or none), any other slot the primary's.
+    #[test]
+    fn a_slot_in_hand_draws_its_own_model() {
+        let mut t = team(&[(
+            "rep_inf_ep3_rifleman",
+            Some("rep_inf_ep3trooper"),
+            Some("rep_weap_inf_rifle"),
+        )]);
+        t.classes[0].held_models = vec![
+            (1, Some("rep_weap_inf_pistol".into())),
+            (2, Some("com_weap_inf_grenadethermal".into())),
+            (3, None),
+        ];
+        let plan = DrawPlan::of(&[t.clone(), t]);
+        for team in 0..2 {
+            assert_eq!(plan.weapon_in_slot(team, 0, 0), Some("rep_weap_inf_rifle"));
+            assert_eq!(plan.weapon_in_slot(team, 0, 1), Some("rep_weap_inf_pistol"));
+            assert_eq!(
+                plan.weapon_in_slot(team, 0, 2),
+                Some("com_weap_inf_grenadethermal")
+            );
+            assert_eq!(
+                plan.weapon_in_slot(team, 0, 3),
+                None,
+                "a slot with no model"
+            );
+            assert_eq!(plan.weapon_in_slot(team, 0, 7), Some("rep_weap_inf_rifle"));
+        }
+        assert_eq!(plan.weapons.len(), 3, "each model once: {:?}", plan.weapons);
+    }
+
+    /// The thermal detonator as the discs author it (re-grenades §9, BF2).
+    fn thermal() -> core::weapon::WeaponClass {
+        use core::weapon::{OrdnanceClass, Thrown, WeaponClass};
+        WeaponClass {
+            name: "thermal".into(),
+            rounds_per_clip: 1,
+            reload_time: 0.01,
+            trigger_single: true,
+            shot_delay: [1.3; 2],
+            initial_salvo_delay: 0.51,
+            thrown: Some(Thrown {
+                shot_elevate: 0.21,
+                hide_on_fire: true,
+                hand: Some(Thrown::BF2_HAND),
+            }),
+            ordnance: OrdnanceClass {
+                velocity: 25.0,
+                life_span: 0.6,
+                sticky: Some(core::sticky::StickyClass::new(true)),
+                ..OrdnanceClass::default()
+            },
+            ..WeaponClass::default()
+        }
+    }
+
+    /// Card WHELD acceptance 3, through the sim's own pad path: a soldier
+    /// holding the rifle, a pistol (slot 1, channel 0) and a thermal (slot 2,
+    /// channel 1). The switch puts the pistol in hand; the throw puts the
+    /// thermal in hand, hidden by its `HideOnFire` for the throw and the
+    /// reload; then the pistol is back. On a baked BF2 clone the drawn model
+    /// and the fire point follow: the pistol's `hp_fire`, not the rifle's.
+    #[test]
+    fn the_weapon_in_hand_follows_the_switch_and_the_throw() {
+        use core::sim::{buttons, PadState};
+        let mut w = WalkSim::new(3, Vec3::ZERO, None);
+        let mut pistol = core::weapon::WeaponClass::bf1_rifle();
+        pistol.name = "pistol".into();
+        let pistol = w.sim.add_weapon_class(pistol);
+        let thermal = w.sim.add_weapon_class(thermal());
+        let slot = |slot, channel, weapon_class, clips| core::unit::SlotSpec {
+            slot,
+            channel,
+            weapon_class,
+            clips,
+        };
+        let me = w
+            .sim
+            .spawn(&core::unit::UnitSpec {
+                slots: std::sync::Arc::new([slot(1, 0, pistol, 0), slot(2, 1, thermal, 4)]),
+                ..core::unit::UnitSpec::player_in_slot(1, 0, Vec3::new(4.0, 0.0, 0.0))
+            })
+            .expect("spawned")
+            .index as usize;
+        let pad = |b| {
+            [
+                PadState::default(),
+                PadState {
+                    buttons: b,
+                    ..Default::default()
+                },
+            ]
+        };
+        let hand = |w: &WalkSim| weapon_in_hand(&w.sim.units[me], &w.sim.weapon_classes);
+        let rifle = hand(&w);
+        assert_eq!((rifle.slot, rifle.hidden), (0, false));
+        w.step_tick(&pad(buttons::SWITCH_WEAPON));
+        w.step_tick(&pad(0));
+        let h = hand(&w);
+        assert_eq!(
+            (h.class, h.slot, h.hidden),
+            (pistol, 1, false),
+            "the pistol in hand"
+        );
+        let at_pistol = w.sim.tick;
+
+        // The throw: channel 1 has him, the thermal is hidden from its fire
+        // state through the reload, then the pistol is back.
+        let mut seen = Vec::new();
+        for n in 0..90 {
+            w.step_tick(&pad(if n < 2 { buttons::SECONDARY_FIRE } else { 0 }));
+            let h = hand(&w);
+            if seen.last() != Some(&h) {
+                seen.push(h);
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                InHand {
+                    class: thermal,
+                    slot: 2,
+                    hidden: true
+                },
+                InHand {
+                    class: pistol,
+                    slot: 1,
+                    hidden: false
+                },
+            ],
+            "the throw's hands"
+        );
+
+        // The drawn model and its fire point, on a baked soldier.
+        let root = crate::assets::baked_root();
+        let ok = |p: &str| root.join(format!("side_bf2/{p}")).exists();
+        if !ok("soldiers/rep_inf_ep3trooper.glb")
+            || !ok("weapons/rep_weap_inf_pistol.nodes.ron")
+            || !ok("weapons/rep_weap_inf_rifle.nodes.ron")
+        {
+            eprintln!("skip: no bf2 rep_inf_ep3trooper / pistol / rifle bake");
+            return;
+        }
+        let mut t = team(&[(
+            "rep_inf_ep3_rifleman",
+            Some("rep_inf_ep3trooper"),
+            Some("rep_weap_inf_rifle"),
+        )]);
+        t.classes[0].held_models = vec![(1, Some("rep_weap_inf_pistol".into()))];
+        let mut vis = SoldierVisuals::load_cpu(&root, "bf2", &[t.clone(), t]);
+        vis.update(&w, core::TICK_DT);
+        let rifle = vis.weapon_for(0, 0, 0).expect("the rifle");
+        let held = vis.weapon_for(0, 0, 1).expect("the pistol");
+        let fire = |n: &manifest::WeaponNodes| {
+            n.iter()
+                .find(|n| n.name.eq_ignore_ascii_case("hp_fire"))
+                .map(|n| Vec3::from(n.pos))
+        };
+        let (rp, pp) = (fire(&rifle.nodes).unwrap(), fire(&held.nodes).unwrap());
+        assert!(rp.distance(pp) > 0.1, "two guns, two muzzles: {rp} {pp}");
+        assert!(w.sim.tick > at_pistol);
+        let (_, sa, model, palette) = vis
+            .posed(&w)
+            .into_iter()
+            .find(|(i, ..)| *i == me)
+            .expect("drawn");
+        let hp = sa.hp_weapons.expect("hp_weapons");
+        let hand_m = model * palette[hp] * sa.asset.skeleton.global_bind[hp];
+        let got = vis.fire_points(&w)[me].expect("a fire point");
+        assert!(got.abs_diff_eq(hand_m.transform_point3(pp), 1e-4), "{got}");
+        assert!(
+            !got.abs_diff_eq(hand_m.transform_point3(rp), 1e-2),
+            "not the rifle's"
         );
     }
 
@@ -1599,6 +2080,7 @@ mod tests {
                         vel: glam::Vec2::new(0.0, if ahead { speed } else { -speed }),
                         yaw: 0.0,
                         max_speed: 7.0,
+                        root_scale: 1.0,
                         dead: false,
                         set: 0,
                         fired: false,

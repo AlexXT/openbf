@@ -4,14 +4,14 @@ title: The start-of-level and respawn flow: pick a SIDE (or random), then a comm
 milestone: M5
 value: 5
 phase: re
-status: todo
+status: done
 deps: SPSEL
 files:
 declares:
 needs:
 effort:
 branch:
-resume: RE FIRST, from the PS2 disc and PCSX2 (not the PC game, whose screens differ): capture the BF2 PS2 start-of-level sequence (side select incl. random, then the spawn map to pick a command post, then class select) and the death/respawn screen, and write `analysis/re-spawn-flow.md`; then build on the sim's spawn choice (SPSEL is the sim half).
+resume: RE done 5aa7304 2026-10-20 (analysis/re-spawn-flow.md [O]); split into build cards SSELA (sim: the stages, side choice, accept, no wave for the human), SSELB (the screens + camera-shot backdrops), SSELC (the death camera); report reports/20261020_0412_card_SSEL.md
 created: 2026-10-19
 first: 5
 ---
@@ -28,4 +28,4 @@ first: 5
 3. Replays reproduce: the choices ride the input log like the class choice does.
 
 ## Notes
-
+- planner 2026-10-19 16:25: the death camera belongs here too (what the PS2 shows between a death and the spawn screen: does it follow the body, turn to the killer, how long) - measure it in the same PCSX2 captures; card CFOVM is its FOV. The maintainer (INBOX 10-19 (a)): the in-game unit select (the rotating trooper line-up, framed by the map's camera shots) is probably the same on PS2 and PC, so its layout may follow the PC game's, checked against a PCSX2 capture; the shell is not (BSHL).

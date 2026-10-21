@@ -79,6 +79,8 @@ pub struct ClassRoster {
     pub cries: crate::walk::Cries,
     /// What picks the class's animation sets ([`class_anim`]).
     pub anim: crate::animator::ClassAnim,
+    /// The class's override textures ([`class_skins`], card USKN).
+    pub skins: ClassSkins,
     /// `JetJump > 0` — a jump/jet pack (BF1 dark trooper 21.0, BF2 jettrooper
     /// 5.0). There is NO jet physics this phase: the only consumer is the
     /// planning graph, which keeps `Arc::JET_JUMP` routes off a jetless
@@ -110,6 +112,9 @@ pub struct HeldSlot {
     pub weapon: WeaponClass,
     /// The slot in the HUD's weapon rows ([`weapon_hud`]).
     pub hud: crate::walk::WeaponHud,
+    /// The model drawn at `hp_weapons` while this slot is in hand
+    /// ([`weapon_model`], card WHELD), if any.
+    pub geometry: Option<String>,
 }
 
 /// Every soldier class a faction fields this round, in MISSION order.
@@ -438,8 +443,51 @@ pub fn cries(db: &ClassDb, class: &str) -> crate::walk::Cries {
 /// the super battle droid's wrists and draws no gun.
 pub fn weapon_geometry(db: &ClassDb, soldier: &str) -> Option<String> {
     let (weapon, _) = primary_weapon(db, soldier)?;
-    db.prop(&weapon, "GeometryName")
-        .map(|g| g.trim().to_owned())
+    weapon_model(db, &weapon)
+}
+
+/// The model a weapon class is drawn as in a soldier's hand: its
+/// `GeometryName` through the BASE chain (the soldier render draws the
+/// active weapon at `hp_weapons`, `analysis/re-muzzle-flash.md` §5;
+/// `re-grenades.md` §2.3 item 4). `None` = drawn as nothing.
+pub fn weapon_model(db: &ClassDb, weapon: &str) -> Option<String> {
+    db.prop(weapon, "GeometryName").map(|g| g.trim().to_owned())
+}
+
+/// A soldier class's skins (card USKN, `analysis/re-soldier-skeleton-skins.md`
+/// 9 [O]): `OverrideTexture` replaces the texture of its model's
+/// `override_texture` group, `OverrideTexture2` that of `override_texture2` -
+/// the second only with the first (BF1 `FUN_002013a0`, BF2 `FUN_00239bb0`).
+/// Lowercase texture names; `None` = the model's own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClassSkins {
+    pub texture: Option<String>,
+    pub texture2: Option<String>,
+}
+
+impl ClassSkins {
+    /// The override of a model group, if the class has one.
+    pub fn of_group(&self, group: &str) -> Option<&str> {
+        match group {
+            "override_texture" => self.texture.as_deref(),
+            "override_texture2" => self.texture2.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// [`ClassSkins`] of a class through its BASE chain.
+pub fn class_skins(db: &ClassDb, class: &str) -> ClassSkins {
+    let tex = |key: &str| {
+        db.prop(class, key)
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    };
+    let texture = tex("OverrideTexture");
+    ClassSkins {
+        texture2: texture.as_ref().and(tex("OverrideTexture2")),
+        texture,
+    }
 }
 
 /// What picks a soldier class's animation sets
@@ -467,7 +515,21 @@ pub fn class_anim(
             Some((s.weapon.to_ascii_lowercase(), bank))
         })
         .collect();
-    crate::animator::ClassAnim { family, banks }
+    // SkeletonRootScale counts only with an own skeleton (BF1 B1:123186-123194,
+    // BF2 B2:172070-172080; re-soldier-skeleton-skins 3).
+    let own = db
+        .prop(class, "SkeletonName")
+        .and_then(word)
+        .is_some_and(|s| !s.starts_with("human"));
+    let root_scale = own
+        .then(|| db.prop_f32(class, "SkeletonRootScale"))
+        .flatten()
+        .unwrap_or(1.0);
+    crate::animator::ClassAnim {
+        family,
+        root_scale,
+        banks,
+    }
 }
 
 /// What the HUD's weapon slot is told about `weapon` (`analysis/re-hud.md`
@@ -512,6 +574,7 @@ pub fn weapon_from_db(db: &ClassDb, weapon: &str) -> Result<WeaponClass> {
     });
     ord.laser = laser_look(db, &ord_name);
     ord.impact = impact_look(db, &ord_name);
+    ord.explosion = impact_explosion(db, &ord_name).and_then(|e| explosion_class(db, e));
     ord.kind = db
         .engine_base(&ord_name)
         .map_or(OrdKind::Other, OrdKind::from_base);
@@ -565,14 +628,7 @@ pub fn thrown_weapon_from_db(db: &ClassDb, weapon: &str) -> Result<Option<Weapon
     let mut sticky = core::sticky::StickyClass::replay(chain_props(db, ord_name), bf2);
     sticky.explosion = db
         .prop(ord_name, "ExplosionExpire")
-        .and_then(|e| db.resolve(e.trim()))
-        .map(|e| {
-            let mut x = ExplosionClass::from_props(&ClassSrc { db, class: e });
-            if let Some(look) = explosion_look(db, e) {
-                x.look = look;
-            }
-            x
-        });
+        .and_then(|e| explosion_class(db, e));
     ord.sticky = Some(sticky);
     ord.kind = OrdKind::Lobbed;
     let mut w = WeaponClass::from_props(weapon, &wsrc, ord);
@@ -612,6 +668,7 @@ pub fn held_slots(db: &ClassDb, soldier: &str, primary: u8) -> Vec<HeldSlot> {
                 channel: s.channel,
                 clips: s.ammo.unwrap_or(0),
                 hud: weapon_hud(db, &name),
+                geometry: weapon_model(db, &name),
                 weapon,
             })
         })
@@ -697,12 +754,36 @@ pub fn impact_look(db: &ClassDb, ordnance: &str) -> Option<ImpactLook> {
             ..ImpactLook::default()
         };
     }
-    l.explosion = db
-        .props_all(ordnance, "ExplosionName")
-        .last()
-        .map(|e| e.trim())
-        .and_then(|e| explosion_look(db, e));
+    l.explosion = impact_explosion(db, ordnance).and_then(|e| explosion_look(db, e));
     Some(l)
+}
+
+/// The keys that set an ordnance's impact explosion (re-blaster-damage 7.3,
+/// class +0x38 / +0x4c): `Explosion`, `ExplosionImpact` and `ExplosionName`.
+const IMPACT_EXPLOSION_KEYS: [u32; 3] = [0x02bb_1fe0, 0x61a8_bb12, 0x9b30_e763];
+
+/// An ordnance's impact explosion class name (card RKEX): the last of the
+/// three keys in the chain's file order, base first - each writes the same
+/// field. The BF2 EMP launcher names it by `ExplosionImpact`, the rocket
+/// launchers by `ExplosionName`.
+fn impact_explosion<'a>(db: &'a ClassDb, ordnance: &str) -> Option<&'a str> {
+    chain_props(db, ordnance)
+        .into_iter()
+        .rev()
+        .find(|(h, _)| IMPACT_EXPLOSION_KEYS.contains(h))
+        .map(|(_, v)| v.trim())
+        .filter(|v| !v.is_empty())
+}
+
+/// An `expc` class's numbers and look, `None` when the class is not in the
+/// db.
+fn explosion_class(db: &ClassDb, name: &str) -> Option<ExplosionClass> {
+    let e = db.resolve(name.trim())?;
+    let mut x = ExplosionClass::from_props(&ClassSrc { db, class: e });
+    if let Some(look) = explosion_look(db, e) {
+        x.look = look;
+    }
+    Some(x)
 }
 
 /// An explosion class's `Effect` / `WaterEffect` ([`core::impact`]); `None`
@@ -896,6 +977,7 @@ impl ClassRoster {
             spare_clips,
             held: held_slots(db, class, weapon_slot),
             anim: class_anim(db, class, &slots),
+            skins: class_skins(db, class),
             slots,
             weapon_slot,
             geometry: db.prop(class, "GeometryName").map(|g| g.trim().to_owned()),

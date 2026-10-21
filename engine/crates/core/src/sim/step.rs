@@ -69,12 +69,13 @@ impl Sim {
     /// every 5th tick, phased by its index, a human's every tick (card
     /// CLSE2, `analysis/re-soldier-ai.md` 18.1). The decay and the floor are
     /// the skill of who shoots at the unit: the tier's one base skill here
-    /// (OURS: the PS2 keeps a skill per team and moves it by auto-balance).
+    /// (OURS: the PS2 keeps a skill per team and moves it by auto-balance);
+    /// under a per-team tier (card ARVS) the other side's.
     fn aim_blocks(&mut self) {
         if self.ground_rules != crate::soldier::GroundRules::Bf2 {
             return;
         }
-        let skill = self.difficulty.skill();
+        let skills = [0u8, 1, 2].map(|t| self.enemy_difficulty_of(t).skill());
         let tick = self.tick;
         for (i, u) in self.units.iter_mut().enumerate() {
             let period = if u.is_player {
@@ -90,6 +91,7 @@ impl Sim {
                 2.0 * ai::unit_unit(i as u32, tick, u.gen, salt) - 1.0
             };
             let jolt = Vec3::new(draw(0), draw(0x51ED_2701), draw(0xA3DA_4E03));
+            let skill = &skills[usize::from(u.team.min(2))];
             u.aim.think(
                 period as f32 * TICK_DT,
                 u.soldier.vel,
@@ -117,8 +119,8 @@ impl Sim {
         //     can act on it.
         self.spawn_select(pads);
 
-        // 0. Respawns (respawn timer expired, then the team's spawn wave;
-        //    AI additionally capped by the alive-AI cap: BF2 FUN_0034cea8
+        // 0. Respawns (respawn timer expired, then the team's spawn wave for
+        //    a bot - a human skips it, card SSELA; AI additionally capped by the alive-AI cap: BF2 FUN_0034cea8
         //    waits 5 s when NumBots is reached).
         for w in &mut self.waves {
             w.tick(dt);
@@ -128,18 +130,35 @@ impl Sim {
             if u.alive || u.respawn_at.is_none_or(|t| t > self.tick) {
                 continue;
             }
+            // A HUMAN waits for no spawn wave (BF2 `FUN_0034cea8` skips the
+            // wave tests for a human, `B2:344186-344192`, card SSELA). Behind
+            // the spawn screens its timer running out opens the spawn map
+            // (when its team still has tickets, `B2:392963`), and the class
+            // accept is what spawns it (`Sim::spawn_screen_input`).
+            if u.is_player {
+                match u.spec.player_slot.map(usize::from) {
+                    Some(s) if self.spawn_screens => {
+                        let team = u.team;
+                        if self.spawn_stage.get(s) == Some(&super::spawn::SpawnStage::Accepted)
+                            && self.battle.teams[usize::from(team.min(1))].tickets() > 0
+                        {
+                            self.open_spawn_map(s, team);
+                        }
+                    }
+                    _ => self.respawn_slot(i),
+                }
+                continue;
+            }
             // A bot asks for its post when the timer runs out and keeps the
             // answer through the waits below (card BSPN).
-            if !u.is_player {
-                self.keep_or_draw_spawn_post(i);
-            }
+            self.keep_or_draw_spawn_post(i);
             let u = &self.units[i];
             if let Some(slot) = u.spawn_slot {
                 if !self.waves[usize::from(u.team).min(1)].ready(slot) {
                     continue;
                 }
             }
-            if !u.is_player {
+            {
                 let team = u.team;
                 let alive_ai = self
                     .units
@@ -160,6 +179,8 @@ impl Sim {
         //     is not given an objective this same tick.
         self.squad_pass(pads);
 
+        // Card HITCH: the AI's wall time (the frame recorder's; no sim input).
+        let ai_t0 = std::time::Instant::now();
         // 1. The COMMANDER (Phase B), before anyone thinks, so the think loop
         //    below reads the plan made this same tick. One team per tick at
         //    most: team t plans when the tick reaches its `next_plan_tick`,
@@ -190,7 +211,12 @@ impl Sim {
         // 1a. Every BF2 unit's own aim-error block (card CLSE2), before the
         //     think that reads it.
         self.aim_blocks();
+        // 1a''. Card TEAM: the team board's roles, before the thinks.
+        crate::ai::team::board(self);
         let mut ai_updates: Vec<(usize, AiState, PadState, ai::NavTick)> = Vec::new();
+        // Card TEAM: the unit grid answers "who is near" for the thinks, which
+        // read a sim no one moves until the write-back.
+        self.unit_grid.build(&self.units);
         for (i, u) in self.units.iter().enumerate() {
             if u.alive && u.controller == Controller::Ai {
                 let mut st = u.ai;
@@ -198,11 +224,16 @@ impl Sim {
                 ai_updates.push((i, st, p, nt));
             }
         }
+        self.unit_grid.clear();
+        self.ai_wall_ms = ai_t0.elapsed().as_secs_f32() * 1000.0;
         let mut recycled: Vec<(usize, DeathCause)> = Vec::new();
         // Card TPOS: positions taken this tick, granted in unit-index order.
         let mut granted: Vec<glam::Vec3> = Vec::new();
         for (i, mut st, p, nt) in ai_updates {
             ai::tactic::grant(&self.positions, self.tick, &mut st, &mut granted);
+            self.nav_stats.cover_ticks += u64::from(st.role.post.is_some());
+            self.nav_stats.flank_ticks += u64::from(st.flank.route.is_some());
+            self.nav_stats.overwatch_ticks += u64::from(st.behaviour == ai::Behaviour::Overwatch);
             self.units[i].ai = st;
             // Card BNDS: a bot off the level with no way back is given up
             // here, in the write-back's fixed order — and (card RCYC) one
@@ -211,6 +242,7 @@ impl Sim {
                 recycled.push((i, DeathCause::Lost));
             } else if nt.stalled != 0 {
                 recycled.push((i, DeathCause::Stalled));
+                self.nav_stats.flank_stalled += u64::from(self.units[i].ai.flank.route.is_some());
             }
             if self.units[i].mount.is_some() {
                 self.nav_stats.ai_drive_ticks += 1;
@@ -218,6 +250,7 @@ impl Sim {
             unit_pads[i] = p;
             self.nav_stats.bfs_fallbacks += u64::from(nt.bfs);
             self.nav_stats.straight_fallbacks += u64::from(nt.straight);
+            self.nav_stats.flank_legs += u64::from(nt.flank);
             self.nav_stats.stuck_max = self.nav_stats.stuck_max.max(nt.stuck_run);
             self.nav_stats.detoured_legs += u64::from(nt.detoured);
             self.nav_stats.blocked_ticks += u64::from(nt.blocked);
@@ -229,6 +262,7 @@ impl Sim {
                 self.nav_stats.unreachable_dwell_max.max(nt.dwell);
             self.nav_stats.contacts_max = self.nav_stats.contacts_max.max(nt.contacts);
             self.nav_stats.heard_contacts += u64::from(nt.heard);
+            self.nav_stats.told_contacts += u64::from(nt.told);
             self.nav_stats.line_held += u64::from(nt.line_held);
             self.nav_stats.tpos_queries += u64::from(nt.tpos_query != 0);
             self.nav_stats.tpos_ceiling += u64::from(nt.tpos_query == 2);
@@ -569,11 +603,33 @@ impl Sim {
             let blocked = self.units[i].soldier.stance == Stance::Roll;
             // A soldier with more slots than the one in its hands (GREN):
             // the channels decide whether FIRE reaches the primary.
-            let fire_held = if self.units[i].held.is_empty() {
+            let mut fire_held = if self.units[i].held.is_empty() {
                 p.pressed(buttons::FIRE)
             } else {
                 self.held_weapons(i, &p, blocked, dt)
             };
+            // Card RKSLF (OURS): a bot's exploding shot that this update
+            // could release - a salvo latched in the cycle, a held trigger,
+            // or a charge weapon's trigger coming up (it fires on the
+            // release, `fire_predicate`) - whose blast would come back on its
+            // own side is not let go: the salvo is cancelled as the PS2's
+            // put-away cancels one, and the trigger stays as it was before
+            // the shot (up, or a charge still held).
+            if self.units[i].controller == Controller::Ai {
+                let w = &self.units[i].weapon;
+                let charge = self.weapon_classes[self.units[i].weapon_class].max_pressed_time > 0.0;
+                let releasing = w.salvo_counter >= 1
+                    || if charge {
+                        !fire_held && w.fire_cmd > 0
+                    } else {
+                        fire_held
+                    };
+                if releasing && crate::ai::release_blasts_own_side(self, i) {
+                    fire_held = charge && self.units[i].weapon.fire_cmd > 0;
+                    self.units[i].weapon.salvo_counter = 0;
+                    self.nav_stats.blast_holds += 1;
+                }
+            }
             let input = FireInput {
                 held: fire_held,
                 blocked,
@@ -591,8 +647,11 @@ impl Sim {
             // 2). Ours is written once per fire tick, which has the same
             // effect — `spread_mult` is only read when a shot adds spread
             // (`weapon.rs`, `spread_per_shot`). A player keeps 1.0.
-            let ai_spread_mult = (self.units[i].controller == Controller::Ai)
-                .then(|| self.difficulty.skill_at(self.units[i].skill).spread_mult);
+            let ai_spread_mult = (self.units[i].controller == Controller::Ai).then(|| {
+                self.difficulty_of(self.units[i].team)
+                    .skill_at(self.units[i].skill)
+                    .spread_mult
+            });
             let fire_empty;
             let reload_started = {
                 let wc = &self.weapon_classes[wc_idx];
@@ -1402,6 +1461,95 @@ mod tests {
             (stopped - -2.0).abs() < 0.1,
             "pushed out of the wall: {stopped}"
         );
+    }
+
+    /// Card RKSLF (OURS): a bot whose launcher's salvo is latched in the
+    /// cycle (pressed, InitialSalvoDelay still running, FIRE up since)
+    /// fires no rocket into the wall 2.5 m before its muzzle: the salvo is
+    /// dropped where it would leave and the bot is unhurt. 22.5 m from the
+    /// same wall the rocket leaves - unless a team-mate stands by the spot
+    /// it lands on (an enemy there does not hold it). A charge launcher
+    /// (MaxPressedTime, TriggerSingle: the shot leaves when the trigger comes
+    /// up) whose bot lets go facing the near wall keeps its charge held.
+    #[test]
+    fn a_bot_fires_no_rocket_into_the_wall_before_it() {
+        use crate::weapon::{ExplosionClass, FireState};
+        // (shots, the shooter's health lost, blast holds)
+        let run = |z: f32, by_wall: Option<u8>, charge: bool| {
+            let mut sim = Sim::empty(3);
+            sim.heightfield = Some(flat_ground());
+            sim.collision = wall_world();
+            let mut w = sim.weapon_classes[0].clone();
+            w.ordnance.velocity = 100.0;
+            w.ordnance.life_span = 3.0;
+            w.ordnance.explosion = Some(ExplosionClass {
+                damage: 400.0,
+                damage_inner: 2.0,
+                damage_outer: 4.0,
+                ..ExplosionClass::default()
+            });
+            if charge {
+                w.max_pressed_time = 0.75;
+                w.trigger_single = true;
+            } else {
+                w.initial_salvo_delay = 0.25;
+            }
+            sim.weapon_classes.push(w);
+            let wc = sim.weapon_classes.len() - 1;
+            let h = sim.spawn(&ai(0, Vec3::new(0.0, 0.0, z), 0.0)).unwrap();
+            if let Some(team) = by_wall {
+                // An idle trooper on this side of the slab, 2.3 m from
+                // where the rocket strikes it.
+                sim.spawn(&UnitSpec::trooper(team, Vec3::new(2.0, 0.0, -1.5)))
+                    .unwrap();
+            }
+            {
+                let u = &mut sim.units[h.index as usize];
+                u.weapon_class = wc;
+                u.weapon.active = true;
+                u.weapon.clip = 10;
+                if charge {
+                    // Charging for 5 ticks; the bot's pad lets go now.
+                    u.weapon.fire_cmd = 5;
+                } else {
+                    // The press of a tick ago: the cycle holds one salvo,
+                    // due 0.2 s from now.
+                    u.weapon.state = FireState::Firing;
+                    u.weapon.salvo_counter = 1;
+                    u.weapon.salvo_timer = 0.2;
+                }
+            }
+            let hp0 = sim.units[h.index as usize].health.cur;
+            let mut shots = 0;
+            for _ in 0..12 {
+                sim.step(&[PadState::default()]);
+                shots += sim
+                    .events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Shot { unit, .. } if *unit == h))
+                    .count();
+            }
+            let hp = sim.unit(h).map_or(0.0, |u| u.health.cur);
+            (shots, hp0 - hp, sim.nav_stats.blast_holds)
+        };
+        for charge in [false, true] {
+            let (shots, lost, holds) = run(0.0, None, charge);
+            assert_eq!(
+                (shots, lost),
+                (0, 0.0),
+                "no rocket into the wall ({charge})"
+            );
+            assert!(holds >= 1);
+            assert_eq!(
+                run(20.0, None, charge),
+                (1, 0.0, 0),
+                "the far wall: it leaves"
+            );
+            let (shots, _, holds) = run(20.0, Some(0), charge);
+            assert_eq!(shots, 0, "a team-mate by the far wall ({charge})");
+            assert!(holds >= 1);
+            assert_eq!(run(20.0, Some(1), charge).0, 1, "an enemy by the far wall");
+        }
     }
 
     /// Determinism holds with a collision world, and the world CHANGES the

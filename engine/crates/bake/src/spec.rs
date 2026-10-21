@@ -146,6 +146,7 @@ mod tests {
             spec_color: color,
             textures: Vec::new(),
             bone: None,
+            group: None,
             bmap: Vec::new(),
             bind: Vec::new(),
             wght: Vec::new(),

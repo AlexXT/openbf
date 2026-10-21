@@ -26,7 +26,7 @@
 //! OURS, PROVISIONAL: what the PS2's soldier narrowphase does with such a
 //! leaf is not read. Its RAY test (BF2 `FUN_00165070`) is one-sided and asks
 //! a hit to lie inside every edge of the stored polygon — an unverified
-//! reading, not in `analysis/`.
+//! reading, not in `analysis/` (card COLN).
 
 use std::collections::HashMap;
 

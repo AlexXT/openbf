@@ -24,10 +24,14 @@
 //!   PORT'S OWN fallback for the entries the authors left empty.
 //!
 //! PROVISIONAL/ours, and labelled as such where they appear: the BFS fallback,
-//! and the connected-component cache that keeps the "is that post reachable at
-//! all" test O(1).
+//! the connected-component cache that keeps the "is that post reachable at
+//! all" test O(1), and the flank table ([`flank`], card FLNK: per post pair
+//! the best other way, which a share of the attackers walks).
 
 use glam::{Vec2, Vec3};
+
+pub mod flank;
+pub use flank::{FlankRoute, FlankTable};
 
 /// Routed unit types on the disc: the five route tables (SOLDIER, HOVER,
 /// SMALL, MEDIUM, HUGE). FLYER has no table — flyers do not route.

@@ -187,8 +187,18 @@ pub fn upload_texture_file(
     if !pak::exists(dir.join(format!("{name}.ktx2"))) {
         return Ok(None);
     }
+    let t0 = std::time::Instant::now();
     let t = crate::assets::load_texture(dir, name)?;
-    Ok(Some(upload_cpu_texture(r, &t, name)?))
+    let h = upload_cpu_texture(r, &t, name)?;
+    // The frame recorder's (card HITCH): a file loaded in a battle frame.
+    let bytes = t.rgba.len() + t.extra_mips.iter().map(Vec::len).sum::<usize>();
+    render::made::note(
+        "texture file",
+        Some(name),
+        bytes as u64,
+        t0.elapsed().as_secs_f32() * 1000.0,
+    );
+    Ok(Some(h))
 }
 
 /// One uploaded submesh: its mesh handle, the material name (`None` when the

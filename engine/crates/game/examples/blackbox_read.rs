@@ -16,13 +16,19 @@
 //! which body, its goal), every unit within 15 m of the human, the posts, the
 //! last 30 s of events, and the sounds (card SNDB): a line for every tick
 //! whose starts sum over full scale ("N starts, sum G: names") and the last
-//! 10 s of starts - name, gain, pitch, metres, voices, take file.
+//! 10 s of starts - name, gain, pitch, metres, voices, take file. Right
+//! after the header, the frame record (card HITCH, schema 6): the summary
+//! line (frames, p50 / p99 / worst ms, frames over 25 ms past the first 5 s
+//! and per minute), the five longest frames and the newest ten over 25 ms,
+//! each with its phases, ticks run, AI and hook ms and the GPU objects made.
 //!
 //! Views:
 //! - `--unit <id>`: that unit in every frame, its trail and its events;
 //! - `--near x,y,z,r`: the units within `r` of a point in the last frame;
 //! - `--events`: every event in the file;
 //! - `--sounds`: every sound start in the file (60 s);
+//! - `--frames`: every slow frame the record kept (up to 256), each GPU
+//!   object made in it named;
 //! - `--replay-spot [id]`: one line for a headless follow-up on a unit's spot
 //!   (the focus unit by default): the map, seed, tick and place, and the
 //!   `round_to_outcome` command that looks at it.
@@ -318,6 +324,68 @@ fn blocked_run(frames: &[Frame], id: u32, gen: u32) -> Option<Run> {
     }
     close(&mut run);
     best
+}
+
+/// The frame record (card HITCH): the summary, the worst five, and the
+/// newest ten slow frames (`all`: every one kept, each GPU object named).
+fn frame_record(snap: &Snapshot, all: bool) -> String {
+    let mut s = String::new();
+    let Some(h) = &snap.hitches else {
+        let why = match snap.schema < 6 {
+            true => "schema < 6: written before card HITCH",
+            false => "a headless round, or the record off",
+        };
+        let _ = writeln!(s, "FRAMES  not recorded ({why})");
+        return s;
+    };
+    let _ = writeln!(s, "FRAMES  {}", h.summary());
+    for w in &h.worst {
+        let _ = writeln!(s, "  worst  {}", w.line());
+    }
+    if !h.made.is_empty() {
+        let made: Vec<String> = h
+            .made
+            .iter()
+            .map(|m| {
+                format!(
+                    "{} {:?} x{} ({:.1} MB, {:.1} ms)",
+                    m.kind,
+                    m.label,
+                    m.count,
+                    m.bytes as f64 / (1024.0 * 1024.0),
+                    m.ms
+                )
+            })
+            .collect();
+        let _ = writeln!(s, "  made past {:.0} s: {}", h.settle_s, made.join(", "));
+    }
+    let from = if all {
+        0
+    } else {
+        h.slow.len().saturating_sub(10)
+    };
+    if !h.slow.is_empty() {
+        let _ = writeln!(
+            s,
+            "  slow (over {:.0} ms): {} kept, {}",
+            h.limit_ms,
+            h.slow.len(),
+            if all { "all" } else { "the newest 10" }
+        );
+    }
+    for r in &h.slow[from..] {
+        let _ = writeln!(s, "  slow   {}", r.line());
+        if all {
+            for m in &r.made {
+                let _ = writeln!(
+                    s,
+                    "           made {} {:?} {} B {:.2} ms",
+                    m.kind, m.label, m.bytes, m.ms
+                );
+            }
+        }
+    }
+    s
 }
 
 fn header(snap: &Snapshot) -> String {
@@ -949,14 +1017,14 @@ fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("{a} wants a value"))?;
                 view = Some((a.clone(), Some(v.clone())));
             }
-            "--events" | "--sounds" => view = Some((a.clone(), None)),
+            "--events" | "--sounds" | "--frames" => view = Some((a.clone(), None)),
             "--replay-spot" => {
                 let v = it.next_if(|n| n.parse::<u32>().is_ok()).cloned();
                 view = Some((a.clone(), v));
             }
             f if !f.starts_with("--") => file = Some(std::path::PathBuf::from(f)),
             other => anyhow::bail!(
-                "unknown view {other} (--unit <id>, --near x,y,z,r, --events, --sounds, --replay-spot [id])"
+                "unknown view {other} (--unit <id>, --near x,y,z,r, --events, --sounds, --frames, --replay-spot [id])"
             ),
         }
     }
@@ -979,6 +1047,8 @@ fn main() -> anyhow::Result<()> {
         format!("{:.2} MB", b as f64 / (1024.0 * 1024.0))
     });
     print!("{}", header(&snap));
+    let all_frames = view.as_ref().is_some_and(|v| v.0 == "--frames");
+    print!("{}", frame_record(&snap, all_frames));
     match view.as_ref().map(|(k, v)| (k.as_str(), v.as_deref())) {
         Some(("--unit", Some(v))) => print!("{}", unit_view(&snap, v.parse()?)),
         Some(("--near", Some(v))) => {
@@ -1001,6 +1071,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(("--events", _)) => print!("{}", events(&snap, None)),
         Some(("--sounds", _)) => print!("{}", game::blackbox::sound_digest(&snap, None)),
+        Some(("--frames", _)) => {}
         Some(("--replay-spot", v)) => {
             print!("{}", replay_spot(&snap, v.and_then(|x| x.parse().ok())))
         }

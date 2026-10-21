@@ -119,6 +119,9 @@ pub struct HudModel {
     /// The command-post capture icon (card CPBAR); `None` = not in a post's
     /// capture region, or nothing to show there.
     pub capture: Option<crate::hud_capture::CaptureIcon>,
+    /// The spawn screen drawn in the HUD's frame (card SSELB,
+    /// `crate::spawn_draw`); `None` = none up.
+    pub spawn: Option<crate::spawn_draw::SpawnPage>,
 }
 
 pub const TEAM_COLORS: [Color32; 2] = [
@@ -235,6 +238,7 @@ pub fn feed(hud: &mut Hud, m: &HudModel, has_mesh: &dyn Fn(&str) -> bool) {
     hud.map = m.map.clone();
     hud.squad = m.squad.clone();
     hud.capture = m.capture;
+    hud.spawn = m.spawn.clone();
     let mut put = |event: &str, v: EventValue| hud.publish(event, v, has_mesh);
     if alive && m.map.is_some() {
         put("player1.map.enable", EventValue::None);
@@ -498,6 +502,7 @@ mod tests {
             map: None,
             squad: None,
             capture: None,
+            spawn: None,
         }
     }
 

@@ -11,6 +11,7 @@ mod detail_map;
 mod frame_filter;
 mod gpu_smoke;
 mod light_path;
+mod lod_switch;
 mod skinned;
 mod sky_shell;
 mod specular;

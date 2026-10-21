@@ -14,14 +14,10 @@ use render::{box_side, Camera, DrawCmd, FrameFilter, Renderer};
 use crate::common;
 use common::{upload_tex, view_quad};
 
-/// 448 lines: one PS2 half-scale pixel is a 2×2 box, as on the PS2.
-const W: u32 = 96;
-const H: u32 = 448;
-
-#[test]
-#[ignore = "requires a GPU adapter (run with --ignored on the NVIDIA box)"]
-fn the_pass_matches_the_ps2_model() {
-    let mut r = Renderer::new_headless(W, H).expect("headless renderer");
+/// Render the noise sheet off and on at `w`×`h` and return the worst
+/// level the pass is off the n × n model, and how many channels it lifted.
+fn pass_against_model(w: u32, h: u32) -> (f32, usize) {
+    let mut r = Renderer::new_headless(w, h).expect("headless renderer");
     // A 16×16 noise sheet over the whole view: every level from dark to
     // bright, edges everywhere, so the box and the threshold both matter.
     let mut seed = 12345u32;
@@ -52,7 +48,6 @@ fn the_pass_matches_the_ps2_model() {
     let (on, _, _) = r.capture_rgba().expect("capture");
 
     let n = box_side(h) as i32;
-    assert_eq!(n, 2);
     let at = |x: i32, y: i32, c: usize| {
         let x = x.clamp(0, w as i32 - 1) as u32;
         let y = y.clamp(0, h as i32 - 1) as u32;
@@ -77,15 +72,45 @@ fn the_pass_matches_the_ps2_model() {
             }
         }
     }
-    assert!(worst <= 2.0, "the pass is {worst} levels off the model");
-    assert!(
-        lifted > (w * h) as usize,
-        "the filter lifted only {lifted} channels"
-    );
 
     // Off again: the frame is back to the unfiltered bytes exactly.
     r.set_frame_filter(None);
     r.render(&cam, &draws, [0.0, 0.0, 0.0, 1.0])
         .expect("render");
     assert_eq!(r.capture_rgba().expect("capture").0, off);
+    (worst, lifted)
+}
+
+#[test]
+#[ignore = "requires a GPU adapter (run with --ignored on the NVIDIA box)"]
+fn the_pass_matches_the_ps2_model() {
+    // 448 lines: one PS2 half-scale pixel is a 2×2 box, as on the PS2.
+    assert_eq!(box_side(448), 2);
+    let (worst, lifted) = pass_against_model(96, 448);
+    assert!(worst <= 2.0, "the pass is {worst} levels off the model");
+    assert!(
+        lifted > (96 * 448) as usize,
+        "the filter lifted only {lifted} channels"
+    );
+}
+
+/// Card ISPF: the box is two 1-D passes (rows, then columns); at 720, 1080
+/// and 1920 lines (3 × 3, 5 × 5, 9 × 9: an odd side ends on a single load)
+/// it is the n × n box's mean to the rounding of the 8-bit result - no more
+/// than one level off the model anywhere (measured 0.55-0.67 on both GPUs).
+#[test]
+#[ignore = "requires a GPU adapter (run with --ignored on the NVIDIA box)"]
+fn the_two_pass_box_is_the_square_box() {
+    for (w, h, n) in [(96, 720, 3), (64, 1080, 5), (48, 1920, 9)] {
+        assert_eq!(box_side(h), n);
+        let (worst, lifted) = pass_against_model(w, h);
+        assert!(
+            worst <= 1.0,
+            "{h} lines: the pass is {worst} levels off the n x n box"
+        );
+        assert!(
+            lifted > (w * h) as usize,
+            "{h} lines: the filter lifted only {lifted} channels"
+        );
+    }
 }

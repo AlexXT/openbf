@@ -94,6 +94,14 @@
 //!   OPENBF_PROFILE=<file>         the profile file (default
 //!                                 $XDG_CONFIG_HOME/openbf/profile.ron)
 //!   OPENBF_ADAPTER=igpu|dgpu|<name>  the GPU (default: high performance)
+//!   OPENBF_GPU_TIMING=1           GPU ms per section of the frame (timestamp
+//!                                 queries; `--bench` prints them, the
+//!                                 frame profile writes them; card ISPD)
+//!   OPENBF_FRAME_PROFILE=<csv>    windowed: a row of CPU and GPU ms per
+//!                                 battle frame (game::frame_profile)
+//!   OPENBF_NO_VSYNC=1             windowed: present without vsync
+//!   OPENBF_WINDOW_SIZE=WxH        windowed: the first window size in
+//!                                 physical pixels (default 1280x720 logical)
 //!   OPENBF_BF1_WALKER_PACE=1      BF1 walkers on their own gait (vehicle_class::walker)
 //!   MUSIC_LOG=<team>              headless: log the music manager's changes
 //!                                 for that team; OPENBF_SOUND_ROOT=<dir> reads

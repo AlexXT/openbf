@@ -25,7 +25,8 @@
 //! graph to the vehicle's hub, `route::retarget_board`, then straight) and
 //! when a claim is lost to another bot ([`board_goal`]); the entry reach
 //! (the player's, 5 m past the vehicle's radius, plus [`BOARD_SLACK`],
-//! measured from the bot's feet in XZ); the dismount at the post, with no
+//! measured from the bot's feet in XZ; a building turret's is the PS2's
+//! board agent, card TBRD, [`in_reach`]); the dismount at the post, with no
 //! objective, when stuck (`DRIVE_STUCK_BAIL`) or routeless, or in a class
 //! the port cannot drive; and (card WAI) where a walker goes when its
 //! type's graph does not reach its post's hub — the hub it can reach
@@ -53,10 +54,12 @@ use super::gunner::Look;
 use super::route::{hub_has_floor, post_hub};
 use super::state::{AiState, NavTick, RideState, SteerPick};
 use super::{
-    BOARD_BLOCK, BOARD_GIVEUP, BOARD_SEEK, BOARD_SLACK, BOARD_TRIP, GUNNER_WAIT, RIDE_GAIN,
+    BOARD_BLOCK, BOARD_GIVEUP, BOARD_PAD_BF1, BOARD_PAD_BF2, BOARD_SEEK, BOARD_SLACK, BOARD_TRIP,
+    GUNNER_WAIT, OTHER_FLOOR, RIDE_GAIN,
 };
 use crate::nav;
 use crate::sim::{PadState, Sim, ENTER_REACH};
+use crate::soldier::GroundRules;
 use crate::unit::{Unit, UnitHandle};
 use crate::vehicle::{Mount, SeatKind, VehicleHandle, VehicleKind, STUCK_MOVED};
 use glam::Vec3;
@@ -91,15 +94,50 @@ pub(crate) fn claim_seat(sim: &Sim, me: UnitHandle, vh: VehicleHandle) -> Option
     (k == 0 || armed(k)).then_some(k)
 }
 
-/// The reach within which a claim is boarded: the vehicle's radius plus the
-/// player's 5 m (`ENTER_REACH`) and [`BOARD_SLACK`].
-pub(crate) fn board_reach(sim: &Sim, vh: VehicleHandle) -> f32 {
-    sim.vehicle(vh)
-        .and_then(|v| sim.seat_setup.get(v.class as usize))
+/// Is `u` near enough to board `vh`? A vehicle: within the vehicle's radius
+/// plus the player's 5 m (`ENTER_REACH`) and [`BOARD_SLACK`], from the bot's
+/// feet in XZ. Card TBRD, a building turret: the PS2's board agent - the
+/// 3-D distance between the two bodies' spheres under [`BOARD_PAD_BF2`]
+/// (B2 `FUN_002c42d8`) / [`BOARD_PAD_BF1`] (B1 `FUN_00244848`), so a bot
+/// walks up to the turret and a turret above or below it is not boarded.
+pub(crate) fn in_reach(sim: &Sim, u: &Unit, vh: VehicleHandle) -> bool {
+    reach_test(sim, u, vh).is_some_and(|(d2, reach)| d2 <= reach * reach)
+}
+
+/// Card TBRD: `u` stands inside a building turret's reach in XZ, out of it
+/// in 3-D and over [`OTHER_FLOOR`] above or below it - on another floor.
+/// OURS: its claim is given up at once (the PS2's board agent waits on, BF1
+/// with no timer).
+fn on_another_floor(sim: &Sim, u: &Unit, vh: VehicleHandle) -> bool {
+    let Some(v) = sim.vehicle(vh).filter(|v| v.kind == VehicleKind::Turret) else {
+        return false;
+    };
+    let c = u.capsule().center();
+    reach_test(sim, u, vh).is_some_and(|(d2, reach)| {
+        d2 > reach * reach && nav::xz_dist(c, v.pos) <= reach && (c.y - v.pos.y).abs() > OTHER_FLOOR
+    })
+}
+
+/// [`in_reach`]'s squared distance and reach.
+fn reach_test(sim: &Sim, u: &Unit, vh: VehicleHandle) -> Option<(f32, f32)> {
+    let v = sim.vehicle(vh)?;
+    let radius = sim
+        .seat_setup
+        .get(v.class as usize)
         .and_then(|s| s.as_ref())
-        .map_or(0.0, |s| s.radius)
-        + ENTER_REACH
-        + BOARD_SLACK
+        .map_or(0.0, |s| s.radius);
+    if v.kind != VehicleKind::Turret {
+        let d = nav::xz_dist(u.soldier.pos, v.pos);
+        return Some((d * d, radius + ENTER_REACH + BOARD_SLACK));
+    }
+    let pad = if sim.ground_rules == GroundRules::Bf2 {
+        BOARD_PAD_BF2
+    } else {
+        BOARD_PAD_BF1
+    };
+    let cap = u.capsule();
+    let reach = radius + cap.radius.max(cap.height * 0.5) + pad;
+    Some((cap.center().distance_squared(v.pos), reach))
 }
 
 /// On the think period, a bot on foot with no claim: the nearest vehicle it
@@ -218,7 +256,7 @@ pub(super) fn board_goal(
     let mut r = st.ride?;
     let vh = r.board?;
     let at = sim.vehicle(vh).map(|v| v.pos);
-    let reach = at.is_some_and(|at| nav::xz_dist(u.soldier.pos, at) <= board_reach(sim, vh));
+    let reach = in_reach(sim, u, vh);
     let older = sim.units.iter().enumerate().any(|(i, o)| {
         o.alive
             && o.mount.is_none()
@@ -242,7 +280,7 @@ pub(super) fn board_goal(
             .and_then(|i| sim.cps.get(i as usize))
             .is_some_and(|cp| routes_to(sim, vh, cp))
     };
-    let late = sim.tick >= r.since + BOARD_GIVEUP;
+    let late = sim.tick >= r.since + BOARD_GIVEUP || on_another_floor(sim, u, vh);
     if older || left || late || !routes || claim_seat(sim, me, vh).is_none() {
         nt.claim = if older || left {
             NavTick::CLAIM_LOST

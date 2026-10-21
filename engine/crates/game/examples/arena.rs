@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! cargo run --release -p game --example arena -- [ticks] [seed=42] [flat|<map_key>] [tier=all]
+//! cargo run --release -p game --example arena -- [ticks] [seed=42] [flat|<map_key>] vs <a>:<b>|all [seeds=1]
 //! ```
 //!
 //! `ticks` defaults to 3,000 on the flat field and 9,000 on a map. The target
@@ -23,6 +24,26 @@
 //!   examples cannot import each other. `SWEEP_SLOT0=bot` makes slot 0 a bot
 //!   here too (the sweep's default; see `slot0_is_bot` for why this example's
 //!   default is the other one).
+//!
+//! The `all` rows put ONE tier on both teams, so `kills/min` measures how
+//! deadly a fight is, not which tier wins it: a tier that is harder to hit
+//! lowers both sides' kills (card TIER: Elite's flat-field kills / min fell
+//! under Hard's). Its `monotonic:` line is a row of the determinism gate,
+//! not a verdict on the tiers; the head-to-head below is.
+//!
+//! ## The head-to-head (card ARVS)
+//! `vs a:b` puts tier `a` on team 0 and tier `b` on team 1
+//! ([`Sim::team_difficulty`]; equal tiers set no override, so `vs normal:normal`
+//! is `normal`'s run hash for hash) and prints one row per seed with each
+//! side's kills, hits / shots, first kill and the margin (tickets left on a
+//! map, survivors on the flat field). `vs all` runs every neighbouring pair
+//! (easy:normal, normal:hard, hard:elite) both ways round on each seed, so the
+//! spawn side cancels, and ends with one `beats:` line per pair: the higher
+//! tier's share of the pair's kills (both runs of a seed summed), its paired t
+//! against an even 0.5 over the seeds, how many seeds it won and its mean
+//! margin. The verdict is pre-set: t >= 2 `yes`, t <= -2 `REVERSED`, else
+//! `coin flip`. `[seeds]` runs `seed .. seed + seeds`, in parallel
+//! (`ARENA_JOBS`, default 8); the output is in seed order whatever the jobs.
 //!
 //! ## The row
 //! `tier  kills/min  hit_rate  ttfk_s  shots_per_kill  ai_shots  unperceived  hash`
@@ -52,7 +73,12 @@ const HZ: f64 = core::TICK_HZ as f64;
 
 /// One tier's row.
 struct Row {
-    tier: Difficulty,
+    /// Team 0's and team 1's tier (equal outside `vs`).
+    tiers: [Difficulty; 2],
+    /// Per team: AI-on-AI kills, AI shots, AI hits on AI, first kill tick.
+    side: [Side; 2],
+    /// Per team: tickets left on a map, units alive on the flat field.
+    margin: [f64; 2],
     kills: u64,
     ai_shots_events: u64,
     ai_hits: u64,
@@ -101,7 +127,7 @@ impl Row {
         println!(
             "{:<7} {:9.2} {:9.3} {ttfk} {spk} {:8} {:6} {:016x}  \
              ticks {}  alive {}/{}  player_hits {}  player_deaths {}",
-            self.tier.label(),
+            self.tiers[0].label(),
             self.kills_per_min(),
             self.hit_rate(),
             self.nav_ai_shots,
@@ -122,8 +148,51 @@ impl Row {
         // The acceptance is a `cmp` of two runs' STDOUT, so the one column
         // that cannot be identical — wall time — goes to stderr, exactly as
         // the sweep puts its progress there.
-        eprintln!("arena {} {:.1} s", self.tier.label(), self.wall_s);
+        eprintln!("arena {} {:.1} s", self.tiers[0].label(), self.wall_s);
     }
+
+    /// One `vs` row: seed, the two tiers, each side's kills, hits / shots and
+    /// first kill, the margin and the hash.
+    fn print_vs(&self, seed: u32) {
+        let side = |t: usize| {
+            let s = &self.side[t];
+            let ttfk = s
+                .ttfk
+                .map_or_else(|| "-".to_owned(), |t| format!("{:.2}", t as f64 / HZ));
+            format!(
+                "{:<6} kills {:3} hits {:5}/{:<6} ttfk {:>6}",
+                self.tiers[t].label(),
+                s.kills,
+                s.hits,
+                s.shots,
+                ttfk
+            )
+        };
+        println!(
+            "{seed:>5}  {}  |  {}  |  margin {:.1}/{:.1}  ticks {}  {:016x}",
+            side(0),
+            side(1),
+            self.margin[0],
+            self.margin[1],
+            self.ticks,
+            self.hash
+        );
+        if self.unperceived > 0 {
+            println!(
+                "        PERCEPTION ASSERTION FAILED: {} unperceived AI shots",
+                self.unperceived
+            );
+        }
+    }
+}
+
+/// One team's AI-on-AI fight (`vs`).
+#[derive(Clone, Copy, Default)]
+struct Side {
+    kills: u64,
+    shots: u64,
+    hits: u64,
+    ttfk: Option<u64>,
 }
 
 /// The per-tick event fold both fields share: AI-on-AI kills, AI shots and
@@ -136,6 +205,7 @@ struct Fold {
     ttfk: Option<u64>,
     player_hits: u64,
     player_deaths: u64,
+    side: [Side; 2],
 }
 
 impl Fold {
@@ -147,6 +217,7 @@ impl Fold {
             ttfk: None,
             player_hits: 0,
             player_deaths: 0,
+            side: [Side::default(); 2],
         }
     }
 
@@ -157,9 +228,22 @@ impl Fold {
         let human = |h: core::unit::UnitHandle| {
             sim.units.get(h.index as usize).is_some_and(|u| u.is_player)
         };
+        // A unit keeps its slot's team for the round (the respawn reuses it).
+        let side = |h: core::unit::UnitHandle| {
+            sim.units
+                .get(h.index as usize)
+                .map(|u| u.team)
+                .filter(|&t| t < 2)
+                .map(usize::from)
+        };
         for e in &sim.events {
             match *e {
-                core::sim::Event::Shot { unit, .. } if !human(unit) => self.shots += 1,
+                core::sim::Event::Shot { unit, .. } if !human(unit) => {
+                    self.shots += 1;
+                    if let Some(t) = side(unit) {
+                        self.side[t].shots += 1;
+                    }
+                }
                 core::sim::Event::Hit {
                     shooter, victim, ..
                 } if !human(shooter) => {
@@ -167,6 +251,9 @@ impl Fold {
                         self.player_hits += 1;
                     } else {
                         self.hits += 1;
+                        if let Some(t) = side(shooter) {
+                            self.side[t].hits += 1;
+                        }
                     }
                 }
                 core::sim::Event::Kill { shooter, victim } if !human(shooter) => {
@@ -175,6 +262,10 @@ impl Fold {
                     } else {
                         self.kills += 1;
                         self.ttfk.get_or_insert(sim.tick);
+                        if let Some(t) = side(shooter) {
+                            self.side[t].kills += 1;
+                            self.side[t].ttfk.get_or_insert(sim.tick);
+                        }
                     }
                 }
                 _ => {}
@@ -196,9 +287,22 @@ fn slot0_is_bot() -> bool {
 
 /// The flat field: `Sim::empty` on 400 m of level ground, no posts, no graph,
 /// 8 v 8 troopers on two lines 30 m apart.
-fn flat_sim(seed: u32, tier: Difficulty) -> Sim {
+/// Team 0 at `tiers[0]`, team 1 at `tiers[1]`: equal tiers are the round's
+/// one `difficulty` and no override, so a `vs x:x` run is the `x` run.
+/// Unequal ones leave the round's tier (the readers that are not a unit's:
+/// the human team's bleed handicap) at the LOWER of the two, so a pair's two
+/// orientations differ only in which side is which.
+fn set_tiers(sim: &mut Sim, tiers: [Difficulty; 2]) {
+    sim.difficulty = tiers[0];
+    if tiers[0] != tiers[1] {
+        sim.difficulty = tiers[0].min(tiers[1]);
+        sim.team_difficulty = tiers.map(Some);
+    }
+}
+
+fn flat_sim(seed: u32, tiers: [Difficulty; 2]) -> Sim {
     let mut sim = Sim::empty(seed);
-    sim.difficulty = tier;
+    set_tiers(&mut sim, tiers);
     // No manifest here, so the BF2 value stands (RE §9.1: BF1 maps are the
     // ones with no omni).
     sim.omni_radius = 10.0;
@@ -224,9 +328,9 @@ fn flat_sim(seed: u32, tier: Difficulty) -> Sim {
     sim
 }
 
-fn run_flat(ticks: u64, seed: u32, tier: Difficulty) -> Row {
+fn run_flat(ticks: u64, seed: u32, tiers: [Difficulty; 2]) -> Row {
     let started = std::time::Instant::now();
-    let mut sim = flat_sim(seed, tier);
+    let mut sim = flat_sim(seed, tiers);
     let mut f = Fold::new();
     let idle = [PadState::default()];
     let mut t = 0u64;
@@ -240,7 +344,8 @@ fn run_flat(ticks: u64, seed: u32, tier: Difficulty) -> Row {
             break;
         }
     }
-    row(tier, &sim, f, t, started)
+    let (a, b) = alive_counts(&sim);
+    row(tiers, &sim, f, t, started, [a as f64, b as f64])
 }
 
 fn alive_counts(sim: &Sim) -> (usize, usize) {
@@ -255,10 +360,19 @@ fn alive_counts(sim: &Sim) -> (usize, usize) {
     c
 }
 
-fn row(tier: Difficulty, sim: &Sim, f: Fold, ticks: u64, started: std::time::Instant) -> Row {
+fn row(
+    tiers: [Difficulty; 2],
+    sim: &Sim,
+    f: Fold,
+    ticks: u64,
+    started: std::time::Instant,
+    margin: [f64; 2],
+) -> Row {
     let (a, b) = alive_counts(sim);
     Row {
-        tier,
+        tiers,
+        side: f.side,
+        margin,
         kills: f.kills,
         ai_shots_events: f.shots,
         ai_hits: f.hits,
@@ -287,7 +401,7 @@ fn mission_for(key: &str) -> Option<game::mission::MissionDef> {
 /// example cannot import another example): mode sublevel, shared props, the
 /// mission's tickets/factions/class mix, the nav graph, model collision, then
 /// `setup_conquest` at 16 v 16 with the idle player.
-fn run_map(key: &str, path: &Path, ticks: u64, seed: u32, tier: Difficulty) -> Option<Row> {
+fn run_map(key: &str, path: &Path, ticks: u64, seed: u32, tiers: [Difficulty; 2]) -> Option<Row> {
     let started = std::time::Instant::now();
     let mut scene = match game::assets::load_scene(path) {
         Ok(s) => s,
@@ -314,7 +428,7 @@ fn run_map(key: &str, path: &Path, ticks: u64, seed: u32, tier: Difficulty) -> O
     let applied = mission.as_ref().map(|m| layout.apply_mission(m));
 
     let mut sim = Sim::empty(seed);
-    sim.difficulty = tier;
+    set_tiers(&mut sim, tiers);
     sim.omni_radius = core::sim::omni_radius_for(&scene.manifest.source_game);
     sim.water_level = scene.manifest.water.as_ref().map(|w| w.height);
     sim.ground_rules = core::soldier::GroundRules::for_game(&scene.manifest.source_game);
@@ -379,9 +493,11 @@ fn run_map(key: &str, path: &Path, ticks: u64, seed: u32, tier: Difficulty) -> O
                             weapon_geometry: c.weapon_geometry.clone(),
                             weapon_hud: c.weapon_hud.clone(),
                             held_hud: Vec::new(),
+                            held_models: Vec::new(),
                             foley_class: c.foley_class,
                             cries: c.cries.clone(),
                             anim: c.anim.clone(),
+                            skins: c.skins.clone(),
                         })
                         .collect(),
                 }
@@ -427,7 +543,13 @@ fn run_map(key: &str, path: &Path, ticks: u64, seed: u32, tier: Difficulty) -> O
         f.eat(&w.sim);
         t += 1;
     }
-    Some(row(tier, &w.sim, f, t, started))
+    let tickets = w
+        .sim
+        .battle
+        .teams
+        .each_ref()
+        .map(|t| f64::from(t.reinforcements));
+    Some(row(tiers, &w.sim, f, t, started, tickets))
 }
 
 fn main() {
@@ -436,7 +558,12 @@ fn main() {
     let seed: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(42);
     let target = args.get(2).cloned().unwrap_or_else(|| "flat".to_owned());
     let tier_arg = args.get(3).cloned().unwrap_or_else(|| "all".to_owned());
-    let tiers: Vec<Difficulty> = if tier_arg == "all" {
+    let vs = (tier_arg == "vs").then(|| {
+        let spec = args.get(4).cloned().unwrap_or_else(|| "all".to_owned());
+        let seeds: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
+        (spec, seeds.max(1))
+    });
+    let tiers: Vec<Difficulty> = if tier_arg == "all" || vs.is_some() {
         Difficulty::ALL.to_vec()
     } else {
         match Difficulty::parse(&tier_arg) {
@@ -466,6 +593,10 @@ fn main() {
         }
     };
 
+    if let Some((spec, seeds)) = vs {
+        head_to_head(&map, ticks, seed, &spec, seeds);
+        return;
+    }
     println!(
         "arena: {} ticks {ticks} seed {seed}",
         map.as_ref().map_or("flat 8v8", |(k, _)| k.as_str())
@@ -477,8 +608,8 @@ fn main() {
     let mut rows: Vec<Row> = Vec::new();
     for tier in tiers {
         let r = match &map {
-            None => run_flat(ticks, seed, tier),
-            Some((key, path)) => match run_map(key, path, ticks, seed, tier) {
+            None => run_flat(ticks, seed, [tier; 2]),
+            Some((key, path)) => match run_map(key, path, ticks, seed, [tier; 2]) {
                 Some(r) => r,
                 None => return,
             },
@@ -502,6 +633,160 @@ fn main() {
     }
 }
 
+/// One run of the field: the flat one, or the map.
+fn run_any(
+    map: &Option<(String, std::path::PathBuf)>,
+    ticks: u64,
+    seed: u32,
+    tiers: [Difficulty; 2],
+) -> Option<Row> {
+    match map {
+        None => Some(run_flat(ticks, seed, tiers)),
+        Some((key, path)) => run_map(key, path, ticks, seed, tiers),
+    }
+}
+
+/// `vs <a>:<b>|all [seeds]` (card ARVS): the runs in parallel, the rows in
+/// seed order, then a `beats:` line per pair under `all`.
+fn head_to_head(
+    map: &Option<(String, std::path::PathBuf)>,
+    ticks: u64,
+    seed: u32,
+    spec: &str,
+    seeds: u32,
+) {
+    let pairs: Vec<[Difficulty; 2]> = if spec == "all" {
+        Difficulty::ALL.windows(2).map(|w| [w[0], w[1]]).collect()
+    } else {
+        let parsed = spec
+            .split_once(':')
+            .and_then(|(a, b)| Some([Difficulty::parse(a)?, Difficulty::parse(b)?]));
+        match parsed {
+            Some(p) => vec![p],
+            None => {
+                eprintln!("arena: vs wants <tier>:<tier> or all, not {spec:?}");
+                return;
+            }
+        }
+    };
+    // `all` runs each pair both ways round on a seed; `a:b` just as given.
+    let both = spec == "all";
+    let mut jobs: Vec<(u32, [Difficulty; 2])> = Vec::new();
+    for p in &pairs {
+        for s in seed..seed + seeds {
+            jobs.push((s, *p));
+            if both {
+                jobs.push((s, [p[1], p[0]]));
+            }
+        }
+    }
+    let n_jobs: usize = std::env::var("ARENA_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8usize)
+        .max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Vec<std::sync::Mutex<Option<Row>>> =
+        jobs.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..n_jobs.min(jobs.len()) {
+            sc.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&(s, t)) = jobs.get(k) else {
+                    break;
+                };
+                *out[k].lock().unwrap() = run_any(map, ticks, s, t);
+            });
+        }
+    });
+    let rows: Vec<Option<Row>> = out.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    if rows.iter().any(Option::is_none) {
+        eprintln!("arena: a run failed to load");
+        return;
+    }
+    let rows: Vec<Row> = rows.into_iter().flatten().collect();
+
+    println!(
+        "arena vs: {} ticks {ticks} seeds {seed}..{} {spec}",
+        map.as_ref().map_or("flat 8v8", |(k, _)| k.as_str()),
+        seed + seeds - 1,
+    );
+    let margin = if map.is_some() { "tickets" } else { "alive" };
+    println!(" seed  team 0 | team 1 | margin = {margin} team 0/team 1");
+    for ((s, _), r) in jobs.iter().zip(&rows) {
+        r.print_vs(*s);
+    }
+    if !both {
+        return;
+    }
+    for p in &pairs {
+        let (lo, hi) = (p[0], p[1]);
+        let mut shares: Vec<f64> = Vec::new();
+        let mut margins: Vec<f64> = Vec::new();
+        let (mut k_hi, mut k_lo) = (0u64, 0u64);
+        for s in seed..seed + seeds {
+            let run = |t: [Difficulty; 2]| {
+                jobs.iter()
+                    .zip(&rows)
+                    .find(|((js, jt), _)| *js == s && *jt == t)
+                    .map(|(_, r)| r)
+                    .expect("every pair ran both ways")
+            };
+            // Run 1: lo is team 0; run 2: hi is team 0.
+            let (r1, r2) = (run([lo, hi]), run([hi, lo]));
+            let hi_k = r1.side[1].kills + r2.side[0].kills;
+            let lo_k = r1.side[0].kills + r2.side[1].kills;
+            k_hi += hi_k;
+            k_lo += lo_k;
+            if hi_k + lo_k > 0 {
+                shares.push(hi_k as f64 / (hi_k + lo_k) as f64);
+            }
+            margins.push(((r1.margin[1] - r1.margin[0]) + (r2.margin[0] - r2.margin[1])) / 2.0);
+        }
+        let (mean, t) = paired_t(&shares, 0.5);
+        let won = shares.iter().filter(|&&x| x > 0.5).count();
+        let verdict = if t >= 2.0 {
+            "yes"
+        } else if t <= -2.0 {
+            "REVERSED"
+        } else {
+            "coin flip"
+        };
+        println!(
+            "beats: {}>{} {verdict}  share {:.3}  t {:+.2}  won {} of {}  kills {}/{}  margin {:+.1}",
+            hi.label(),
+            lo.label(),
+            mean,
+            t,
+            won,
+            shares.len(),
+            k_hi,
+            k_lo,
+            margins.iter().sum::<f64>() / margins.len().max(1) as f64,
+        );
+    }
+    let bad: u64 = rows.iter().map(|r| r.unperceived).sum();
+    if bad > 0 {
+        println!("PERCEPTION ASSERTION FAILED: {bad} unperceived AI shots");
+    }
+}
+
+/// The mean of `xs` and its one-sample t against `mu` (0 when it cannot be
+/// taken: under two values, or no spread).
+fn paired_t(xs: &[f64], mu: f64) -> (f64, f64) {
+    let n = xs.len() as f64;
+    if xs.is_empty() {
+        return (f64::NAN, 0.0);
+    }
+    let mean = xs.iter().sum::<f64>() / n;
+    if xs.len() < 2 {
+        return (mean, 0.0);
+    }
+    let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let se = (var / n).sqrt();
+    (mean, if se > 0.0 { (mean - mu) / se } else { 0.0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,8 +797,8 @@ mod tests {
     /// example's OWN rig rather than a copy of it.
     #[test]
     fn the_flat_arena_is_deterministic_and_seeded() {
-        let a = run_flat(600, 42, Difficulty::Normal);
-        let b = run_flat(600, 42, Difficulty::Normal);
+        let a = run_flat(600, 42, [Difficulty::Normal; 2]);
+        let b = run_flat(600, 42, [Difficulty::Normal; 2]);
         assert_eq!(a.hash, b.hash, "same seed, same final state");
         assert_eq!(
             (a.kills, a.ai_hits, a.ai_shots_events),
@@ -525,12 +810,33 @@ mod tests {
             "the perception assertion holds in the arena"
         );
 
-        let c = run_flat(600, 43, Difficulty::Normal);
+        let c = run_flat(600, 43, [Difficulty::Normal; 2]);
         assert_ne!(a.hash, c.hash, "a different seed is a different fight");
 
         // The tier reaches the bots: Elite's fight is not Normal's.
-        let e = run_flat(600, 42, Difficulty::Elite);
+        let e = run_flat(600, 42, [Difficulty::Elite; 2]);
         assert_ne!(a.hash, e.hash);
         assert_eq!(e.unperceived, 0);
+    }
+
+    /// Card ARVS: `vs x:x` is the `x` run (no override), and an uneven pair
+    /// is a different fight whose kills fold per side.
+    #[test]
+    fn a_head_to_head_of_equal_tiers_is_the_one_tier_run() {
+        let n = run_flat(600, 42, [Difficulty::Normal; 2]);
+        let mut sim = flat_sim(42, [Difficulty::Normal; 2]);
+        assert_eq!(sim.team_difficulty, [None; 2]);
+        set_tiers(&mut sim, [Difficulty::Easy, Difficulty::Elite]);
+        assert_eq!(sim.difficulty, Difficulty::Easy, "the lower of the two");
+        let v = run_flat(600, 42, [Difficulty::Easy, Difficulty::Elite]);
+        assert_ne!(n.hash, v.hash);
+        assert_eq!(v.side[0].kills + v.side[1].kills, v.kills);
+        assert_eq!(v.side[0].shots + v.side[1].shots, v.ai_shots_events);
+        assert_eq!(v.unperceived, 0);
+        let (mean, t) = paired_t(&[0.6, 0.7, 0.8], 0.5);
+        assert!(
+            (mean - 0.7).abs() < 1e-12 && (t - 3.4641).abs() < 1e-3,
+            "{mean} {t}"
+        );
     }
 }

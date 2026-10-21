@@ -118,20 +118,23 @@ fn texture_bind_group(
         Some("hud sheet"),
     )
     .ok()?;
-    Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("hud sheet bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    }))
+    Some(crate::made::bind_group(
+        device,
+        &wgpu::BindGroupDescriptor {
+            label: Some("hud sheet bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        },
+    ))
 }
 
 impl HudPass {
@@ -183,10 +186,13 @@ impl HudPass {
             bind_group_layouts: &[&screen_bgl, &texture_bgl],
             push_constant_ranges: &[],
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("hud shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
+        let shader = crate::made::shader_module(
+            device,
+            wgpu::ShaderModuleDescriptor {
+                label: Some("hud shader"),
+                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            },
+        );
         let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4];
         let pipeline = |depth: bool, additive: bool| {
             let blend = wgpu::BlendState {
@@ -201,73 +207,85 @@ impl HudPass {
                 },
                 alpha: wgpu::BlendComponent::OVER,
             };
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("hud pipeline"),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_hud"),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<HudVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &attributes,
-                    }],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_hud"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(blend),
-                        write_mask: crate::pipelines::FRAME_WRITES,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                // HUD meshes are mirrored and turned freely: no culling.
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: depth,
-                    depth_compare: if depth {
-                        wgpu::CompareFunction::LessEqual
-                    } else {
-                        wgpu::CompareFunction::Always
+            crate::made::render_pipeline(
+                device,
+                &wgpu::RenderPipelineDescriptor {
+                    label: Some("hud pipeline"),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_hud"),
+                        buffers: &[wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<HudVertex>() as u64,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &attributes,
+                        }],
+                        compilation_options: Default::default(),
                     },
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            })
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_hud"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(blend),
+                            write_mask: crate::pipelines::FRAME_WRITES,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    // HUD meshes are mirrored and turned freely: no culling.
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: depth,
+                        depth_compare: if depth {
+                            wgpu::CompareFunction::LessEqual
+                        } else {
+                            wgpu::CompareFunction::Always
+                        },
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                },
+            )
         };
         let pipelines = [
             [pipeline(false, false), pipeline(false, true)],
             [pipeline(true, false), pipeline(true, true)],
         ];
-        let screen_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("hud screen"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let screen_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("hud screen bg"),
-            layout: &screen_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: screen_buf.as_entire_binding(),
-            }],
-        });
+        let screen_buf = crate::made::buffer(
+            device,
+            &wgpu::BufferDescriptor {
+                label: Some("hud screen"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        );
+        let screen_bg = crate::made::bind_group(
+            device,
+            &wgpu::BindGroupDescriptor {
+                label: Some("hud screen bg"),
+                layout: &screen_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: screen_buf.as_entire_binding(),
+                }],
+            },
+        );
         // The HUD's sheets are drawn near their own size: bilinear, clamped,
         // no mips.
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("hud sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        let sampler = crate::made::sampler(
+            device,
+            &wgpu::SamplerDescriptor {
+                label: Some("hud sampler"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            },
+        );
         let white = texture_bind_group(device, queue, &texture_bgl, &sampler, &[255; 4], 1, 1)
             .expect("a 1x1 texture uploads");
         Self {
@@ -338,12 +356,15 @@ impl HudPass {
             if !matches!(slot, Some((_, cap)) if *cap >= need) {
                 let cap = need.next_power_of_two().max(4096);
                 *slot = Some((
-                    device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("hud geometry"),
-                        size: cap,
-                        usage: usage | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    }),
+                    crate::made::buffer(
+                        device,
+                        &wgpu::BufferDescriptor {
+                            label: Some("hud geometry"),
+                            size: cap,
+                            usage: usage | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        },
+                    ),
                     cap,
                 ));
             }

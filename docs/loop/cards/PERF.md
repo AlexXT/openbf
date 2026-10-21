@@ -14,6 +14,7 @@ branch:
 resume:
 created: 2026-10-02
 alpha: yes
+defer: post-alpha
 ---
 
 ## ORDER (the maintainer, 2026-10-02 17:40) - HELD until the bot redesign is in
@@ -42,6 +43,12 @@ Measure and decide (a section of the report, then build cards):
 3. **Different CPUs**: thread count chosen at start from the machine (physical cores, not logical; performance vs efficiency cores on hybrid Intel - the maintainer's i9 is 8 P + 16 E - and big.LITTLE ARM; a 2-core / 4-thread laptop; a 4-core 2020 laptop; a Steam Deck's 4c / 8t; a 16+ core desktop), a user override, never more threads than help. Measure pinned to P cores, to E cores, to 2 and 4 cores (`taskset`), and with SMT siblings only. Report where more threads make it SLOWER (small N: the overhead beats the gain - keep 1 thread below a bot count).
 4. Architectures: x86-64 with and without AVX2 (no instruction newer than the baseline without runtime detection), aarch64 (builds? `cargo check --target aarch64-unknown-linux-gnu`), float determinism across them (the sim uses its own `fmath` - state whether hashes match across architectures or only within one, and what a replay / netcode later would need).
 5. Also off the main thread: asset loading / level load, audio mixing, the black box (done), texture upload staging.
+
+**The maintainer, 2026-10-20 17:05 (INBOX, standing):** (b) root causes first, threads last - fix the structure (load-time uploads,
+per-frame allocation, AI bursts, O(N^2) queries) BEFORE adding threads, never use threads to hide a slow path; **Part 3 comes
+after Part 2.** (c) Threading is automatic: the game picks its worker count from the machine (physical cores, leaving the
+main, audio and driver threads their share); no setting the player must touch (an override may exist, the default is always
+right); the sim result is identical for any count. The hitch hunt is card HITCH (not held), render interpolation card RINT.
 
 ## The standing record - `engine/artifacts/loop/PERF.md` (create it in this card; EVERY later card that changes a number appends one line)
 Top of the file, always current: **the largest bot count per map that holds 60 fps on the maintainer's machine and on the reference proxy (at the ceiling written "500 a side held 60 fps (capped at 500, not tried further; estimated ~M)", INBOX 2026-10-15); sim ms / tick at 32, 64, 128, 256, 500 a side; the top 3 costs; date and commit.** Below it a dated log, newest first. The planner copies the top block into STATUS under a `## Performance` heading at every planner pass, so "what happened overnight" always has it.
@@ -72,3 +79,4 @@ Top of the file, always current: **the largest bot count per map that holds 60 f
   1.05 1.18; sd 0.10 - not resolved under load, but no seed is under). CLSE2 gave every unit an aim block that thinks
   every 5th tick; MOUTH added the corner line. Card OBSV's 0.316 for main is this window on other seeds under more
   load, not a regression of 69 %. Re-measure on a quiet machine before quoting.
+- planner 2026-10-19 16:25: **the bot-count benchmark half is deferred to near the end of the project** (the maintainer, 2026-10-19: "drop the idea of doing the bot benchmark for now"): `defer: post-alpha`. The profiling at today's bot counts is wanted now and lives in ISPD (render, whole frame) and AITHK (the AI's CPU). STATUS's Performance block reads ISPD's table until this card runs.

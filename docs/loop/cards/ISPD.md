@@ -5,13 +5,13 @@ milestone: M0
 value: 5
 phase: measure
 status: todo
-deps:
+deps: ISPS,LODP
 files:
 declares:
 needs:
 effort:
 branch:
-resume: MEASURE FIRST (no files yet): render the showcase maps, BF2 GEO1 above all, on this machine's Intel iGPU (OPENBF_ADAPTER=igpu) at 2880x1920 and at 1920x1080 and print ms per frame split by pass; then cut the build slices from what the numbers say.
+resume: Table re-taken on main 8729cae after ISPF (README 'Update 2026-10-20': 52-79 fps at 2880x1920, 132-166 at 1080p on the iGPU) and the world fs priced by shader variants (x/*.wgsl, scratch binary reads OPENBF_X_SHADER: worktree openbf-wt/ispd-x-scratch, target lead_tmp/ispdx_target) -> card ISPS filed (value 5). NEXT after ISPS and LODP land: re-take the table (batch3.sh gating on load < 8 - the iGPU slows ~2x under the other lane's load), price BF1 grass (NAB1 6.6 ms at native: alpha-blend overdraw; try the sprite count and a cheaper fs) and per-vertex lighting (the PS2's VU1 way; lean 7.44 vs flat 2.26 ms on KAM1 is what is left), then state the final target (Acceptance 4) and close; fold in the maintainer's Surface CSV when he sends it.
 created: 2026-10-19
 first: 2
 ---
@@ -31,3 +31,4 @@ This machine's Intel iGPU (renderD128) is the stand-in for Iris Xe (`OPENBF_ADAP
 
 ## Notes
 Do not edit LOD's files while LOD is in progress (render/src/draw.rs, mesh.rs); slices wait for it. The maintainer does not want gameplay changed for speed.
+- planner 2026-10-19 16:25: from the maintainer's 10-19 INBOX list, two more candidate slices to price on the same table: **animation LOD** (the animator's ms per frame at today's bot counts first; if it is a real cost, cut a card that finds the PS2's own low-detail animator - `analysis/re-lod.md` says ~4 soldiers a frame get the hi-res body - presentation only, no sim hash), and **nearest-first opaque draws** (a depth bucket in `draw_key`, or a depth prepass). FARC (un-deferred today) is the RE that lets `OPENBF_FAR_CULL` default on. Every constant from the PS2 corpus. While PERF's bot-count benchmark is deferred (the maintainer 10-19), this card's `engine/artifacts/ispd/README.md` table is the performance line STATUS copies.

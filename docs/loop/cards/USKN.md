@@ -2,16 +2,16 @@
 id: USKN
 title: Per-class skins and size: OverrideTexture / OverrideTexture2 (sharpshooter red, assault/assassin droid blue/red, urban/desert/snow rebels, snow Wookiee, the locals) and SkeletonRootScale / CollisionRootScale (Wookiee 1.15, Gungan 1.1, Jawa 0.6, Ewok 0.5) - the port reads neither
 milestone: M1
-value: 4
+value: 5
 phase: build
-status: todo
+status: done
 deps:
 files: engine/crates/bake/src/soldier.rs, engine/crates/mungefs/src/anim.rs, engine/crates/game/src/animator.rs, engine/crates/game/src/soldier_vis.rs, engine/crates/game/src/roster.rs, engine/crates/game/src/assets.rs
-declares: rebake=side
+declares: rebake=side; goldens=units/bf1_all_inf_wookie.png,units/bf1_cis_inf_bdroid.png,units/bf1_cis_inf_sbdroid.png,units/bf2_all_inf_marksperson.png,units/bf2_all_inf_markspersonsnow.png,units/bf2_all_inf_wookie.png,units/bf2_cis_inf_bdroid.png,units/bf2_cis_inf_magnaguard.png,units/bf2_cis_inf_sbdroid.png
 needs:
 effort:
-branch:
-resume: RE done (analysis/re-soldier-skeleton-skins.md section 10). Build step 1: in bake::soldier::clip_to_tracks pose each model on its rig (SkeletonName's zaf_ rig, else human_animation_0 / human_0): the game's listed bones (BF1 the 22 names of FUN_0022f428, BF2 every bone but bone 0, bone_root, hp_weapons) take the rig JONT rest_pos, not the clip's; test the head heights of the card's Acceptance 1 (lead_tmp/uskn/tools/fk.py numbers). Step 2: SkeletonRootScale per class at run time (bone_root x s; chooser and clip rate on v/s). Step 3: MNAM slot + override textures + per-class swap. After gates, add the moved goldens to declares.
+branch: uskn
+resume: landed c5110943 2026-10-20
 created: 2026-09-29
 alpha: yes
 ---
@@ -96,3 +96,4 @@ Wookiee Smuggler 15 % small on 13 port GCW missions.
 
 ## Planner note (2026-09-30, M-ALPHA)
 `alpha: yes` — per-class skins: snow troops on HOT1, the sharpshooter's red, on every map. Value 4 (kept). Showcase maps: BF1 NAB1, BF1 TAT1 (the port's `tat1`), BF1 YAV2, BF2 UTA1, BF2 MYG1, BF2 HOT1 (PLAN §Milestones M-ALPHA).
+- planner 2026-10-19 16:25: value 4 -> 5 (the RE's suggestion): every Clone Wars battle's battle droids are distorted and the Wookiee / MagnaGuard crushed to human size - the main CIS infantry, seen in a minute of play.

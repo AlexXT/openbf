@@ -392,6 +392,29 @@ impl BoltVis {
         }
     }
 
+    /// Upload the glow and every bolt sheet `walk`'s weapons can fire (card
+    /// HITCH): at the battle's load, so a weapon's first shot reads no file
+    /// in a frame.
+    pub fn preload(&mut self, r: &mut Renderer, walk: &WalkSim) {
+        self.texture(r, GLOW_TEXTURE);
+        let names: Vec<String> = walk
+            .sim
+            .weapon_classes
+            .iter()
+            .filter_map(|w| {
+                w.ordnance
+                    .laser
+                    .as_ref()?
+                    .texture
+                    .as_deref()
+                    .map(texture_name)
+            })
+            .collect();
+        for n in names {
+            self.texture(r, &n);
+        }
+    }
+
     fn texture(&mut self, r: &mut Renderer, name: &str) -> Option<TextureHandle> {
         if let Some(t) = self.textures.get(name) {
             return *t;

@@ -2,16 +2,16 @@
 id: TPOSR
 title: The Tactician's reservation and hide / fire cycle run only on thinks with the target seen, where the PS2's cover state machine runs every update: 20 % of held time unreserved, two bots on positions within 2 m in 175 of 256 rounds (4,024 pair-ticks on the same position), a position hit twice kept 22 s, hide phases over 3 s late in 11 % of cover time - and tests for the 15 rules no test referees (AUDIT TPOS)
 milestone: M3
-value: 4
+value: 5
 phase: build
-status: todo
+status: done
 deps: TPOS
-files: engine/crates/core/src/ai/behave.rs, engine/crates/core/src/ai/tactic.rs, engine/crates/core/src/ai/tactic/tests.rs
+files: engine/crates/core/src/ai/behave.rs, engine/crates/core/src/ai/tactic.rs, engine/crates/core/src/ai/tactic/tests.rs, engine/crates/core/src/ai/state.rs, engine/crates/core/src/perception.rs, engine/CRATES.md
 declares: sim; sweep; arena
 needs:
 effort: high
-branch:
-resume:
+branch: tposr
+resume: landed 28d42d46 2026-10-20
 created: 2026-10-19
 alpha: yes
 ---
@@ -95,3 +95,6 @@ Numbers on the landing's code: 32 maps x 8 seeds, a per-tick observer, a switch 
   - BF1 differs: its another-hint timer is randint(16, 25) s, its step-out is 3 m, it takes no coin flip
     (B1 `FUN_0024df78` / `FUN_0024e058`). The port uses BF2's 5-12 s on both games.
 - Files overlap card TEAM (in progress on 2026-10-19). Build on top of it once it lands.
+- planner 2026-10-20 05:20: value 4 -> 5, and TCMP now `deps += TPOSR`. TPOS's audit (PARTLY) found the reservation lapse;
+  TCMP gives Elite the cover the Tactician runs, so the fix goes in before TCMP builds on it (both edit behave.rs).
+  Undo: `loopctl.py set TPOSR value=4`; `loopctl.py set TCMP deps=BOTD,TIER,TPOS,GRAI,ARVS`.

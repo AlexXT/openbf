@@ -1,15 +1,21 @@
-//! Spawn screen: what a dead player looks at while their wave slot comes up.
+//! Spawn screen: what a player off the field looks at - dead, or behind the
+//! spawn screens (card SSELA: side, spawn map, class; [`SpawnScreen`]). The
+//! PS2's own side, map and class screens are `crate::spawn_draw`'s (card
+//! SSELB), painted by the HUD pass; this egui panel is the battle without
+//! spawn screens and the fallback where no HUD pass draws.
 //!
 //! Pure presentation — `SpawnModel` is filled by the game layer from the sim's
 //! command posts and `Sim.waves[team]`.
 //!
-//! Two selections, and they are NOT the same kind of thing:
-//! - the CLASS row is real. `selected_class` is read straight out of
-//!   `Sim::spawn_choice[slot]`, the player moves it with pad bits the input
-//!   log carries (`buttons::SPAWN_CLASS_NEXT`/`PREV`), and the respawn is
-//!   built from it — so it reproduces under replay like any other sim state.
-//! - the POST cursor (`selected`) is still UI-side only: the sim picks the
-//!   spawn node itself. Wiring that up the same way is a later item.
+//! Both selections are SIM state, moved by pad bits the input log carries,
+//! so they reproduce under replay like any other:
+//! - the CLASS row: `selected_class` is `Sim::spawn_choice[slot]`
+//!   (`buttons::SPAWN_CLASS_NEXT`/`PREV`), the class the respawn is built from;
+//! - the POST: `selected` is the slot's spawn-map pick through keep-or-nearest
+//!   (`Sim::spawn_post_selected`, card SPSEL; `buttons::SPAWN_POST_*` push it
+//!   by direction on the map, the PS2's rule), the post the respawn uses.
+//!   `None` until the player first pushes: the respawn then draws from every
+//!   post's nodes.
 
 use egui::{Align2, Color32, FontId, Frame, RichText, Vec2};
 
@@ -24,6 +30,45 @@ pub struct SpawnPost {
     pub distance: f32,
 }
 
+/// What every spawn screen leaves of the backdrop's brightness: 0.51 behind
+/// the respawn map on Hoth (the snow's mean colour 194 -> 98, within 0.3 s;
+/// `analysis/re-spawn-flow.md` §6 item 3 [L]). The level start's screens read
+/// the same (the snow at about 110 under the side, map and class screens of
+/// `lead_tmp/ssel/t1_hot1`, [D]); the class line-up stands undimmed in front
+/// (card SSELB slice 2).
+pub const BACKDROP_DIM: f32 = 0.51;
+
+/// The black veil's alpha that leaves [`BACKDROP_DIM`] of a displayed value:
+/// the overlay blends in linear light (an sRGB target), so the factor is
+/// taken through the sRGB curve at the PS2's own measured level, 194 -> 98.
+fn backdrop_veil_alpha() -> u8 {
+    fn lin(c: f32) -> f32 {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    let c = 194.0 / 255.0;
+    let keep = lin(c * BACKDROP_DIM) / lin(c);
+    ((1.0 - keep) * 255.0).round() as u8
+}
+
+/// Which of the sim's spawn screens is up (card SSELA, `Sim::spawn_stage`),
+/// when the battle runs them. A placeholder text layer over this panel until
+/// card SSELB draws the PS2's own screens.
+#[derive(Debug, Clone)]
+pub enum SpawnScreen {
+    /// The side select: team 1, team 2, Auto Assign, and the highlighted row.
+    Side { rows: [String; 3], selected: usize },
+    /// The spawn map: the post list below is the pick; X takes it.
+    Map,
+    /// The class select: the class row; X spawns, Triangle goes back.
+    Class,
+    /// Dead, the respawn timer still running.
+    Waiting,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SpawnModel {
     pub team_names: [String; 2],
@@ -31,8 +76,9 @@ pub struct SpawnModel {
     pub tickets: [u32; 2],
     /// Posts this team can spawn at, in map order.
     pub posts: Vec<SpawnPost>,
-    /// Cursor into `posts` (UI-side; clamped when drawing).
-    pub selected: usize,
+    /// The sim's pick as an index into `posts` (clamped when drawing);
+    /// `None` = no pick yet, any post.
+    pub selected: Option<usize>,
     /// The player's soldier classes, in the team's table order — display
     /// labels from `game::walk::TeamTemplate::classes`. Empty = the team has
     /// no class table and no row is drawn.
@@ -42,23 +88,85 @@ pub struct SpawnModel {
     pub selected_class: usize,
     /// Seconds until this player's spawn slot opens; None = slot is open.
     pub countdown: Option<f32>,
+    /// The spawn screen up (card SSELA); `None` = the battle runs no spawn
+    /// screens (the respawn is automatic).
+    pub screen: Option<SpawnScreen>,
+    /// The PS2's own screen for `screen`, drawn by the HUD pass
+    /// (`crate::spawn_draw`, card SSELB); while it is `Some` this panel
+    /// draws nothing. The game clears it where no HUD pass draws.
+    pub page: Option<crate::spawn_draw::SpawnPage>,
+}
+
+/// The side select (card SSELA placeholder): the three rows, the highlighted
+/// one marked.
+fn draw_side(ctx: &egui::Context, rows: &[String; 3], selected: usize) {
+    egui::Area::new(egui::Id::new("spawn_side"))
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(Color32::from_black_alpha(215))
+                .inner_margin(egui::Margin::symmetric(28, 20))
+                .corner_radius(6.0)
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new("SELECT A TEAM")
+                                .font(FontId::proportional(26.0))
+                                .color(Color32::WHITE)
+                                .strong(),
+                        );
+                        ui.add_space(10.0);
+                        for (i, r) in rows.iter().enumerate() {
+                            let color = match i {
+                                0 | 1 if i == selected => TEAM_COLORS[i],
+                                _ if i == selected => Color32::WHITE,
+                                _ => Color32::from_gray(150),
+                            };
+                            let mark = if i == selected { "▶ " } else { "   " };
+                            ui.label(
+                                RichText::new(format!("{mark}{}", r.to_uppercase()))
+                                    .size(19.0)
+                                    .color(color)
+                                    .strong(),
+                            );
+                        }
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("D-pad up / down  ·  X select")
+                                .size(12.0)
+                                .color(Color32::GRAY),
+                        );
+                    });
+                });
+        });
 }
 
 /// Draw the spawn screen over the frame. Call instead of the normal death
 /// banner while the player is dead and the round is still running.
 pub fn draw_spawn(ctx: &egui::Context, m: &SpawnModel) {
+    if m.page.is_some() {
+        return;
+    }
     let team = usize::from(m.player_team.min(1));
+    let title = match &m.screen {
+        Some(SpawnScreen::Class) => "SELECT CLASS",
+        _ => "SELECT SPAWN POINT",
+    };
     let accent = TEAM_COLORS[team];
 
-    // Dim the battle behind the screen.
+    // Dim the backdrop behind the screen to the PS2's 0.51.
     egui::Area::new(egui::Id::new("spawn_dim"))
         .anchor(Align2::LEFT_TOP, Vec2::ZERO)
         .show(ctx, |ui| {
             let r = ctx.content_rect();
             ui.painter()
-                .rect_filled(r, 0.0, Color32::from_black_alpha(150));
+                .rect_filled(r, 0.0, Color32::from_black_alpha(backdrop_veil_alpha()));
             ui.allocate_space(r.size());
         });
+    if let Some(SpawnScreen::Side { rows, selected }) = &m.screen {
+        draw_side(ctx, rows, *selected);
+        return;
+    }
 
     egui::Area::new(egui::Id::new("spawn_panel"))
         .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, 0.0))
@@ -70,7 +178,7 @@ pub fn draw_spawn(ctx: &egui::Context, m: &SpawnModel) {
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            RichText::new("SELECT SPAWN POINT")
+                            RichText::new(title)
                                 .font(FontId::proportional(26.0))
                                 .color(accent)
                                 .strong(),
@@ -88,34 +196,39 @@ pub fn draw_spawn(ctx: &egui::Context, m: &SpawnModel) {
                     });
                     ui.add_space(12.0);
 
-                    // The class row: the one selection on this screen that
-                    // really does reach the sim.
+                    // The class row.
                     if !m.classes.is_empty() {
                         let pick = m.selected_class.min(m.classes.len() - 1);
                         ui.vertical_centered(|ui| {
-                        ui.horizontal(|ui| {
-                            for (i, c) in m.classes.iter().enumerate() {
-                                let picked = i == pick;
-                                ui.label(
-                                    RichText::new(c.to_uppercase())
-                                        .size(if picked { 16.0 } else { 14.0 })
-                                        .color(if picked {
-                                            accent
-                                        } else {
-                                            Color32::from_gray(150)
-                                        })
-                                        .strong(),
-                                );
-                                if i + 1 < m.classes.len() {
-                                    ui.label(RichText::new("·").size(14.0).color(Color32::DARK_GRAY));
+                            ui.horizontal(|ui| {
+                                for (i, c) in m.classes.iter().enumerate() {
+                                    let picked = i == pick;
+                                    ui.label(
+                                        RichText::new(c.to_uppercase())
+                                            .size(if picked { 16.0 } else { 14.0 })
+                                            .color(if picked {
+                                                accent
+                                            } else {
+                                                Color32::from_gray(150)
+                                            })
+                                            .strong(),
+                                    );
+                                    if i + 1 < m.classes.len() {
+                                        ui.label(
+                                            RichText::new("·").size(14.0).color(Color32::DARK_GRAY),
+                                        );
+                                    }
                                 }
-                            }
-                        });
-                        ui.label(
-                            RichText::new("R1 / Select to change class")
+                            });
+                            ui.label(
+                                RichText::new(if m.screen.is_some() {
+                                    "On the class screen: D-pad left / right or R1 / Select"
+                                } else {
+                                    "R1 / Select to change class"
+                                })
                                 .size(12.0)
                                 .color(Color32::GRAY),
-                        );
+                            );
                         });
                         ui.add_space(10.0);
                     }
@@ -127,9 +240,16 @@ pub fn draw_spawn(ctx: &egui::Context, m: &SpawnModel) {
                                 .color(Color32::from_rgb(230, 180, 80)),
                         );
                     }
-                    let sel = m.selected.min(m.posts.len().saturating_sub(1));
+                    let sel = m.selected.map(|s| s.min(m.posts.len().saturating_sub(1)));
+                    if sel.is_none() && !m.posts.is_empty() {
+                        ui.label(
+                            RichText::new("ANY POST — push the D-pad toward one to pick it")
+                                .size(13.0)
+                                .color(Color32::from_gray(170)),
+                        );
+                    }
                     for (i, p) in m.posts.iter().enumerate() {
-                        let picked = i == sel;
+                        let picked = Some(i) == sel;
                         let (mark, name_color) = if picked {
                             ("▶", accent)
                         } else {
@@ -162,14 +282,25 @@ pub fn draw_spawn(ctx: &egui::Context, m: &SpawnModel) {
                     ui.add_space(14.0);
                     ui.separator();
                     ui.add_space(8.0);
-                    ui.vertical_centered(|ui| match m.countdown {
-                        Some(s) => ui.label(
+                    let prompt = match &m.screen {
+                        Some(SpawnScreen::Map) => Some("X  SELECT COMMAND POST"),
+                        Some(SpawnScreen::Class) => Some("X  SELECT CHARACTER    △  BACK"),
+                        _ => None,
+                    };
+                    ui.vertical_centered(|ui| match (prompt, m.countdown) {
+                        (Some(p), _) => ui.label(
+                            RichText::new(p)
+                                .font(FontId::proportional(22.0))
+                                .color(accent)
+                                .strong(),
+                        ),
+                        (None, Some(s)) => ui.label(
                             RichText::new(format!("SPAWNING IN {}", s.ceil().max(1.0) as u32))
                                 .font(FontId::proportional(22.0))
                                 .color(Color32::WHITE)
                                 .strong(),
                         ),
-                        None => ui.label(
+                        (None, None) => ui.label(
                             RichText::new("SPAWNING…")
                                 .font(FontId::proportional(22.0))
                                 .color(accent)
@@ -178,21 +309,12 @@ pub fn draw_spawn(ctx: &egui::Context, m: &SpawnModel) {
                     });
                     ui.add_space(4.0);
                     ui.vertical_centered(|ui| {
+                        // The pick goes by direction on the map (the PS2's
+                        // spawn map), not down the list: up = north (-z).
                         ui.label(
-                            RichText::new("D-pad up / down: select post")
+                            RichText::new("D-pad: pick the post that way on the map")
                                 .size(12.0)
                                 .color(Color32::GRAY),
-                        );
-                        // Honest label: the CLASS choice reaches the sim now
-                        // (it is `Sim::spawn_choice`), the POST cursor still
-                        // does not — the maintainer should not have to guess which is
-                        // which from a dev build.
-                        ui.label(
-                            RichText::new(
-                                "the class choice reaches the sim — the post cursor is still a preview",
-                            )
-                            .size(11.0)
-                            .color(Color32::from_gray(120)),
                         );
                     });
                 });
@@ -220,7 +342,7 @@ mod tests {
                     distance: 118.0,
                 },
             ],
-            selected: 1,
+            selected: Some(1),
             classes: vec![
                 "Trooper".into(),
                 "Assault Gunner".into(),
@@ -230,7 +352,32 @@ mod tests {
             ],
             selected_class: 2,
             countdown: Some(3.4),
+            screen: None,
+            page: None,
         }
+    }
+
+    /// The veil leaves the PS2's 0.51 of the snow's displayed level (194 ->
+    /// 98, re-spawn-flow §6 item 3) once the linear-light blend is done.
+    #[test]
+    fn the_veil_dims_the_measured_level_to_0_51() {
+        let to_lin = |c: f32| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let to_srgb = |l: f32| {
+            if l <= 0.0031308 {
+                l * 12.92
+            } else {
+                1.055 * l.powf(1.0 / 2.4) - 0.055
+            }
+        };
+        let keep = 1.0 - f32::from(backdrop_veil_alpha()) / 255.0;
+        let shown = to_srgb(to_lin(194.0 / 255.0) * keep) * 255.0;
+        assert!((shown - 98.0).abs() <= 1.5, "194 -> {shown}");
     }
 
     /// Lays out headless at two aspects, in every state the game can hand it.
@@ -263,17 +410,53 @@ mod tests {
         // No posts, no countdown, selection past the end.
         let m = SpawnModel {
             posts: Vec::new(),
-            selected: 7,
+            selected: Some(7),
             countdown: None,
             ..model()
         };
         let _ = ctx.run(egui::RawInput::default(), |ctx| draw_spawn(ctx, &m));
         // Selection past the end with posts present clamps to the last.
         let m = SpawnModel {
-            selected: 99,
+            selected: Some(99),
             ..model()
         };
         let _ = ctx.run(egui::RawInput::default(), |ctx| draw_spawn(ctx, &m));
+        // No pick yet.
+        let m = SpawnModel {
+            selected: None,
+            ..model()
+        };
+        let _ = ctx.run(egui::RawInput::default(), |ctx| draw_spawn(ctx, &m));
+    }
+
+    /// Card SSELA: every spawn screen the sim can be on lays out, and the
+    /// side select (its own panel) draws something.
+    #[test]
+    fn every_spawn_screen_lays_out() {
+        let rows = || ["all".to_owned(), "imp".to_owned(), "Auto Assign".to_owned()];
+        for screen in [
+            SpawnScreen::Side {
+                rows: rows(),
+                selected: 2,
+            },
+            SpawnScreen::Side {
+                rows: rows(),
+                selected: 9,
+            },
+            SpawnScreen::Map,
+            SpawnScreen::Class,
+            SpawnScreen::Waiting,
+        ] {
+            let ctx = egui::Context::default();
+            let m = SpawnModel {
+                screen: Some(screen.clone()),
+                ..model()
+            };
+            let _ = ctx.run(egui::RawInput::default(), |ctx| draw_spawn(ctx, &m));
+            let out = ctx.run(egui::RawInput::default(), |ctx| draw_spawn(ctx, &m));
+            let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+            assert!(!prims.is_empty(), "{screen:?} drew nothing");
+        }
     }
 
     /// The class row draws for every table size the game can hand it — none

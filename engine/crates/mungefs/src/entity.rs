@@ -8,8 +8,8 @@
 //!   NUL-terminated model (modl) name + a trailing u32, the model's triangle
 //!   count (BF2's loader reads it as an int: `analysis/re-far-lowd.md` §2.1,
 //!   §9 — 588 / 1200 for UTA1's cliffs).
-//! - gmod INFO (BF2, B2 FUN_001c59e8): u32, f32, u32 count (<= 8), then count
-//!   NUL-terminated cloth names - the cloths a soldier of this geometry wears
+//! - gmod INFO (BF2, B2 FUN_001c59e8): u32, f32, u32 count (8 slots; B2
+//!   does not check it), then count NUL-terminated cloth names - the cloths a soldier of this geometry wears
 //!   (`analysis/re-cloth.md` 2 [O]).
 //!
 //! Instance class → entc(GeometryName) → gmod(NAME) → LOD model → modl chunk.
@@ -151,8 +151,9 @@ impl GeomModel {
     }
 }
 
-/// The gmod INFO's cloth names: u32, f32, u32 count, count NUL names. A count
-/// over 8 (B2 FUN_001c59e8's bound) or a name past the payload reads as none.
+/// The gmod INFO's cloth names: u32, f32, u32 count, count NUL names. B2
+/// FUN_001c59e8 stores them in 8 slots and does not check the count (B2:72386-72404).
+/// OURS: a count over 8, or a name past the payload, reads as none.
 fn cloth_list(info: &[u8]) -> Vec<String> {
     let Some(n) = info
         .get(8..12)

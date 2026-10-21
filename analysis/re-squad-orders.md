@@ -229,6 +229,12 @@ seat says the type-4 line (p 0.3, `FUN_0024d020`; a type 3 from a seat becomes 4
 Only the seated issuers' orders are delivered (§1.5): AI on foot within 30 m board the caller's vehicle and answer
 "yes" — the `needgunner` / `yes` pairs heard in a battle with no order from the player (card note, ANNC run 1).
 
+Correction (card GUNWT, 2026-10-19, `re-driver-wait.md` 4 and 8): "first path leg fails" is wrong - the trooper says
+FOLLOW when it sets out for a post it is not at (`FUN_00235258` = inside the goal's radius, card UTALK). A driving AI
+runs the trooper agent too, so each set-out of a SEATED trooper is the type-4 "need gunner" call (0.3): the waiting
+driver (`UnitWaitSecondaryAgent`, entered once per AI pilot entry, 4 s window) is one of two sources, and neither
+tests the vehicle's seats.
+
 ## 6. PS2 live scenes [L]
 
 `lead_tmp/sqack/sq_live.py` (pad script in game-clock seconds; samples every 8 ms the clock, six stream slots + queue
@@ -352,7 +358,8 @@ order went 12.3 s after it).
 
 Not built: the orders from a vehicle seat (§4.4; a seated player's D-pad does
 nothing), a follower boarding its leader's vehicle, orders to bots in vehicles (and the x3 reach), the AI's own
-orders (§5), the LOD-skipped think, the holder's look-around. The earlier port's Disperse (`CommandKind::Disperse`
+orders (§5; since card UTALK, e22e702, the AI's follow / move out / need gunner lines and the "yes" answers are
+built, the boarding they cause is card GUNWT, `re-driver-wait.md` 7), the LOD-skipped think, the holder's look-around. The earlier port's Disperse (`CommandKind::Disperse`
 and the commander's spread rule) is still in the code and no pad reaches it.
 
 ## 10. Checks run

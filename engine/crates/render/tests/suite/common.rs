@@ -1,7 +1,7 @@
 //! Shared fixtures for the render crate's GPU referees.
 //!
-//! The ten test modules of the suite binary — `alpha_blend`, `detail_map`, `frame_filter`, `gpu_smoke`,
-//! `light_path`, `skinned`, `sky_shell`, `specular`, `uv_scroll`,
+//! The eleven test modules of the suite binary — `alpha_blend`, `detail_map`, `frame_filter`, `gpu_smoke`,
+//! `light_path`, `lod_switch`, `skinned`, `sky_shell`, `specular`, `uv_scroll`,
 //! `water_pass` — all build the same
 //! three things before they can assert anything: a 64x64 headless renderer,
 //! a view-spanning textured quad, and a pixel read out of the readback buffer.

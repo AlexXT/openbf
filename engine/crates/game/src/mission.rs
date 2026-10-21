@@ -140,6 +140,12 @@ pub struct MissionDef {
     /// script on both discs.
     #[serde(default)]
     pub sound: Vec<(String, String)>,
+    /// The spawn screens' backdrops (card SSELB, re-spawn-flow §1.1):
+    /// `AddCameraShot(qw, qx, qy, qz, x, y, z)` in call order, the first 16
+    /// (the PS2's cap, B2:31916). Every mission script on both discs calls
+    /// it; [`MissionDef::camera_shots`] reads them.
+    #[serde(default, rename = "camera_shots")]
+    pub camera_shot_calls: Vec<[f32; 7]>,
     /// The PC .lua and PS2 script this record was read out of.
     #[serde(default)]
     pub source: String,
@@ -196,7 +202,9 @@ pub struct Pick {
     pub path: PathBuf,
     pub mission: MissionDef,
     /// The sim team of the player's army: its own team in the mission when
-    /// the pair is the mission's own, else 0.
+    /// the pair is the mission's own, else 0. Where the battle runs the spawn
+    /// screens (card SSELA) this only orders the armies and seats the held
+    /// player; the side the player accepts there is the team it plays.
     pub player_team: u8,
     /// The pair picked is this mission's own pair (either order).
     pub own: bool,
@@ -247,6 +255,14 @@ pub fn pick(dir: &Path, map: &str, mode: &str, armies: [&str; 2]) -> Option<Pick
 }
 
 impl MissionDef {
+    /// The mission's camera shots (the spawn screens' level-start views).
+    pub fn camera_shots(&self) -> Vec<crate::spawn_backdrop::CameraShot> {
+        self.camera_shot_calls
+            .iter()
+            .map(|&a| crate::spawn_backdrop::CameraShot::from_call(a))
+            .collect()
+    }
+
     pub fn load(path: &Path) -> Result<MissionDef> {
         let txt = pak::read_to_string(path).with_context(|| path.display().to_string())?;
         let m: MissionDef =
@@ -697,5 +713,60 @@ mod tests {
         let mut b = core::battle::Battle::new(m.tickets());
         m.apply_death_drains(&mut b);
         assert_eq!(b.death_drain, [[1, 0], [0, 0]]);
+    }
+
+    /// Card SSELB acceptance 1: the mission RON carries the script's
+    /// `AddCameraShot` list - hot1g_con's three, the first as the script
+    /// writes it - and every mission on both discs has 3 to 16.
+    #[test]
+    fn missions_carry_their_camera_shots() {
+        if no_missions() {
+            return;
+        }
+        let m = MissionDef::load(&missions_dir().join("bf2_hot1_con.ron")).expect("hot1");
+        assert_eq!(m.camera_shot_calls.len(), 3);
+        assert_eq!(
+            m.camera_shot_calls[0],
+            [0.94421, 0.065541, 0.321983, -0.02235, -500.48984, 0.797472, -68.77385]
+        );
+        let mut n = 0;
+        for e in std::fs::read_dir(missions_dir()).expect("missions dir") {
+            let p = e.expect("entry").path();
+            if p.extension().is_none_or(|x| x != "ron") {
+                continue;
+            }
+            let m = MissionDef::load(&p).expect("parse");
+            let k = m.camera_shot_calls.len();
+            assert!((3..=16).contains(&k), "{}: {k} shots", p.display());
+            n += 1;
+        }
+        assert!(n >= 57, "{n} missions read");
+    }
+
+    /// Card SSELB acceptance 2: the port's view at the side select on Hoth
+    /// is shot 0 and stands where the PS2's camera stood
+    /// (`engine/artifacts/lead_tmp/ssel/t1_hot1/s0_team1.p2s`, read by
+    /// `lead_tmp/sselb/pose.py`: eye (-500.4898, 0.7975, -68.7738), back row
+    /// (0.6051, -0.1382, 0.7841), tan_v 0.34131), within 0.05 m and 0.1 deg.
+    #[test]
+    fn hoth_side_select_stands_at_the_ps2_eye() {
+        if no_missions() {
+            return;
+        }
+        let m = MissionDef::load(&missions_dir().join("bf2_hot1_con.ron")).expect("hot1");
+        let mut b = crate::spawn_backdrop::Backdrop::new(m.camera_shots(), 1).expect("shots");
+        b.follow(core::sim::SpawnStage::Side);
+        let c = b.camera();
+        let eye = glam::Vec3::new(-500.4898, 0.7975, -68.7738);
+        assert!(c.position.distance(eye) < 0.05, "{:?}", c.position);
+        let ps2_fwd = -glam::Vec3::new(0.6051, -0.1382, 0.7841).normalize();
+        let deg = c
+            .forward()
+            .dot(ps2_fwd)
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees();
+        assert!(deg < 0.1, "view {deg} deg off the PS2's");
+        assert!(((c.fov_y * 0.5).tan() - 0.34131).abs() < 1e-5);
     }
 }

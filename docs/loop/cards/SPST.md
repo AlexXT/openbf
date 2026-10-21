@@ -70,3 +70,4 @@ command post (CWSP's walker post). The port's stills have no battle and so no wa
 the port's walker post carries its post light in a battle (`game/src/point_light.rs`). Whoever is in the walker
 post's code next: one headless HOT1 battle frame with `PXC_LIGHTS=1`-style printing of the lights, the walker post's
 among them or not, and if not, add it (the post's light at the walker's post point, owner colour). Small; no card.
+- SPSEL landed 2026-10-20 (6dc5a68): a human's post is `Sim::spawn_post_choice[slot]`, moved by `pick_spawn_post` (along + 0.25 perp^2), read through `keep_or_nearest_post`; `player_spawn_posts(team)` is the eligible list with live positions. Reuse it, do not add a second mechanism.

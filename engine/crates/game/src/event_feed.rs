@@ -171,6 +171,12 @@ impl Texts {
             .to_owned()
     }
 
+    /// The BF2 table's text under the key path `key`, line ends and the
+    /// trailing blank lines kept as the disc has them; `None` without one.
+    pub fn bf2_text(&self, key: &str) -> Option<&str> {
+        self.bf2.as_ref()?.text(key)
+    }
+
     /// A team's name: `common.sides.<faction>.name` ("Rebels", "Empire").
     pub fn team_name(&self, faction: &str) -> String {
         self.bf2
@@ -195,6 +201,25 @@ impl Texts {
             Some(n) if self.bf1_map => title_case(&n),
             Some(n) => n,
             None => self.line(COMMAND_POST),
+        }
+    }
+
+    /// A soldier class's name as the spawn screen prints it (card SPSEL):
+    /// class `<side>_<rest>` is keyed `entity.<side>.<rest>` in both games'
+    /// tables ("rep_inf_ep3_sniper" → "Clone Sharpshooter", BF1
+    /// "all_inf_smuggler" → "WOOKIEE SMUGGLER", title-cased like the post
+    /// names), the map's own game's table first. `None` when neither has it.
+    pub fn class_name(&self, class: &str) -> Option<String> {
+        let (side, rest) = class.split_once('_')?;
+        let hash = manifest::hud::locl_key(&format!("entity.{side}.{rest}"));
+        let (text, bf1) = [(&self.map, self.bf1_map), (&self.bf2, false)]
+            .into_iter()
+            .find_map(|(l, bf1)| Some((l.as_ref()?.get(hash)?, bf1)))?;
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        match text.is_empty() {
+            true => None,
+            false if bf1 => Some(title_case(&text)),
+            false => Some(text),
         }
     }
 
@@ -282,6 +307,10 @@ pub struct EventFeed {
     teams: [(String, Vec<String>, Vec<String>); 2],
     /// Per post (`Sim::cps` order): its name.
     posts: Vec<String>,
+    /// Per team, its soldier classes' names in the class table's order
+    /// ([`Texts::class_name`], else the roster's label). Empty for a feed
+    /// built without a walk.
+    classes: [Vec<String>; 2],
     /// The lines made since the last [`EventFeed::take`], oldest first.
     out: Vec<HudMessage>,
     /// What was said lately, and when (the one-line rule).
@@ -317,6 +346,7 @@ impl EventFeed {
         Self {
             teams: [team(factions[0]), team(factions[1])],
             posts: post_keys.iter().map(|k| texts.post_name(k)).collect(),
+            classes: [Vec::new(), Vec::new()],
             order_labels: ORDER_LABELS.map(|l| texts.order_label(l)),
             texts,
             out: Vec::new(),
@@ -333,11 +363,54 @@ impl EventFeed {
 
     /// The feed of `walk`'s battle, with the text baked under `assets_dir`.
     pub fn for_walk(assets_dir: &Path, source_game: &str, walk: &crate::walk::WalkSim) -> Self {
-        Self::new(
+        let mut feed = Self::new(
             Texts::load(assets_dir, source_game),
             [&walk.teams[0].faction, &walk.teams[1].faction],
             &walk.post_keys,
-        )
+        );
+        feed.classes = [0, 1].map(|t| {
+            walk.teams[t]
+                .classes
+                .iter()
+                .map(|c| {
+                    feed.texts
+                        .class_name(&c.name)
+                        .unwrap_or_else(|| c.label.clone())
+                })
+                .collect()
+        });
+        feed
+    }
+
+    /// Team `team`'s soldier class names, in its class table's order (empty
+    /// without a walk).
+    pub fn class_names(&self, team: u8) -> &[String] {
+        &self.classes[usize::from(team.min(1))]
+    }
+
+    /// A shell or spawn-screen text from BF2's table by its key path
+    /// (`ifs.sideselect.chooseteam`), else `fallback` - the disc's English.
+    pub fn screen_text(&self, key: &str, fallback: &str) -> String {
+        self.texts.bf2_text(key).unwrap_or(fallback).to_owned()
+    }
+
+    /// A text the ELF names by its hash (the class panel's, B2
+    /// `FUN_00396430`), else `fallback`.
+    pub fn text_by_hash(&self, hash: u32, fallback: &str) -> String {
+        self.texts.line((hash, fallback))
+    }
+
+    /// A weapon class's name as the class select lists it: BF2 keys
+    /// `<side>_weap_<rest>` as `weapons.<side>.weap.<rest>` ("Blaster
+    /// Rifle"); `None` when the table has none.
+    pub fn weapon_name(&self, class: &str) -> Option<String> {
+        let (side, rest) = class.split_once('_')?;
+        let (kind, rest) = rest.split_once('_')?;
+        let text = self
+            .texts
+            .bf2_text(&format!("weapons.{side}.{kind}.{rest}"))?;
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_owned())
     }
 
     /// The two teams' names as the lines print them.
@@ -601,6 +674,8 @@ mod tests {
             ("common.sides.all.firstnames.01", "Ben"),
             ("common.sides.all.lastnames.01", "Pulastra"),
             ("level.hoth.cp5", "Echo Base"),
+            ("weapons.imp.weap.inf_rifle", "Blaster Rifle"),
+            ("ifs.sideselect.chooseteam", "Select a team"),
         ] {
             entries.push((manifest::hud::locl_key(key), text.to_string()));
         }
@@ -931,5 +1006,35 @@ mod tests {
             let c = order(&mut sim, me, &mut feed, button);
             assert_eq!(c.count, None, "nobody in reach");
         }
+    }
+
+    /// The spawn screens' texts (card SSELB): a Lua key path, a hash the
+    /// ELF names, a weapon class by its `weapons.<side>.weap.<rest>` key,
+    /// each falling back to the disc's English where the table lacks it.
+    #[test]
+    fn the_spawn_screens_read_the_table() {
+        let feed = EventFeed::new(texts(), ["all", "imp"], &[]);
+        assert_eq!(
+            feed.screen_text("ifs.sideselect.chooseteam", "x"),
+            "Select a team"
+        );
+        assert_eq!(
+            feed.screen_text("ifs.sideselect.autoassign", "Auto Assign"),
+            "Auto Assign"
+        );
+        assert_eq!(
+            feed.weapon_name("imp_weap_inf_rifle").as_deref(),
+            Some("Blaster Rifle")
+        );
+        assert_eq!(feed.weapon_name("imp_weap_inf_pistol"), None);
+        assert_eq!(feed.weapon_name("norifle"), None);
+        assert_eq!(
+            feed.text_by_hash(manifest::hud::locl_key("level.hoth.cp5"), "x"),
+            "Echo Base"
+        );
+        assert_eq!(
+            feed.text_by_hash(0xecf8_496f, "Unit Count: %d"),
+            "Unit Count: %d"
+        );
     }
 }

@@ -46,6 +46,23 @@ pub mod buttons {
     /// `analysis/re-grenades.md` §2.4); [`SWITCH_WEAPON`] steps channel 0's.
     /// Both are edge-triggered, on foot (`Sim::step` phase 4).
     pub const SWITCH_SECONDARY: u32 = 1 << 15;
+    /// Spawn map (card SPSEL): push the chosen POST toward screen-up on the
+    /// map (world −z). Read ONLY while the player is dead (`Sim::step` phase
+    /// 0a, `Sim::spawn_select`); the four arms combine into one push.
+    pub const SPAWN_POST_UP: u32 = 1 << 16;
+    /// Spawn map: push toward screen-down (world +z).
+    pub const SPAWN_POST_DOWN: u32 = 1 << 17;
+    /// Spawn map: push toward screen-left (world −x).
+    pub const SPAWN_POST_LEFT: u32 = 1 << 18;
+    /// Spawn map: push toward screen-right (world +x).
+    pub const SPAWN_POST_RIGHT: u32 = 1 << 19;
+    /// The spawn screens' accept (card SSELA; the PS2's X, re-spawn-flow §1):
+    /// side -> spawn map -> class -> spawn. EDGE-TRIGGERED, read only while
+    /// the slot is not on the field and `Sim::spawn_screens` is on.
+    pub const SPAWN_ACCEPT: u32 = 1 << 20;
+    /// The spawn screens' back (the PS2's Triangle): class -> spawn map;
+    /// nothing on the spawn map (offline) or on the side screen.
+    pub const SPAWN_BACK: u32 = 1 << 21;
 }
 
 /// One controller's state for one tick. Extend as input needs grow (axes are

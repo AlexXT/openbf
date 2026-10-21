@@ -19,6 +19,19 @@ pub enum SpawnPost {
     Walker(crate::vehicle::VehicleHandle),
 }
 
+impl SpawnPost {
+    /// A kind byte (1 post, 2 walker), then the index and generation.
+    pub fn hash_into(&self, eat: &mut impl FnMut(&[u8])) {
+        let (kind, index, gen) = match *self {
+            SpawnPost::Post(i) => (1u8, u32::from(i), 0),
+            SpawnPost::Walker(h) => (2, h.index, h.gen),
+        };
+        eat(&[kind]);
+        eat(&index.to_le_bytes());
+        eat(&gen.to_le_bytes());
+    }
+}
+
 /// Generation-checked unit reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct UnitHandle {
@@ -478,13 +491,7 @@ impl Unit {
         // Eaten only while a dead bot holds a choice, so a sim nobody has
         // died in keeps its hash (the pinned command-free format).
         if let Some(post) = self.spawn_post {
-            let (kind, index, gen) = match post {
-                SpawnPost::Post(i) => (1u8, u32::from(i), 0),
-                SpawnPost::Walker(h) => (2, h.index, h.gen),
-            };
-            eat(&[kind]);
-            eat(&index.to_le_bytes());
-            eat(&gen.to_le_bytes());
+            post.hash_into(eat);
         }
         for v in [self.wall_push.x, self.wall_push.y, self.wall_push.z] {
             eat(&v.to_bits().to_le_bytes());

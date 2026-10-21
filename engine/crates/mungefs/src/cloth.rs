@@ -17,7 +17,7 @@
 //!   3 f32 params, 12 f32 rows r0 r1 r2 t).
 //!
 //! All 58 disc chunks end exactly on their DATA and COLL ends (the test in
-//! `tests/cloth_disc.rs`).
+//! `tests/suite/cloth_disc.rs`).
 
 use crate::{le, Chunk, UcfbError};
 
@@ -328,5 +328,33 @@ mod tests {
     #[test]
     fn refuses_leftover_bytes() {
         assert!(parse(&sample(&[0])).is_err());
+    }
+
+    /// The no-panic contract: every word of the chunk set to 0xFFFFFFFF (a huge
+    /// count, an index past N) and every byte flipped parses to a `Result`.
+    #[test]
+    fn hostile_words_and_bytes_never_panic() {
+        fn try_parse(b: &[u8]) -> usize {
+            match crate::chunks(b).next() {
+                Some(Ok(c)) => {
+                    let _ = Cloth::parse(&c);
+                    1
+                }
+                _ => 0,
+            }
+        }
+        let good = sample(&[]);
+        let mut cases = 0;
+        for at in (0..good.len()).step_by(4) {
+            let mut b = good.clone();
+            b[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            cases += try_parse(&b);
+        }
+        for at in 0..good.len() {
+            let mut b = good.clone();
+            b[at] ^= 0xff;
+            cases += try_parse(&b);
+        }
+        assert!(cases > good.len(), "{cases} cases");
     }
 }

@@ -4,14 +4,14 @@ title: Team sense: a unit grid for every 'who is near' question, roles with capa
 milestone: M3
 value: 5
 phase: build
-status: in-progress
+status: done
 deps: BOTD,TPOS
-files: engine/crates/core/src/ai/team.rs, engine/crates/core/src/ai/behave.rs, engine/crates/core/src/perception.rs, engine/crates/core/src/sim/step.rs, engine/crates/core/src/ai/mover.rs, engine/crates/core/src/skill.rs, engine/crates/core/src/ai/gunner_foot.rs
+files: engine/crates/core/src/ai/team.rs, engine/crates/core/src/ai/team/tests.rs, engine/crates/core/src/ai/behave.rs, engine/crates/core/src/ai/state.rs, engine/crates/core/src/ai.rs, engine/crates/core/src/perception.rs, engine/crates/core/src/sim/step.rs, engine/crates/core/src/sim/state.rs, engine/crates/core/src/ai/mover.rs, engine/crates/core/src/skill.rs, engine/crates/core/src/ai/gunner_foot.rs, engine/crates/core/src/ai/man/tests.rs, engine/crates/game/examples/round_to_outcome.rs
 declares: sim; sweep; arena
 needs:
 effort: high
 branch: team
-resume:
+resume: landed d4a50c62 2026-10-20
 created: 2026-10-03
 alpha: yes
 ---
@@ -56,3 +56,10 @@ The maintainer, 2026-10-02: bots "all standing next to each other", shooting eac
   column, Easy off); (2) roles: Cover for a capturer (Hard and Elite only, the design's section 7) and Overwatch, with
   role counts per map and a capacity test; (3) the cost at 33 units (`lead_tmp/obst2/tools/perf.sh`, JOBS=1, a null twin
   of main); (4) move the Tactician's per-unit loops onto the grid (its reservations walk every unit).
+- 2026-10-20 slice B LANDED d4a50c6 (lane 2; report `reports/20261020_0824_card_TEAM.md`): the telling ON (every tier but Easy) with
+  `Contact::told` - aimed at, keeps nobody on a position, never overwrites the bot's own record (COR1 20 s spells 11.7 -> 8.5 %);
+  fire lanes: every shot's line cleared by a tick of walking + its flight (`gunner_foot::shot_late`; the telling alone raised BF2
+  team kills 307 -> 368); the team board's COVER role at Hard / Elite (`ai::team::board`, capacity 2, tests + 5 mutants); a
+  circler with no ring point walks at an out-of-reach target (BF1 KAS2 Hard seed 2 NO OUTCOME on B1). B3 / B4 met, 256/256 at
+  Normal and Hard, ms a tick x0.996 of main. Left (not carded): lanes held on the board (the Tactician asks each friend's line
+  itself); Flank / Gunner roles are FLNK / TURR.

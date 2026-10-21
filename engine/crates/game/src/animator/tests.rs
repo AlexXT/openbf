@@ -178,6 +178,7 @@ fn input(speed: f32) -> AnimInput {
         vel: glam::Vec2::new(0.0, speed),
         yaw: 0.0,
         max_speed: 7.0,
+        root_scale: 1.0,
         dead: false,
         set: 0,
         fired: false,
@@ -655,7 +656,7 @@ fn the_chooser_is_the_ps2s() {
     let deg = |a: f32| a.to_degrees();
     let pick = |game, v: Vec2, alert, prev: Legs| {
         let mut l = prev;
-        choose(game, v, false, alert, 7.0, &mut l).map(|(m, t)| (m, deg(t)))
+        choose(game, v, 1.0, false, alert, 7.0, &mut l).map(|(m, t)| (m, deg(t)))
     };
     let from = |mv| Legs {
         mv,
@@ -729,7 +730,7 @@ fn the_chooser_is_the_ps2s() {
     // BF2: the speed mode, 0.78 of MaxSpeed (7.0 -> 5.46) to run, 0.71
     // (4.97) to stay.
     let mut l = idle;
-    let mut at = |s: f32| choose(Game::Bf2, ahead(s), false, false, 7.0, &mut l).map(|c| c.0);
+    let mut at = |s: f32| choose(Game::Bf2, ahead(s), 1.0, false, false, 7.0, &mut l).map(|c| c.0);
     assert_eq!(at(5.4), Some(Move::WalkForward));
     assert_eq!(at(5.5), Some(Move::RunForward));
     assert_eq!(at(5.0), Some(Move::RunForward));
@@ -742,11 +743,11 @@ fn the_chooser_is_the_ps2s() {
         ..idle
     };
     assert_eq!(
-        choose(Game::Bf2, ahead(0.25), false, false, 7.0, &mut l).map(|c| c.0),
+        choose(Game::Bf2, ahead(0.25), 1.0, false, false, 7.0, &mut l).map(|c| c.0),
         Some(Move::WalkForward)
     );
     assert_eq!(
-        choose(Game::Bf2, ahead(0.15), false, false, 7.0, &mut l),
+        choose(Game::Bf2, ahead(0.15), 1.0, false, false, 7.0, &mut l),
         None
     );
     // BF2's forward bit is up from a stand: a strafe takes the wide window
@@ -772,15 +773,16 @@ fn the_chooser_is_the_ps2s() {
 fn a_stance_with_strafe_clips_strafes() {
     let mut l = Legs::default();
     let v = glam::Vec2::new(1.0, 0.2);
-    let (m, t) = choose(Game::Bf1, v, true, false, 7.0, &mut l).unwrap();
+    let (m, t) = choose(Game::Bf1, v, 1.0, true, false, 7.0, &mut l).unwrap();
     assert_eq!(m, Move::WalkLeft);
     assert!((t + 0.2f32.atan2(1.0)).abs() < 1e-5, "{t}");
-    let r = choose(Game::Bf1, -v, true, false, 7.0, &mut l).unwrap();
+    let r = choose(Game::Bf1, -v, 1.0, true, false, 7.0, &mut l).unwrap();
     assert_eq!(r.0, Move::RunRight);
     // Mostly ahead: the forward clip, the whole angle on the legs.
     let (m, t) = choose(
         Game::Bf1,
         glam::Vec2::new(1.0, 1.5),
+        1.0,
         true,
         false,
         7.0,
@@ -812,6 +814,49 @@ fn a_walk_plays_at_its_speed() {
         let feet = v * move_rate(speed, v);
         assert!((feet - (0.95 * speed + 0.05 * v)).abs() < 1e-4);
     }
+}
+
+/// A class's SkeletonRootScale (card USKN, re-soldier-skeleton-skins 7): the
+/// chooser and the clip rate read v / scale - a 1.15 Wookiee walks at 6.0
+/// m/s (5.2 < BF1's 5.5 run speed), idles at 0.33 (0.29 < 0.3) and plays
+/// his walk at v / 1.15; BF2's speed mode stays on v against MaxSpeed.
+#[test]
+fn a_scaled_class_chooses_and_plays_on_v_over_the_scale() {
+    let ahead = |s: f32| glam::Vec2::new(0.0, s);
+    let pick = |game, v, scale| choose(game, v, scale, false, false, 7.0, &mut Legs::default());
+    assert_eq!(
+        pick(Game::Bf1, ahead(6.0), 1.0).unwrap().0,
+        Move::RunForward
+    );
+    assert_eq!(
+        pick(Game::Bf1, ahead(6.0), 1.15).unwrap().0,
+        Move::WalkForward
+    );
+    assert_eq!(
+        pick(Game::Bf1, ahead(0.33), 1.0).unwrap().0,
+        Move::WalkForward
+    );
+    assert_eq!(pick(Game::Bf1, ahead(0.33), 1.15), None);
+    assert_eq!(pick(Game::Bf2, ahead(0.33), 1.15), None);
+    assert_eq!(
+        pick(Game::Bf2, ahead(5.5), 1.15).unwrap().0,
+        Move::RunForward
+    );
+    let mut sets_rig = rig_bf1();
+    sets_rig.root[WALK] = Some([0.0, 3.687]);
+    let (speed, v, scale) = (4.5, 3.687, 1.15);
+    let i = AnimInput {
+        root_scale: scale,
+        ..input(speed)
+    };
+    let mut r = Run::new(sets_rig);
+    r.steps(&i, 30);
+    assert_eq!(r.a.lower_clip(), Some(WALK));
+    let t0 = r.a.lower.t;
+    r.steps(&i, 1);
+    let got = (r.a.lower.t - t0).rem_euclid(1.0);
+    let want = DT * 30.0 / 19.0 * move_rate(speed / scale, v);
+    assert!((got - want).abs() < 1e-5, "{got} not {want}");
 }
 
 /// Standing, the legs keep their place while the body turns; past the

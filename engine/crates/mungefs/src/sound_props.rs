@@ -1,7 +1,8 @@
 //! `snd_` sound-property scripts (analysis/re-sound-banks.md §snd_): a config
 //! DATA/SCOP tree (mungefs::config) where a `soundproperties` record opens a
 //! definition whose SCOP holds `name`, `gain`, `pitch`, distances, the
-//! `samplelist` (0x4143ACAF → `sample(id, weight)` records) and an
+//! `samplelist` (0x4143ACAF → `sample(id, weight[, interval, deviation])`
+//! records; the last two are a take's lock), the mixer `bus` and an
 //! `inherit` template (0xCA04EFE0). Layered definitions (kind 0xA54A2138 on
 //! TAT.LVL, e.g. reload sounds) list `Layer(layer name, sound, delay
 //! [, deviation])` entries (analysis/re-weapon-sounds.md §1).

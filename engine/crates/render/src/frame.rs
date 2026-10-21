@@ -18,6 +18,7 @@
 //! [`FrameStats`] is what it submitted. The draw-order tests live here.
 
 use crate::frustum;
+use crate::gpu_timer::GpuTimer;
 use crate::mesh::{self, GpuMesh, Instance};
 use crate::{
     Camera, DrawCmd, DrawLayer, Globals, LightPath, RenderError, Renderer, SkinnedDrawCmd, SkyMode,
@@ -66,6 +67,24 @@ impl Renderer {
     /// frustum removed.
     pub fn frame_stats(&self) -> FrameStats {
         self.frame_stats
+    }
+
+    /// GPU ms per section of the newest timed frame, in drawing order, when
+    /// `OPENBF_GPU_TIMING=1` and the adapter has timestamp queries (empty
+    /// otherwise, and until the first readback). A frame or two old.
+    pub fn gpu_sections(&self) -> &[(&'static str, f64)] {
+        self.gpu_timer.as_ref().map_or(&[], |t| t.last())
+    }
+
+    /// Is the GPU timer on (`OPENBF_GPU_TIMING=1` on an adapter that has it)?
+    pub fn gpu_timing(&self) -> bool {
+        self.gpu_timer.is_some()
+    }
+
+    /// CPU ms the last frame waited for the window's next image (vsync and
+    /// the frame-latency limit); 0 headless.
+    pub fn acquire_ms(&self) -> f64 {
+        self.acquire_ms
     }
 
     /// The bind group a draw's texture handle resolves to. `None` — and an
@@ -315,8 +334,8 @@ impl Renderer {
                 // The sky is never distance-culled: on the PS2 it is drawn by
                 // the sky tick under draw flag 0x20, outside both scene
                 // ranges (`analysis/re-fog.md` 2.4 [V]).
-                cull: mesh::NO_CULL,
-                cull_near: mesh::NO_CULL_NEAR,
+                cull: [mesh::NO_CULL; 2],
+                cull_near: [mesh::NO_CULL_NEAR; 2],
                 light: LightPath::Lit as u32,
                 fade: mesh::NO_FADE,
                 lights: [0; 4],
@@ -347,11 +366,12 @@ impl Renderer {
             }
         }
         instances.extend(order.iter().map(|&i| {
+            let (cull, cull_near) = crate::draw::instance_cull(&draws[i]);
             Instance {
                 model: draws[i].model.to_cols_array_2d(),
                 color: draws[i].color,
-                cull: draws[i].cull.unwrap_or(mesh::NO_CULL),
-                cull_near: draws[i].cull_near.unwrap_or(mesh::NO_CULL_NEAR),
+                cull,
+                cull_near,
                 light: draws[i].light as u32 | crate::affine::layer_bit(draws[i].layer),
                 fade: draws[i]
                     .fade
@@ -395,8 +415,8 @@ impl Renderer {
                     // Soldiers carry no cull: `SkinnedDrawCmd` has no `cull`
                     // field, because every skinned draw the port makes is a
                     // unit inside the near scene. Stated in the item 5 report.
-                    cull: mesh::NO_CULL,
-                    cull_near: mesh::NO_CULL_NEAR,
+                    cull: [mesh::NO_CULL; 2],
+                    cull_near: [mesh::NO_CULL_NEAR; 2],
                     // A skinned draw carries no COL0: the PS2's normal light
                     // set (hemisphere + Light1 + Light2), with BF1's
                     // character ambient where the map has one — every
@@ -507,6 +527,7 @@ impl Renderer {
         }
 
         // Acquire the frame's color view.
+        let acquire = std::time::Instant::now();
         let (frame, view) = match &mut self.target {
             Target::Window { surface, config } => match surface.get_current_texture() {
                 Ok(frame) => {
@@ -524,6 +545,7 @@ impl Renderer {
             },
             Target::Headless { view, .. } => (None, view.clone()),
         };
+        self.acquire_ms = acquire.elapsed().as_secs_f64() * 1000.0;
 
         let mut draw_calls = 0u32;
         let mut encoder = self
@@ -531,6 +553,12 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame encoder"),
             });
+        // The GPU timer, when on (`gpu_timer.rs`): out of `self` for the
+        // frame, so the passes can mark it while they borrow the rest.
+        let mut timer = self.gpu_timer.take();
+        if let Some(t) = &mut timer {
+            t.begin(&self.device, &mut encoder);
+        }
         // The texture the terrain light pass copies (the frame so far).
         let frame_texture: &wgpu::Texture = match (&frame, &self.target) {
             (Some(f), _) => &f.texture,
@@ -592,6 +620,7 @@ impl Renderer {
                     draw_calls += 1;
                 }
             }
+            mark(&mut timer, &mut pass, "sky");
 
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_vertex_buffer(1, self.instance_buf.slice(..));
@@ -613,15 +642,23 @@ impl Renderer {
             let mut terrain_runs: Vec<(usize, std::ops::Range<u32>)> = Vec::new();
             let mut lights_pending = terrain_light;
             let mut skin_pending = true;
+            // The GPU timer's section of the runs being drawn (`run_section`).
+            let mut section: Option<&'static str> = None;
             while run_start <= blend_base {
                 let key = (run_start < blend_base).then(|| draw_key(&draws[order[run_start]]));
                 if lights_pending
                     && key.is_none_or(|k| k.0 > draw_key_layer(DrawLayer::TerrainLayer))
                 {
                     lights_pending = false;
+                    if let Some(l) = section.take() {
+                        mark(&mut timer, &mut pass, l);
+                    }
                     drop(pass);
                     draw_calls +=
                         self.terrain_light_pass(&mut encoder, frame_texture, &view, &terrain_runs);
+                    if let Some(t) = &mut timer {
+                        t.mark(&mut encoder, "terrain lights");
+                    }
                     pass =
                         continue_pass(&mut encoder, &view, &self.depth_view, "map pass, resumed");
                     pass.set_bind_group(0, &self.globals_bg, &[]);
@@ -639,6 +676,9 @@ impl Renderer {
                 // the water's depth below the surface and ended at the belt.
                 if skin_pending && skinned_go_before(key.map(|k| k.0)) {
                     skin_pending = false;
+                    if let Some(l) = section.take() {
+                        mark(&mut timer, &mut pass, l);
+                    }
                     if !skin_opaque.is_empty() {
                         pass.set_pipeline(if fade {
                             &self.fade_skinned_pipeline
@@ -651,6 +691,7 @@ impl Renderer {
                             draw_calls += 1;
                         }
                     }
+                    mark(&mut timer, &mut pass, "soldiers");
                     // Their specular passes, added over them before anything
                     // composites: the disc draws a segment's pass right
                     // after its base (`analysis/re-specular-pass.md` §7,
@@ -667,6 +708,7 @@ impl Renderer {
                             draw_calls += 1;
                         }
                     }
+                    mark(&mut timer, &mut pass, "soldiers spec");
                     // Back to the world's instances for the water runs.
                     pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                     bound_layer = None;
@@ -678,6 +720,12 @@ impl Renderer {
                 }
 
                 let d = &draws[order[run_start]];
+                let run = run_section(d);
+                if section != Some(run) {
+                    if let Some(l) = section.replace(run) {
+                        mark(&mut timer, &mut pass, l);
+                    }
+                }
                 if terrain_light
                     && d.light == LightPath::Terrain
                     && d.layer != DrawLayer::TerrainLayer
@@ -732,6 +780,9 @@ impl Renderer {
 
                 run_start = run_end;
             }
+            if let Some(l) = section.take() {
+                mark(&mut timer, &mut pass, l);
+            }
 
             // The grass patches (queue FOLGG) and then the leaf patches (card
             // LEAF): after every opaque draw, before the blend pass, each run
@@ -751,6 +802,7 @@ impl Renderer {
                     draw_calls += 1;
                 }
             }
+            mark(&mut timer, &mut pass, "grass");
 
             // The blend pass: after every opaque draw, far to near, one at a
             // time — the world's blended draws (their instances sit at
@@ -792,6 +844,7 @@ impl Renderer {
                 }
                 draw_calls += 1;
             }
+            mark(&mut timer, &mut pass, "blend");
 
             // The laser bolts (card FXB) and the particles (card FXP2):
             // after the blend pass, far to near, each bolt's core (NORMAL)
@@ -819,11 +872,15 @@ impl Renderer {
                     draw_calls += 1;
                 }
             }
+            mark(&mut timer, &mut pass, "bolts+particles");
         }
         // The frame filter lifts the finished 3D frame, before the overlay
         // (the PS2 draws its HUD after it, `analysis/re-glow.md` §3.3).
         if filter {
             draw_calls += self.filter_pass(&mut encoder, frame_texture, &view);
+            if let Some(t) = &mut timer {
+                t.mark(&mut encoder, "filter");
+            }
         }
         self.frame_stats = FrameStats {
             draw_calls,
@@ -838,8 +895,18 @@ impl Renderer {
                 &view,
                 [width, height],
             );
+            if let Some(t) = &mut timer {
+                t.mark(&mut encoder, "hud");
+            }
+        }
+        if let Some(t) = &mut timer {
+            t.resolve(&mut encoder);
         }
         self.queue.submit([encoder.finish()]);
+        if let Some(mut t) = timer {
+            t.submitted();
+            self.gpu_timer = Some(t);
+        }
         if let Some(frame) = frame {
             frame.present();
         }
@@ -848,12 +915,37 @@ impl Renderer {
 }
 
 pub(super) fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("instances"),
-        size: (capacity * std::mem::size_of::<Instance>()) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
+    crate::made::buffer(
+        device,
+        &wgpu::BufferDescriptor {
+            label: Some("instances"),
+            size: (capacity * std::mem::size_of::<Instance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        },
+    )
+}
+
+/// The GPU timer's mark at the end of section `label`, when the timer is on.
+fn mark(timer: &mut Option<GpuTimer>, pass: &mut wgpu::RenderPass<'_>, label: &'static str) {
+    if let Some(t) = timer {
+        t.mark_pass(pass, label);
+    }
+}
+
+/// The GPU timer's section for a depth-tested run (card ISPD): the base
+/// terrain apart from the models, the terrain's layers, the specular pass,
+/// the water.
+fn run_section(d: &DrawCmd) -> &'static str {
+    match d.layer {
+        DrawLayer::Opaque | DrawLayer::Mask if d.light == LightPath::Terrain => "terrain",
+        DrawLayer::Opaque | DrawLayer::Mask => "models",
+        DrawLayer::TerrainLayer => "terrain layers",
+        DrawLayer::FarSheet => "far sheet",
+        DrawLayer::Spec => "specular",
+        DrawLayer::Water | DrawLayer::Speckle => "water",
+        DrawLayer::Blend => "blend",
+    }
 }
 
 /// Palette buffer for `capacity` skinned draws + its dynamic-offset bind group.
@@ -862,24 +954,30 @@ pub(super) fn create_palette_buffer(
     bgl: &wgpu::BindGroupLayout,
     capacity: usize,
 ) -> (wgpu::Buffer, wgpu::BindGroup) {
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("palettes"),
-        size: (capacity * PALETTE_STRIDE) as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("palette bg"),
-        layout: bgl,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &buffer,
-                offset: 0,
-                size: wgpu::BufferSize::new(PALETTE_STRIDE as u64),
-            }),
-        }],
-    });
+    let buffer = crate::made::buffer(
+        device,
+        &wgpu::BufferDescriptor {
+            label: Some("palettes"),
+            size: (capacity * PALETTE_STRIDE) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        },
+    );
+    let bg = crate::made::bind_group(
+        device,
+        &wgpu::BindGroupDescriptor {
+            label: Some("palette bg"),
+            layout: bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(PALETTE_STRIDE as u64),
+                }),
+            }],
+        },
+    );
     (buffer, bg)
 }
 

@@ -126,6 +126,12 @@ pub struct OrdnanceClass {
     /// the stick mask, the explosion. `Some` makes the weapon's shot a thrown
     /// grenade instead of a bolt; filled by the class loader.
     pub sticky: Option<crate::sticky::StickyClass>,
+    /// The impact explosion (card RKEX, re-blaster-damage 7.3: `Explosion` /
+    /// `ExplosionImpact` / `ExplosionName`, B1 class +0x38 / B2 +0x4c): what
+    /// a struck bolt detonates beside its hit (B1 FUN_00272d70). `None` for
+    /// an ordnance that names none - every rifle bolt. Filled by the class
+    /// loader.
+    pub explosion: Option<ExplosionClass>,
     /// The engine base, for the AI's choice ([`OrdKind`]).
     pub kind: OrdKind,
 }
@@ -147,6 +153,7 @@ impl Default for OrdnanceClass {
             laser: None,
             impact: None,
             sticky: None,
+            explosion: None,
             kind: OrdKind::Other,
         }
     }
@@ -298,6 +305,13 @@ fn read_scales(src: &dyn PropSource, scales: &mut [f32; 7], shield: &mut f32) {
 }
 
 // ── Explosion class ───────────────────────────────────────────────────────
+
+/// How far an ordnance's impact explosion sits off the hit, metres: B1
+/// FUN_00272d70 detonates at hit + 0.2·v (DAT_005182a8 = 0.2). PROVISIONAL
+/// [H]: v is the handler's fourth argument, unidentified (a normal is
+/// likely); the port backs off along the bolt. The sim's blast
+/// (`Sim::resolve_bolt`) and the drawn explosion (`game::fx`) both use it.
+pub const EXPLOSION_OFFSET: f32 = 0.2;
 
 /// An `expc` class's damage and push numbers (`analysis/re-vehicle-death.md`
 /// §1 [O]: B1 ctor FUN_0026ed88 / setter FUN_0026f528, B2 FUN_0030b2f8 /
@@ -861,6 +875,7 @@ impl WeaponClass {
                 }),
                 // re-fx §7's census: every surface ord_explosion.
                 sticky: None,
+                explosion: None,
                 kind: OrdKind::Other,
                 impact: Some(crate::impact::ImpactLook {
                     soft: Some("ord_explosion".into()),
@@ -933,6 +948,7 @@ impl WeaponClass {
                 // re-fx §7's census: every surface com_sfx_ord_exp; BF2
                 // never reads ImpactEffectShield, so the ctor's stands.
                 sticky: None,
+                explosion: None,
                 kind: OrdKind::Other,
                 impact: Some(crate::impact::ImpactLook {
                     soft: Some("com_sfx_ord_exp".into()),

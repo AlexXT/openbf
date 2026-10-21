@@ -393,6 +393,13 @@ pub struct Sim {
     /// it decides every bot's skill at spawn and the two human layers, so it
     /// is HASHED (one byte, right after `tick`). Default `Normal`.
     pub difficulty: crate::skill::Difficulty,
+    /// Card ARVS: a tier per team (0 and 1) over [`Sim::difficulty`], for the
+    /// arena's head-to-head (`arena ... vs hard:elite`). Every per-unit tier
+    /// read goes through [`Sim::difficulty_of`]; `None` (the default, and
+    /// every battle the game runs) is `difficulty`. SIM STATE: hashed after
+    /// `difficulty`, but only when one is set, so an unset pair keeps every
+    /// hash the sim had before.
+    pub team_difficulty: [Option<crate::skill::Difficulty>; 2],
     /// Radius inside which a target is inside the AI's view cone whatever the
     /// angle: BF2's 10 m omni (RE §9.1). **BF1 maps set 0.0** — BF1's cone
     /// test has no omni branch. An INPUT like `nav`, set by whoever builds the
@@ -444,6 +451,32 @@ pub struct Sim {
     /// dead soldier does not step, so `Soldier::prev_buttons` cannot serve.
     /// Hashed beside `spawn_choice`.
     pub prev_spawn_bits: Vec<u32>,
+    /// Per player slot, the POST the spawn map has selected for that slot's
+    /// next respawn (card SPSEL; `buttons::SPAWN_POST_*` while dead, the PS2's
+    /// pick `Sim::pick_spawn_post`). `None` = never picked: the respawn draws
+    /// a node from every post's, as before the spawn map reached the sim.
+    /// Hashed only once some slot holds a pick, so a sim whose players never
+    /// touched the spawn map keeps its hash.
+    pub spawn_post_choice: Vec<Option<crate::unit::SpawnPost>>,
+    /// Card SSELA: the human slots pass through the spawn screens (the PS2's
+    /// spawn display, re-spawn-flow §1): a slot is on the field only once it
+    /// accepts a class, and a dead one comes back only through the spawn map
+    /// and the class accept ([`Sim::open_spawn_screens`] turns it on, the
+    /// game binary's battles call it). Off (the default: every headless
+    /// referee, the golden scenes, `--spawn`) = auto-accept: a dead human
+    /// comes back once its 4.0 s timer has run out. An INPUT for the round;
+    /// it reaches the hash through the per-slot block below.
+    pub spawn_screens: bool,
+    /// Card SSELA: per player slot, which spawn screen is up
+    /// ([`super::spawn::SpawnStage`]); `Accepted` while the slot is on the
+    /// field or waiting out its respawn timer. Parallel to `players`.
+    pub spawn_stage: Vec<super::spawn::SpawnStage>,
+    /// Card SSELA: per player slot, the side screen's highlighted row (team
+    /// 1, team 2, Auto Assign). Parallel to `players`. This and
+    /// `spawn_stage` are hashed together, only while `spawn_screens` is on
+    /// or a slot holds a non-default value, so every sim that never opens the
+    /// screens keeps its hash.
+    pub side_choice: Vec<super::spawn::SideChoice>,
     /// How many AI this team has EVER spawned — the cursor `ai_class` walks
     /// the class table with. Hashed (it decides the next AI's class).
     pub ai_spawned: [u32; 2],
@@ -575,15 +608,28 @@ pub struct Sim {
     /// soldier might stand to fight and their cover. DERIVED by
     /// [`Sim::build_positions`] from inputs, so not hashed; empty = none.
     pub positions: crate::ai::tactic::PositionTable,
+    /// Card TEAM: the unit grid, live only inside the think loop
+    /// (`ai::team`). DERIVED, not hashed.
+    pub unit_grid: crate::ai::team::UnitGrid,
     /// The map's authored planning graph (`core::nav`), when it ships one.
     /// An INPUT like the heightfield and the collision world: immutable during
     /// the round and NOT part of [`Sim::hash`]. `None` = the AI walks straight
     /// at its post, as it did before Phase A. Set by
     /// `game::walk::WalkSim::with_teams` from `game::layout::nav_graph`.
     pub nav: Option<crate::nav::NavGraph>,
+    /// Card FLNK: the flank table of `nav` between the posts' hubs
+    /// (`nav::flank`), with this match's shares. DERIVED from `nav`, the
+    /// posts and the seed ([`Sim::build_flank`]), so not hashed; empty =
+    /// none.
+    pub flank: crate::nav::FlankTable,
     /// Navigation diagnostics for the round (ROUND_VERBOSE / the sweep). An
     /// OUTPUT counter like `events`: deterministic, but not hashed.
     pub nav_stats: NavStats,
+    /// Card HITCH: wall-clock ms the last [`Sim::step`] spent on the AI (the
+    /// commander's plan, the turret offers, the team board and every bot's
+    /// think) - the windowed game's frame recorder reads it. A measurement
+    /// of the machine: never read by the sim, not hashed.
+    pub ai_wall_ms: f32,
     /// Phase B: the two teams' objective plans (`core::commander`). SIM STATE
     /// — hashed, replay-exact, re-made one team per tick.
     pub commander: [crate::commander::TeamPlan; 2],
@@ -639,9 +685,31 @@ pub struct NavStats {
     pub contacts_max: u8,
     /// Records made by HEARING (a shot inside `HEAR_RADIUS`, or being hit).
     pub heard_contacts: u64,
+    /// Card TEAM: contact records made or refreshed from a friend's sight.
+    pub told_contacts: u64,
+    /// Card TEAM: Cover roles the team board gave, and AI ticks spent with
+    /// one / on a sniper's spot (Overwatch) - the role counts per map.
+    pub cover_given: u64,
+    pub cover_ticks: u64,
+    pub overwatch_ticks: u64,
+    /// Card FLNK: Flank roles the team board gave, and AI ticks spent with
+    /// one.
+    pub flank_given: u64,
+    pub flank_ticks: u64,
+    /// ...and how they ended: the last leg into the post, a death, another
+    /// objective, anything else (a seat, an order); and the stalled bots
+    /// recycled while they held one.
+    pub flank_ends: [u64; 4],
+    pub flank_stalled: u64,
+    /// ...and the legs the thinks planned along a flank route.
+    pub flank_legs: u64,
     /// AI shots emitted by a fire cycle that was already running when the
     /// trigger came up — the weapon's, not the AI's (see `unperceived_shots`).
     pub carry_shots: u64,
+    /// Card RKSLF: ticks a bot's exploding shot was dropped at its release
+    /// because its blast would land on its own side
+    /// (`ai::release_blasts_own_side`).
+    pub blast_holds: u64,
     /// Bolts fired by an AI unit that HIT somebody — the numerator of the
     /// sweep's `hit_rate`, against `ai_shots`.
     pub ai_hits: u64,
@@ -725,12 +793,33 @@ pub fn omni_radius_for(source_game: &str) -> f32 {
 }
 
 impl Sim {
+    /// The tier of team `team`'s units: its [`Sim::team_difficulty`] override,
+    /// else the round's [`Sim::difficulty`] (a team past 1 has no override).
+    pub fn difficulty_of(&self, team: u8) -> crate::skill::Difficulty {
+        self.team_difficulty
+            .get(usize::from(team))
+            .copied()
+            .flatten()
+            .unwrap_or(self.difficulty)
+    }
+
+    /// The tier of whoever shoots AT a unit of team `team`: the other side's
+    /// for teams 0 and 1, the round's for any other team.
+    pub fn enemy_difficulty_of(&self, team: u8) -> crate::skill::Difficulty {
+        match team {
+            0 => self.difficulty_of(1),
+            1 => self.difficulty_of(0),
+            _ => self.difficulty,
+        }
+    }
+
     /// Empty world on flat ground: BF1 rifle as weapon class 0, tat1r ticket
     /// pools (250/250). Spawn units with [`Sim::spawn`].
     pub fn empty(seed: u32) -> Sim {
         Sim {
             tick: 0,
             difficulty: crate::skill::Difficulty::default(),
+            team_difficulty: [None; 2],
             // BF2's omni; a BF1 map's builder sets 0.0 (RE §9.1).
             omni_radius: 10.0,
             ground_rules: crate::soldier::GroundRules::Bf2,
@@ -746,7 +835,11 @@ impl Sim {
             weapon_classes: vec![WeaponClass::bf1_rifle()],
             classes: [Vec::new(), Vec::new()],
             spawn_choice: Vec::new(),
+            spawn_post_choice: Vec::new(),
             prev_spawn_bits: Vec::new(),
+            spawn_screens: false,
+            spawn_stage: Vec::new(),
+            side_choice: Vec::new(),
             ai_spawned: [0, 0],
             units: Vec::new(),
             vehicles: Vec::new(),
@@ -787,8 +880,11 @@ impl Sim {
             nav_unwalkable: Vec::new(),
             nav_trapped: Vec::new(),
             positions: Default::default(),
+            unit_grid: Default::default(),
             nav: None,
+            flank: Default::default(),
             nav_stats: NavStats::default(),
+            ai_wall_ms: 0.0,
             commander: [
                 crate::commander::TeamPlan::new(0),
                 crate::commander::TeamPlan::new(1),
@@ -1076,6 +1172,11 @@ impl Sim {
         };
         eat(&self.tick.to_le_bytes());
         eat(&self.difficulty.bytes());
+        if self.team_difficulty.iter().any(Option::is_some) {
+            for d in self.team_difficulty {
+                eat(&d.map_or([0xff], crate::skill::Difficulty::bytes));
+            }
+        }
         eat(&self.rng.state().to_le_bytes());
         eat(&self.lcg.state().to_le_bytes());
         for u in &self.units {
@@ -1141,6 +1242,39 @@ impl Sim {
         eat(&(self.prev_spawn_bits.len() as u32).to_le_bytes());
         for b in &self.prev_spawn_bits {
             eat(&b.to_le_bytes());
+        }
+        // The spawn map's post picks: NOTHING while no slot has one (card
+        // SPSEL; the pinned `--sim-hash 100` and every idle-player gate keep
+        // their values), else a tag, the length and each slot's pick.
+        if self.spawn_post_choice.iter().any(Option::is_some) {
+            eat(b"SPSEL");
+            eat(&(self.spawn_post_choice.len() as u32).to_le_bytes());
+            for c in &self.spawn_post_choice {
+                match c {
+                    Some(p) => p.hash_into(&mut eat),
+                    None => eat(&[0]),
+                }
+            }
+        }
+        // The spawn screens (card SSELA): NOTHING while they are off and every
+        // slot holds the defaults, else a tag, the switch and each slot's
+        // stage and side row.
+        if self.spawn_screens
+            || self
+                .spawn_stage
+                .iter()
+                .any(|&s| s != super::spawn::SpawnStage::Accepted)
+            || self
+                .side_choice
+                .iter()
+                .any(|&c| c != super::spawn::SideChoice::Team1)
+        {
+            eat(b"SSELA");
+            eat(&[u8::from(self.spawn_screens)]);
+            eat(&(self.spawn_stage.len() as u32).to_le_bytes());
+            for (st, side) in self.spawn_stage.iter().zip(&self.side_choice) {
+                eat(&[*st as u8, *side as u8]);
+            }
         }
         // The AI fill cursor: which class the next AI of each team takes.
         for n in &self.ai_spawned {
@@ -1584,6 +1718,49 @@ mod tests {
         let mut hacked = build(crate::skill::Difficulty::Normal).0;
         hacked.units[a.index as usize].skill = 3;
         assert_ne!(hacked.hash(), norm.hash(), "Unit.skill is hashed");
+    }
+
+    #[test]
+    fn a_team_tier_reaches_that_teams_bots_and_only_then_moves_the_hash() {
+        // Card ARVS: `team_difficulty` unset is the sim it was (same hash);
+        // set, each team's bots take their own tier's skill at spawn.
+        use crate::skill::Difficulty as D;
+        let build = |td: [Option<D>; 2]| {
+            let mut s = Sim::empty(4);
+            s.team_difficulty = td;
+            s.heightfield = Some(flat_ground());
+            let mut hs = Vec::new();
+            for team in [0u8, 1] {
+                let mut ai = UnitSpec::trooper(team, Vec3::new(f32::from(team) * 5.0, 0.0, 0.0));
+                ai.controller = Controller::Ai;
+                hs.push(s.spawn(&ai).unwrap());
+            }
+            (s, hs)
+        };
+        let (plain, _) = build([None; 2]);
+        let base = {
+            let mut s = Sim::empty(4);
+            s.heightfield = Some(flat_ground());
+            for team in [0u8, 1] {
+                let mut ai = UnitSpec::trooper(team, Vec3::new(f32::from(team) * 5.0, 0.0, 0.0));
+                ai.controller = Controller::Ai;
+                s.spawn(&ai).unwrap();
+            }
+            s
+        };
+        assert_eq!(plain.hash(), base.hash(), "no override: the old hash");
+        let (split, hs) = build([Some(D::Easy), Some(D::Elite)]);
+        assert_ne!(split.hash(), plain.hash(), "an override is hashed");
+        assert_eq!(split.unit(hs[0]).unwrap().skill, 8, "team 0 at Easy");
+        assert_eq!(split.unit(hs[1]).unwrap().skill, 20, "team 1 at Elite");
+        assert_eq!(split.difficulty_of(0), D::Easy);
+        assert_eq!(
+            split.difficulty_of(2),
+            D::Normal,
+            "a third team: the round's"
+        );
+        assert_eq!(split.enemy_difficulty_of(0), D::Elite);
+        assert_eq!(split.enemy_difficulty_of(1), D::Easy);
     }
 
     #[test]

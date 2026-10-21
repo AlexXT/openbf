@@ -17,7 +17,7 @@
 //! Every key of the parsers' switches is decoded; the 63 the discs use are
 //! all named in [`key`] (7 by the hash alone — Spawner shape type 4 and two of
 //! its X/Y/Z families, 3 emitters on BF1 HOT1). A key the parsers do not know
-//! lands in [`Emitter::unknown`] (none on either disc — `tests/fx_lvl.rs`).
+//! lands in [`Emitter::unknown`] (none on either disc — `tests/suite/fx_lvl.rs`).
 //!
 //! - A **range** `Key(a, b)` is `{base: min(a,b)·k, span: |b−a|·k}` (B1
 //!   `FUN_002ba1f0`, B2 `FUN_0037b7f0`); a one-argument record is `{a·k, 0}`.
@@ -144,7 +144,7 @@ pub const COLOR_SCALE: f32 = f32::from_bits(0x3b80_8081);
 /// `a·b` as the EE FPU computes it: rounded toward zero, not to nearest.
 /// The product of two f32s is exact in f64, so truncating that is the PS2's
 /// answer; IEEE's differs by one ulp on e.g. 249 × 1/255, and with this the
-/// parsed values equal the PS2's RAM bit for bit (`tests/fx_lvl.rs`).
+/// parsed values equal the PS2's RAM bit for bit (`tests/suite/fx_lvl.rs`).
 pub fn ps2_mul(a: f32, b: f32) -> f32 {
     toward_zero(a as f64 * b as f64)
 }

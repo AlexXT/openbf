@@ -5,8 +5,6 @@
 //! and `GpuMesh::upload` via `create_buffer_init`), extended with uv + unorm8 color
 //! (terrain lightmap rides in as vertex color) and per-instance model matrices.
 
-use wgpu::util::DeviceExt;
-
 use crate::RenderError;
 
 /// Interleaved vertex, 36 bytes, no padding (so `Pod` is layout-exact).
@@ -52,16 +50,19 @@ pub(crate) struct Instance {
     /// Flat tint multiplied over texture * vertex color. White = untinted.
     pub color: [f32; 4],
     /// Metres from the eye past which this instance's fragments are DISCARDED
-    /// — the far-scene cull ([`DrawCmd::cull`](crate::DrawCmd::cull)).
-    /// [`NO_CULL`] for a draw with no cull, which is every draw until a caller
-    /// asks for one.
-    pub cull: f32,
+    /// — the far-scene cull ([`DrawCmd::cull`](crate::DrawCmd::cull)) — as a
+    /// band `[lo, hi]`: the edge is `mix(lo, hi, u)` with `u` the pixel's 4×4
+    /// ordered-dither value, so a band crossfades by screen-door and a draw
+    /// with `lo == hi` has one hard edge ([`instance_cull`]). [`NO_CULL`] for
+    /// a draw with no cull, which is every draw until a caller asks for one.
+    pub cull: [f32; 2],
     /// Metres from the eye NEARER than which this instance's fragments are
     /// DISCARDED — the far scene's near edge
-    /// ([`DrawCmd::cull_near`](crate::DrawCmd::cull_near)). [`NO_CULL_NEAR`]
-    /// for a draw with no near edge, which is every draw but the `LOWR`
-    /// sheet.
-    pub cull_near: f32,
+    /// ([`DrawCmd::cull_near`](crate::DrawCmd::cull_near)) — a band like
+    /// [`Instance::cull`], read with the SAME `u`. [`NO_CULL_NEAR`] for a
+    /// draw with no near edge, which is every draw but the `LOWR` sheet and a
+    /// geometry's LOWD.
+    pub cull_near: [f32; 2],
     /// How the shader lights this instance: the low byte is the
     /// [`LightPath`](crate::LightPath)'s `u32` discriminant
     /// ([`DrawCmd::light`](crate::DrawCmd::light)); bit 0x100 is
@@ -99,8 +100,8 @@ impl Instance {
     const ATTRIBS: [wgpu::VertexAttribute; 10] = wgpu::vertex_attr_array![
         4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, // model cols
         8 => Float32x4, // color
-        11 => Float32,  // cull distance, metres
-        12 => Float32,  // near edge, metres
+        11 => Float32x2, // cull band [lo, hi], metres
+        12 => Float32x2, // near-edge band [lo, hi], metres
         13 => Uint32,   // light path
         14 => Float32x3, // fade [begin, end, near], metres
         15 => Uint16x4, // light-table records, 0 = none
@@ -214,16 +215,22 @@ impl GpuMesh {
             })
             .collect();
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh vb"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: vertex_usage,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh ib"),
-            contents: bytemuck::cast_slice(data.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let vertex_buffer = crate::made::buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("mesh vb"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: vertex_usage,
+            },
+        );
+        let index_buffer = crate::made::buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("mesh ib"),
+                contents: bytemuck::cast_slice(data.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            },
+        );
         Ok(Self {
             vertex_buffer,
             index_buffer,
@@ -287,16 +294,22 @@ impl GpuMesh {
                 weights: data.weights[i],
             })
             .collect();
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("skinned mesh vb"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("skinned mesh ib"),
-            contents: bytemuck::cast_slice(data.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let vertex_buffer = crate::made::buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("skinned mesh vb"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        );
+        let index_buffer = crate::made::buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("skinned mesh ib"),
+                contents: bytemuck::cast_slice(data.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            },
+        );
         Ok(Self {
             vertex_buffer,
             index_buffer,
@@ -422,9 +435,9 @@ mod tests {
     fn gpu_struct_sizes_match_the_shader_layout() {
         // 3+3+2 f32 + 4 u8 = 36 bytes, matching Vertex::layout() stride.
         assert_eq!(std::mem::size_of::<Vertex>(), 36);
-        // mat4 + vec4 + the far cull + the near edge + the light path + the
-        // fade + the four light records = 112 bytes.
-        assert_eq!(std::mem::size_of::<Instance>(), 112);
+        // mat4 + vec4 + the far cull band + the near-edge band + the light
+        // path + the fade + the four light records = 120 bytes.
+        assert_eq!(std::mem::size_of::<Instance>(), 120);
         // Vertex + 4 u8 joints + 4 f32 weights = 56 bytes.
         assert_eq!(std::mem::size_of::<SkinnedVertex>(), 56);
         // Palette stride must satisfy the 256-B dynamic-offset alignment.

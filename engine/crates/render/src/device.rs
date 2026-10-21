@@ -76,7 +76,7 @@ impl Renderer {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: present_mode(),
             alpha_mode,
             view_formats,
             desired_maximum_frame_latency: 2,
@@ -104,21 +104,24 @@ impl Renderer {
         let (adapter, device, queue) = request_device(&instance, None)?;
         let info = adapter.get_info();
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("headless color"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
+        let texture = crate::made::texture(
+            &device,
+            &wgpu::TextureDescriptor {
+                label: Some("headless color"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: HEADLESS_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                // For the HUD pass (`Renderer::display_view_format`).
+                view_formats: &[HEADLESS_FORMAT.remove_srgb_suffix()],
             },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: HEADLESS_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            // For the HUD pass (`Renderer::display_view_format`).
-            view_formats: &[HEADLESS_FORMAT.remove_srgb_suffix()],
-        });
+        );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         Self::finish_init(
@@ -246,7 +249,8 @@ fn request_device(
 
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("swbf render device"),
-        required_features: wgpu::Features::empty(),
+        // Timestamp queries only for `OPENBF_GPU_TIMING=1` (`gpu_timer.rs`).
+        required_features: crate::gpu_timer::wanted_features(&adapter),
         required_limits: wgpu::Limits::default(),
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
@@ -254,6 +258,17 @@ fn request_device(
     }))
     .map_err(|e| RenderError::Device(e.to_string()))?;
     Ok((adapter, device, queue))
+}
+
+/// The window's present mode: vsync, unless `OPENBF_NO_VSYNC=1` (a
+/// measurement knob, card ISPD: with vsync a frame's time is the display's,
+/// whatever the frame cost).
+fn present_mode() -> wgpu::PresentMode {
+    if std::env::var("OPENBF_NO_VSYNC").as_deref() == Ok("1") {
+        wgpu::PresentMode::AutoNoVsync
+    } else {
+        wgpu::PresentMode::AutoVsync
+    }
 }
 
 /// Select an adapter by `OPENBF_ADAPTER` (see `request_device`). Errors list
@@ -292,20 +307,23 @@ fn pick_adapter(instance: &wgpu::Instance, want: &str) -> Result<wgpu::Adapter, 
 /// Depth32Float depth target, matching the pipeline's depth-stencil state.
 /// From an earlier wgpu project's renderer/mod.rs `create_depth_texture` (binding usage dropped).
 pub fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("depth"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
+    let texture = crate::made::texture(
+        device,
+        &wgpu::TextureDescriptor {
+            label: Some("depth"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
         },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
+    );
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 

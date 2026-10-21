@@ -3,7 +3,11 @@
 //! `<outdir>/soldiers/<model>.glb`, `<outdir>/textures/<tex>.ktx2`, with its
 //! clips' `<model>.anims.ron` and its animation sets' `<model>.sets.ron`
 //! (`crate::anim_sets`). A BF2 model's worn cloth is baked as extra segments
-//! (`crate::cloth`).
+//! (`crate::cloth`). A model whose classes name their own skeleton
+//! (`SkeletonName`) has its clips posed on that rig's bone lengths with
+//! bone_root x `SkeletonRootScale` ([`PoseRig`]), and its classes' override
+//! textures are baked beside it with `<model>.skins.ron` ([`ModelSkins`];
+//! card USKN, `analysis/re-soldier-skeleton-skins.md`).
 //! Vertices are moved from bone bind space to model space at bake time
 //! (`mungefs::model::to_model_space`), so the runtime uses standard
 //! `joint_global × inverse_bind` skinning (analysis/re-softskin.md §5).
@@ -258,12 +262,138 @@ fn find_clip<'a, 'b>(
     None
 }
 
+/// BF1 `FUN_0022f428`'s list (strings 0x5352a0-0x535400): the body bones a
+/// class with its own `SkeletonName` poses at the rig's rest translation,
+/// not the clip's (`analysis/re-soldier-skeleton-skins.md` §2 [O]).
+const BF1_RIG_BONES: [&str; 22] = [
+    "bone_pelvis",
+    "bone_a_spine",
+    "bone_b_spine",
+    "bone_ribcage",
+    "bone_neck",
+    "bone_head",
+    "bone_l_clavicle",
+    "bone_l_upperarm",
+    "bone_l_forearm",
+    "bone_l_hand",
+    "bone_r_clavicle",
+    "bone_r_upperarm",
+    "bone_r_forearm",
+    "bone_r_hand",
+    "bone_l_thigh",
+    "bone_l_calf",
+    "bone_l_foot",
+    "bone_l_toe",
+    "bone_r_thigh",
+    "bone_r_calf",
+    "bone_r_foot",
+    "bone_r_toe",
+];
+
+/// The skeleton a soldier model is posed on (card USKN,
+/// `analysis/re-soldier-skeleton-skins.md` §1-§3 [O]): the `zaf_` rig its
+/// classes' `SkeletonName` names, with `SkeletonRootScale` on `bone_root`.
+/// The PS2 keeps the flags in the rig, and one rig and one scale per soldier
+/// model hold on both discs (§4, `census_model_rig.txt`), so the bake poses
+/// per model.
+#[derive(Debug, Clone)]
+pub struct PoseRig {
+    pub rig: mungefs::anim::Rig,
+    /// bone_root's clip translation × this (BF1 `FUN_00441ca8`, BF2
+    /// `FUN_00535658`: the bone's +0x68, `VMULx.xyz` in the pose builder).
+    pub root_scale: f32,
+    /// BF2's bone rule (`FUN_00281e68`) rather than BF1's (`FUN_0022f428`).
+    pub bf2: bool,
+}
+
+impl PoseRig {
+    /// Does `bone` take the rig's rest translation instead of the clip's?
+    /// BF1: the 22 named body bones. BF2: every bone but bone 0 (DummyRoot),
+    /// with bone_root and hp_weapons set back (0x620a90); a rig with
+    /// `bone_r_finger3` (the Geonosian) sets back bone_root only (0x620ac0).
+    /// The droideka's list (0x620aa0, a rig with `bone_abdomen`) is not
+    /// built: the port fields no droideka soldier ([`pose_rig`] refuses it).
+    pub fn takes_rest(&self, bone: &str) -> bool {
+        if !self.bf2 {
+            return BF1_RIG_BONES.iter().any(|b| b.eq_ignore_ascii_case(bone));
+        }
+        let geonosian = self.rig.joint(crc32_lower("bone_r_finger3")).is_some();
+        !(bone.eq_ignore_ascii_case("DummyRoot")
+            || bone.eq_ignore_ascii_case("bone_root")
+            || (!geonosian && bone.eq_ignore_ascii_case("hp_weapons")))
+    }
+}
+
+/// [`PoseRig`] of `model` from the level's soldier classes: the first class
+/// (in `classes` order) whose `GeometryName` is the model and whose chain
+/// names a `SkeletonName`. `None` = the human rig, whose rest is the human
+/// clips' own base, so the rule changes nothing there (§2) - also for a
+/// `SkeletonName` of the default `human` rig or a rig no LVL carries.
+/// `SkeletonRootScale` counts only with an own rig (BF1 123186-123194, BF2
+/// 172070-172080).
+pub fn pose_rig(
+    classes: &[manifest::ClassDef],
+    model: &str,
+    rigs: &[mungefs::anim::Rig],
+    bf2: bool,
+) -> Option<PoseRig> {
+    use crate::classes::ClassProps;
+    let entc: std::collections::HashMap<String, &manifest::ClassDef> = classes
+        .iter()
+        .filter(|c| c.kind == "entc")
+        .rev() // the first definition of a name wins
+        .map(|c| (c.name.to_ascii_lowercase(), c))
+        .collect();
+    for c in classes.iter().filter(|c| c.kind == "entc") {
+        let mut chain = vec![c];
+        while let Some(p) = entc.get(&chain[chain.len() - 1].base.to_ascii_lowercase()) {
+            if chain.len() > 16 {
+                break;
+            }
+            chain.push(p);
+        }
+        let first = |key: &str| chain.iter().find_map(|d| d.prop(key)).map(str::trim);
+        if !first("GeometryName").is_some_and(|g| g.eq_ignore_ascii_case(model)) {
+            continue;
+        }
+        let Some(name) = first("SkeletonName").and_then(|v| v.split_whitespace().next()) else {
+            continue;
+        };
+        if name.to_ascii_lowercase().starts_with("human") {
+            return None;
+        }
+        let rig = rigs.iter().find(|r| r.name.eq_ignore_ascii_case(name))?;
+        if rig.joint(crc32_lower("bone_abdomen")).is_some() {
+            return None; // the droideka's list: not built (see `takes_rest`)
+        }
+        let root_scale = first("SkeletonRootScale")
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        return Some(PoseRig {
+            rig: rig.clone(),
+            root_scale,
+            bf2,
+        });
+    }
+    None
+}
+
 /// Turn a decoded clip into GLB tracks on the model skeleton: tracks join
 /// bones by CRC; DummyRoot translation is stripped (returned as root motion).
-pub fn clip_to_tracks(clip: &DecodedClip, skel: &Skeleton) -> (Vec<ClipTrack>, [f32; 3]) {
+/// With a [`PoseRig`] the PS2's pose rule is applied (card USKN): the bones
+/// [`PoseRig::takes_rest`] lists hold the rig's rest translation in every
+/// frame (a listed bone the clip does not animate gets a track at the
+/// model's bind rotation), and bone_root's translation is × the root scale.
+pub fn clip_to_tracks(
+    clip: &DecodedClip,
+    skel: &Skeleton,
+    pose: Option<&PoseRig>,
+) -> (Vec<ClipTrack>, [f32; 3]) {
     let dummy = crc32_lower("DummyRoot");
+    let root = crc32_lower("bone_root");
     let mut root_motion = [0.0f32; 3];
     let mut tracks = Vec::new();
+    let frames = usize::from(clip.frames);
     for t in &clip.tracks {
         let Some(bone) = skel.bones.iter().position(|b| b.crc == t.bone_crc) else {
             continue; // rig helper joints the model does not have
@@ -282,7 +412,129 @@ pub fn clip_to_tracks(clip: &DecodedClip, skel: &Skeleton) -> (Vec<ClipTrack>, [
             translations,
         });
     }
+    if let Some(p) = pose {
+        let binds = bones_of(skel);
+        for (bone, b) in skel.bones.iter().enumerate() {
+            let k = match tracks.iter().position(|t| t.bone == bone) {
+                Some(k) => k,
+                None if p.takes_rest(&b.name) && p.rig.joint(b.crc).is_some() => {
+                    tracks.push(ClipTrack {
+                        bone,
+                        rotations: vec![binds[bone].rotation; frames],
+                        translations: vec![b.t; frames],
+                    });
+                    tracks.len() - 1
+                }
+                None => continue,
+            };
+            let t = &mut tracks[k];
+            if b.crc == root {
+                for v in &mut t.translations {
+                    *v = v.map(|x| x * p.root_scale);
+                }
+            } else if p.takes_rest(&b.name) {
+                if let Some(j) = p.rig.joint(b.crc) {
+                    t.translations.iter_mut().for_each(|v| *v = j.rest_pos);
+                }
+            }
+        }
+    }
     (tracks, root_motion)
+}
+
+/// A soldier model's override groups and the override textures its classes
+/// name (card USKN, `analysis/re-soldier-skeleton-skins.md` 9 [O]).
+#[derive(Debug, Default, PartialEq)]
+pub struct ModelSkins {
+    /// Group (`MNAM`: `override_texture` / `override_texture2`) -> the
+    /// textures of the model's segments in it, lowercase. Written into
+    /// `soldiers/<model>.skins.ron` ([`manifest::SoldierSkins`]): the runtime
+    /// swaps a part whose texture is listed under a group for the class's
+    /// override of that group.
+    pub groups: std::collections::BTreeMap<String, Vec<String>>,
+    /// (texture, group) for every override a class on this model names;
+    /// `OverrideTexture2` only with `OverrideTexture` (both games' draw tests
+    /// the second inside the first's branch).
+    pub overrides: Vec<(String, String)>,
+}
+
+/// The [`ModelSkins`] of `m` from its side LVL's classes.
+pub fn model_skins(m: &Model, classes: &[manifest::ClassDef]) -> ModelSkins {
+    let mut out = ModelSkins::default();
+    for seg in &m.segments {
+        let Some(group) = seg.group.as_deref().map(str::to_ascii_lowercase) else {
+            continue;
+        };
+        if !group.starts_with("override_texture") {
+            continue;
+        }
+        let Some(tex) = crate::alpha::segment_texture(seg) else {
+            continue;
+        };
+        let list = out.groups.entry(group).or_default();
+        let tex = tex.to_ascii_lowercase();
+        if !list.contains(&tex) {
+            list.push(tex);
+        }
+    }
+    for c in classes.iter().filter(|c| c.kind == "entc") {
+        let skin = class_skin(classes, &c.name);
+        if !skin.geometry.eq_ignore_ascii_case(&m.name) {
+            continue;
+        }
+        for (tex, group) in [
+            (skin.texture, "override_texture"),
+            (skin.texture2, "override_texture2"),
+        ] {
+            let Some(tex) = tex else { continue };
+            let row = (tex, group.to_owned());
+            if !out.overrides.contains(&row) {
+                out.overrides.push(row);
+            }
+        }
+    }
+    out
+}
+
+/// One class's model and override textures through its BASE chain (the
+/// first value wins; lowercase; `texture2` only with `texture`).
+#[derive(Debug, Default, PartialEq)]
+pub struct ClassSkin {
+    pub geometry: String,
+    pub texture: Option<String>,
+    pub texture2: Option<String>,
+}
+
+/// [`ClassSkin`] of class `name` among `classes` (`entc` records).
+pub fn class_skin(classes: &[manifest::ClassDef], name: &str) -> ClassSkin {
+    use crate::classes::ClassProps;
+    let find = |n: &str| {
+        classes
+            .iter()
+            .find(|c| c.kind == "entc" && c.name.eq_ignore_ascii_case(n))
+    };
+    let mut chain = Vec::new();
+    let mut cur = find(name);
+    while let Some(c) = cur {
+        if chain.len() > 16 {
+            break;
+        }
+        chain.push(c);
+        cur = find(&c.base);
+    }
+    let first = |key: &str| {
+        chain
+            .iter()
+            .find_map(|d| d.prop(key))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    };
+    let texture = first("OverrideTexture");
+    ClassSkin {
+        geometry: first("GeometryName").unwrap_or_default(),
+        texture2: texture.as_ref().and(first("OverrideTexture2")),
+        texture,
+    }
 }
 
 /// Bake one soldier model (+ textures) from a SIDE LVL.
@@ -351,6 +603,20 @@ pub fn bake_soldier_anims(
             let inner = mungefs::open(side).map_err(|e| anyhow!("{e}"))?;
             banks.extend(mungefs::anim::find_banks(inner).map_err(|e| anyhow!("{e}"))?);
         }
+        // The pose rig (card USKN): the model's classes are in its own side
+        // LVL (BF2: and the sides beside it); the `zaf_` rigs in the side
+        // LVLs and the animation LVL.
+        let mut classes = anim_sets::bf2::side_classes(&buf)?;
+        let mut rigs = mungefs::anim::find_rigs(inner).map_err(|e| anyhow!("{e}"))?;
+        rigs.extend(mungefs::anim::find_rigs(ainner).map_err(|e| anyhow!("{e}"))?);
+        for side in &sides {
+            classes.extend(anim_sets::bf2::side_classes(side)?);
+            rigs.extend(
+                mungefs::anim::find_rigs(mungefs::open(side).map_err(|e| anyhow!("{e}"))?)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+        let pose = pose_rig(&classes, &m.name, &rigs, sanm.is_some());
         let bones: Vec<String> = skel.bones.iter().map(|b| b.name.clone()).collect();
         let plan = match &sanm {
             None => anim_sets::plan_bf1(&anim_sets::bf1::inventory(&banks), &bones),
@@ -411,7 +677,7 @@ pub fn bake_soldier_anims(
                     sets.root_speed.insert(name.clone(), v);
                 }
             }
-            let (tracks, root_motion) = clip_to_tracks(&decoded, &skel);
+            let (tracks, root_motion) = clip_to_tracks(&decoded, &skel, pose.as_ref());
             clips.push(Clip {
                 name: name.clone(),
                 fps: 30.0,
@@ -434,13 +700,39 @@ pub fn bake_soldier_anims(
     let glb = skinned_to_glb(&sm, &clips)?;
     std::fs::write(out.join("soldiers").join(format!("{}.glb", m.name)), glb)?;
 
-    let wanted: Vec<String> = sm
+    let mut wanted: Vec<String> = sm
         .segments
         .iter()
         .map(|s| s.texture.to_ascii_lowercase())
         .filter(|t| !t.is_empty())
         .collect();
+    // The class skins (card USKN): the model's override groups and every
+    // override texture its side's classes name, drawn with the flags of
+    // the textures they replace.
+    let skins = model_skins(&m, &anim_sets::bf2::side_classes(&buf)?);
+    for (tex, group) in &skins.overrides {
+        let replaced = skins.groups.get(group).into_iter().flatten();
+        let f = replaced.filter_map(|t| flags.get(t)).fold(0, |a, f| a | f);
+        flags.insert(tex.clone(), f);
+        wanted.push(tex.clone());
+    }
+    let file = manifest::SoldierSkins {
+        groups: skins.groups.clone(),
+        overrides: skins.overrides.iter().map(|o| o.0.clone()).collect(),
+    };
+    crate::write_ron(
+        &out.join("soldiers").join(format!("{}.skins.ron", m.name)),
+        &file,
+    )?;
     let textures = bake_textures_flagged(inner, &wanted, &flags, out, pc.as_ref())?;
+    for (tex, _) in &skins.overrides {
+        if !textures.contains(tex) {
+            eprintln!(
+                "soldier {}: override texture {tex} is not in the LVL",
+                m.name
+            );
+        }
+    }
 
     let mut min = [f32::MAX; 3];
     let mut max = [f32::MIN; 3];
@@ -731,6 +1023,245 @@ mod tests {
                 (0..3).map(|k| (k == fur).then_some("BLEND")).collect();
             assert_eq!(modes, expected, "{game}: the GLB's materials");
         }
+    }
+
+    /// World position of `bone` at frame 0 of `tracks` (DummyRoot at its
+    /// rest): the skinned draw's forward kinematics.
+    fn fk_frame0(skel: &Skeleton, tracks: &[ClipTrack], bone: &str) -> Vec3 {
+        let binds = bones_of(skel);
+        let local = |i: usize| {
+            let (mut t, mut r) = (binds[i].translation, binds[i].rotation);
+            if let Some(k) = tracks.iter().find(|k| k.bone == i) {
+                (t, r) = (k.translations[0], k.rotations[0]);
+            }
+            glam::Mat4::from_rotation_translation(Quat::from_array(r), Vec3::from_array(t))
+        };
+        let mut i = skel.bones.iter().position(|b| b.name == bone).unwrap();
+        let mut m = local(i);
+        while let Some(p) = skel.bones[i].parent {
+            m = local(p) * m;
+            i = p;
+        }
+        m.w_axis.truncate()
+    }
+
+    /// Card USKN acceptance 1 (`analysis/re-soldier-skeleton-skins.md` §2-§4,
+    /// §10): an own-skeleton class is posed on its rig's bone lengths with
+    /// bone_root x SkeletonRootScale, the idle frame 0 head at the PS2 rule's
+    /// height (`lead_tmp/uskn/fk_idle.txt`); the clone trooper (human rig) is
+    /// unchanged; the listed bones hold the rig's JONT rest in every frame.
+    /// Control: without the rule every model's head is the human 1.605 / 1.643.
+    #[test]
+    fn own_rig_classes_pose_at_their_rig_lengths() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../extracted");
+        let b1 = format!("{root}/bf1/lvl/DATA/_LVL_PS2");
+        let b2 = format!("{root}/bf2/lvl/DATA/_LVL_PS2");
+        let a1 = format!("{b1}/COMMON/ENG/COMMON.LVL");
+        let a2 = format!("{b2}/INGAME.LVL");
+        if !Path::new(&a1).exists() || !Path::new(&a2).exists() {
+            eprintln!("SKIP: COMMON.LVL / INGAME.LVL not present");
+            return;
+        }
+        // (game, side, model, idle clip, rig, scale, PS2 head y, human head y)
+        let rows = [
+            (
+                1,
+                "ALL",
+                "all_inf_wookie",
+                "all_inf_wookie",
+                1.15,
+                1.852,
+                1.605,
+            ),
+            (
+                1,
+                "CIS",
+                "cis_inf_bdroid",
+                "cis_inf_bdroid",
+                1.0,
+                1.726,
+                1.605,
+            ),
+            (1, "REP", "rep_inf_trooper", "", 1.0, 1.605, 1.605),
+            (
+                2,
+                "CIS",
+                "cis_inf_magnaguard",
+                "magnaguard",
+                1.24,
+                1.865,
+                1.643,
+            ),
+            (2, "CIS", "cis_inf_bdroid", "bdroid", 1.0, 1.758, 1.643),
+            (2, "ALL", "all_inf_wookie", "wookie", 1.15, 1.892, 1.643),
+        ];
+        let abufs = [std::fs::read(&a1).unwrap(), std::fs::read(&a2).unwrap()];
+        for (game, side, model, rig, scale, ps2, human) in rows {
+            let (dir, abuf) = if game == 1 {
+                (&b1, &abufs[0])
+            } else {
+                (&b2, &abufs[1])
+            };
+            let buf = std::fs::read(format!("{dir}/SIDE/{side}.LVL")).unwrap();
+            let inner = mungefs::open(&buf).unwrap();
+            let ainner = mungefs::open(abuf).unwrap();
+            let (_, skel) = find_soldier(inner, model).unwrap();
+            let mut rigs = mungefs::anim::find_rigs(inner).unwrap();
+            rigs.extend(mungefs::anim::find_rigs(ainner).unwrap());
+            let classes = anim_sets::bf2::side_classes(&buf).unwrap();
+            let pose = pose_rig(&classes, model, &rigs, game == 2);
+            match &pose {
+                None => assert_eq!(rig, "", "{model}: no pose rig"),
+                Some(p) => {
+                    assert!(
+                        p.rig.name.eq_ignore_ascii_case(rig),
+                        "{model}: {}",
+                        p.rig.name
+                    );
+                    assert_eq!(p.root_scale, scale, "{model}");
+                }
+            }
+            let banks = mungefs::anim::find_banks(ainner).unwrap();
+            let clip = [
+                "human_rifle_stand_idle_emote",
+                "human_rifle_stand_idle_emote_full",
+            ]
+            .iter()
+            .find_map(|n| {
+                banks
+                    .iter()
+                    .find_map(|b| Some(b.decode_clip(b.clip_index(n)?)))
+            })
+            .unwrap()
+            .unwrap();
+            let (tracks, _) = clip_to_tracks(&clip, &skel, pose.as_ref());
+            let head = fk_frame0(&skel, &tracks, "bone_head").y;
+            assert!(
+                (head - ps2).abs() < 0.01,
+                "{model}: head {head} vs PS2 {ps2}"
+            );
+            let (plain, _) = clip_to_tracks(&clip, &skel, None);
+            let head0 = fk_frame0(&skel, &plain, "bone_head").y;
+            assert!(
+                (head0 - human).abs() < 0.01,
+                "{model}: control head {head0}"
+            );
+            let Some(p) = &pose else { continue };
+            let mut listed = 0;
+            for t in &tracks {
+                let b = &skel.bones[t.bone];
+                if !p.takes_rest(&b.name) {
+                    continue;
+                }
+                let Some(j) = p.rig.joint(b.crc) else {
+                    continue;
+                };
+                listed += 1;
+                assert!(
+                    t.translations.iter().all(|v| *v == j.rest_pos),
+                    "{model} {}",
+                    b.name
+                );
+            }
+            assert!(listed >= 22, "{model}: {listed} bones on the rig's rest");
+        }
+    }
+
+    /// Card USKN acceptance 3 (re-soldier-skeleton-skins 9): over the four
+    /// soldier sides of both discs, every class with an `OverrideTexture`
+    /// whose model is in its side LVL has that model's `override_texture`
+    /// group to draw it on (and `override_texture2` for a second), and every
+    /// override texture is in the side LVL for the bake to write; a second
+    /// override without a first is never taken.
+    #[test]
+    fn every_class_override_has_its_group_and_its_texture() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../extracted");
+        let mut checked = 0;
+        let mut no_group = Vec::new();
+        for game in ["bf1", "bf2"] {
+            for side in ["ALL", "IMP", "REP", "CIS"] {
+                let path = format!("{root}/{game}/lvl/DATA/_LVL_PS2/SIDE/{side}.LVL");
+                let Ok(buf) = std::fs::read(&path) else {
+                    eprintln!("SKIP: {path}");
+                    return;
+                };
+                let inner = mungefs::open(&buf).unwrap();
+                let classes = anim_sets::bf2::side_classes(&buf).unwrap();
+                let chunks = mungefs::content_chunks(inner).unwrap();
+                let texs: Vec<String> = chunks
+                    .iter()
+                    .filter(|c| &c.tag == b"tex_")
+                    .filter_map(|c| mungefs::texture::Texture::parse(c).ok())
+                    .map(|t| t.name.to_ascii_lowercase())
+                    .collect();
+                for c in classes.iter().filter(|c| c.kind == "entc") {
+                    let skin = class_skin(&classes, &c.name);
+                    let Some(tex) = &skin.texture else {
+                        continue;
+                    };
+                    let Ok((m, _)) = find_soldier(inner, &skin.geometry) else {
+                        continue; // not a soldier model of this side
+                    };
+                    let skins = model_skins(&m, &classes);
+                    let has = |g: &str| skins.groups.get(g).is_some_and(|l| !l.is_empty());
+                    if !has("override_texture") {
+                        // The model has no such group: the PS2's override
+                        // list finds nothing to replace.
+                        no_group.push(format!("{game} {}", c.name));
+                        continue;
+                    }
+                    assert!(texs.contains(tex), "{game} {}: {tex} not in {side}", c.name);
+                    if let Some(t2) = &skin.texture2 {
+                        assert!(has("override_texture2"), "{game} {}: {}", c.name, m.name);
+                        assert!(texs.contains(t2), "{game} {}: {t2} not in {side}", c.name);
+                    }
+                    assert!(skins
+                        .overrides
+                        .contains(&(tex.clone(), "override_texture".into())));
+                    checked += 1;
+                }
+            }
+        }
+        // 16 BF1 IA classes and 9 BF2 ones author one (unit-audit-bf1 /
+        // bf2 3.3), plus the classes outside the IA lists.
+        assert!(checked >= 25, "{checked} classes with an override");
+        println!("{checked} classes draw an override; none to replace: {no_group:?}");
+        // [D]: `all_inf_engineer` has no MNAM group, so the snow engineer's
+        // `all_inf_engineer_snow` replaces nothing on the PS2 either.
+        assert_eq!(no_group, ["bf2 all_inf_engineer_snow"]);
+    }
+
+    /// The second override counts only with the first (both draws test it
+    /// inside the first's branch).
+    #[test]
+    fn a_second_override_alone_is_not_drawn() {
+        let def = |name: &str, base: &str, props: &[(&str, &str)]| manifest::ClassDef {
+            name: name.into(),
+            kind: "entc".into(),
+            base: base.into(),
+            props: props
+                .iter()
+                .map(|(k, v)| (mungefs::fnv1a_lowercase(k), (*v).to_owned()))
+                .collect(),
+        };
+        let classes = [
+            def(
+                "a",
+                "soldier",
+                &[("GeometryName", "m"), ("OverrideTexture2", "x2")],
+            ),
+            def("b", "a", &[("OverrideTexture", "X1")]),
+        ];
+        assert_eq!(class_skin(&classes, "a").texture2, None);
+        let b = class_skin(&classes, "b");
+        assert_eq!(
+            (
+                b.geometry.as_str(),
+                b.texture.as_deref(),
+                b.texture2.as_deref()
+            ),
+            ("m", Some("x1"), Some("x2"))
+        );
     }
 
     /// re-softskin.md §8 acceptance: the `human` rig's rest pose (zaf_ JONT

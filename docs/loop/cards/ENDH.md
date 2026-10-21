@@ -67,3 +67,9 @@ units never meet", that is one finding for BOTD's endgame row, not two patches.
   #25 (team 1) stands still (speed 0) at (25.3, 9.7, 173.7), 0.9 m from its waypoint with `floor_dy` 2.05 and goal
   `attack cp0` (card STEND's kind: not on its post's floor), #7 (team 0) walks its legs at (-337, 23, 105) with goal
   `attack cp3`. Snapshot `lead_tmp/obsr/bb/final/tat1_s7.json`.
+- 2026-10-20 AUDIT TURR (one more case, ENDH's own kind): BF1 NAB1 seed 14 on b19cdf9 (TURR's landing) is NO OUTCOME
+  (tickets 1 / 1, alive 1 / 1 at 60,000 ticks; 767 / 768 rounds over seeds 1-24, the parent ce8975d 768 / 768 and today's
+  main e95a687 finishes that seed at tick 26,906). At tick 59,990 the last two units stand 41.9 m apart, each with the
+  other as its target, `doing fight`, `hold 2`, `fmode 3`, speed 0, full health (300), and no event in the last 30 s
+  (#5 team 0 at (93.7, -110.0, 79.3), #17 team 1 at (119.7, -114.3, 46.7)); neither is in a turret or claims one.
+  Snapshot `lead_tmp/audit-turr/runs/nab14/bb_land/bf1_nab1_s14.json` (BLACKBOX_AT=59990).

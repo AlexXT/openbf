@@ -193,6 +193,10 @@ pub struct ClassVisual {
     /// The class's other slots in the HUD (card GREN): `(slot, what to
     /// show)` for each weapon the unit holds besides the primary.
     pub held_hud: Vec<(u8, WeaponHud)>,
+    /// The model each of those slots is drawn as in the hand (card WHELD):
+    /// `(slot, GeometryName)`, `None` = drawn as nothing. A slot not listed
+    /// draws the primary's `weapon_geometry`.
+    pub held_models: Vec<(u8, Option<String>)>,
     /// The hash of the class's `FoleyFXClass` (card FOLY, `crate::foley`):
     /// which row of the map's foley table its steps play; 0 = none.
     pub foley_class: u32,
@@ -200,6 +204,8 @@ pub struct ClassVisual {
     pub cries: Cries,
     /// What picks the class's animation sets (card ANIML).
     pub anim: crate::animator::ClassAnim,
+    /// The class's override textures (card USKN).
+    pub skins: crate::roster::ClassSkins,
 }
 
 /// A soldier class's two cries (card UCRY, `analysis/re-unit-chatter.md`
@@ -310,7 +316,7 @@ impl TeamTemplate {
             spare_clips: 6,
             weapon_slot: 0,
             slots: std::sync::Arc::new([]),
-            drops: core::sim::DropTable::default(),
+            drops: core::sim::DropTable::NONE,
             geometry: None,
             weapon_geometry: None,
             classes: vec![ClassVisual {
@@ -320,9 +326,11 @@ impl TeamTemplate {
                 weapon_geometry: None,
                 weapon_hud: WeaponHud::default(),
                 held_hud: Vec::new(),
+                held_models: Vec::new(),
                 foley_class: 0,
                 cries: Default::default(),
                 anim: Default::default(),
+                skins: Default::default(),
             }],
         }
     }
@@ -449,6 +457,10 @@ pub struct WalkSim {
     /// The minimap's fixed part (card BMAP; presentation only): the map
     /// square, the image and the classes' icons. `None` draws no minimap.
     pub minimap: Option<crate::minimap::MapStatic>,
+    /// The spawn screens' level-start view (card SSELB; presentation only):
+    /// the mission's camera shots, cut on each screen change, until the
+    /// player's first spawn. `None` = the battle's own view.
+    pub backdrop: Option<crate::spawn_backdrop::Backdrop>,
     accum: f32,
 }
 
@@ -554,6 +566,7 @@ impl WalkSim {
             sound_levels: Vec::new(),
             post_keys: Vec::new(),
             minimap: None,
+            backdrop: None,
             teams,
             accum: 0.0,
         }
@@ -816,6 +829,7 @@ impl WalkSim {
         if let Some(Some(h)) = self.sim.players.first() {
             self.player = *h;
         }
+        self.follow_backdrop();
         // The camera's zoom follows the player's (`re-zoom.md` §5): S and
         // the FOV ease toward their targets, and rest exactly once there.
         // A building turret's zoom is the seat's (card VTURZ); the same ease
@@ -855,6 +869,9 @@ impl WalkSim {
     /// it is the scope's eye, looking along the aim. Framed at
     /// [`WalkSim::fov_y`].
     pub fn camera(&self) -> Camera {
+        if let Some(b) = &self.backdrop {
+            return b.camera();
+        }
         if let Some(cam) = self.seat_camera() {
             return cam;
         }
@@ -866,6 +883,19 @@ impl WalkSim {
             pitch: core::fmath::atan2(ideal.forward.y, ideal.forward.with_y(0.0).length()),
             fov_y: self.fov_y(),
             ..Camera::default()
+        }
+    }
+
+    /// The level start's backdrop follows slot 0's spawn screen and ends
+    /// with the player's first spawn (card SSELB): after that a spawn screen
+    /// stands over the place he died.
+    pub fn follow_backdrop(&mut self) {
+        let alive = self.sim.units[self.player.index as usize].alive;
+        if alive || !self.sim.spawn_screens {
+            self.backdrop = None;
+        }
+        if let Some(b) = self.backdrop.as_mut() {
+            b.follow(self.sim.spawn_stage.first().copied().unwrap_or_default());
         }
     }
 
@@ -1592,5 +1622,43 @@ mod tests {
         assert_eq!(Some(walk.player), walk.sim.players[0]);
         assert!(walk.player_on_foot(), "the new life is found");
         assert_eq!(walk.player_team(), 0);
+    }
+
+    /// Card SSELB: behind the level start's spawn screens the view is the
+    /// mission's camera shot; a screen change cuts to another shot, a move on
+    /// the same screen does not; the first spawn ends the backdrop for good.
+    #[test]
+    fn the_level_start_view_is_the_camera_shot_until_the_spawn() {
+        use crate::spawn_backdrop::{Backdrop, CameraShot};
+        let mut w = WalkSim::new(1, Vec3::ZERO, Some(flat_ground()));
+        let chase = w.camera();
+        assert!(w.sim.open_spawn_screens(0, true));
+        let shots: Vec<CameraShot> = (0..4)
+            .map(|i| CameraShot::from_call([1.0, 0.0, 0.0, 0.0, 10.0 * i as f32, 50.0, 0.0]))
+            .collect();
+        w.backdrop = Backdrop::new(shots, 3);
+        w.follow_backdrop();
+        assert_eq!(w.camera().position, Vec3::new(0.0, 50.0, 0.0), "shot 0");
+        let pad = |b: u32| PadState {
+            buttons: b,
+            ..PadState::default()
+        };
+        // Down moves the highlight: the same screen, the same shot.
+        w.step_tick(&[pad(buttons::SPAWN_POST_DOWN)]);
+        w.step_tick(&[pad(0)]);
+        assert_eq!(w.sim.side_choice[0], core::sim::SideChoice::Team2);
+        assert_eq!(w.camera().position.x, 0.0);
+        // X takes the side: the map screen, another shot.
+        w.step_tick(&[pad(buttons::SPAWN_ACCEPT)]);
+        w.step_tick(&[pad(0)]);
+        assert_eq!(w.sim.spawn_stage[0], core::sim::SpawnStage::Map);
+        assert_ne!(w.camera().position.x, 0.0);
+        assert_eq!(w.camera().position.y, 50.0);
+        // On the field: the backdrop is gone and the chase camera is back.
+        let i = w.player.index as usize;
+        w.sim.units[i].alive = true;
+        w.follow_backdrop();
+        assert!(w.backdrop.is_none());
+        assert_eq!(w.camera().position, chase.position);
     }
 }

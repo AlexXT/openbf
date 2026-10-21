@@ -40,8 +40,10 @@
 //! was and in the band (re-scored every [`RESCORE`], the PS2's 5 s) and not
 //! hit twice; from an open one a covered one is asked for every 2 s; at it the PS2's hide / fire cycle
 //! (hidden 2-4 s, firing 2-6 s; re-soldier-ai 4.6) and another position
-//! after 5-12 s. RESERVATIONS: a position is the bot's from the write-back
-//! ([`grant`], unit-index order) to [`FREE_AFTER`] after it is left. The
+//! after 5-12 s - on every think, the target seen or remembered ([`Foe`],
+//! card TPOSR). RESERVATIONS: a position is the bot's from the write-back
+//! ([`grant`], unit-index order), renewed every tick it is held ([`keep`]),
+//! to [`FREE_AFTER`] after it is left. The
 //! weights and times are OURS and PROVISIONAL. Not yet: Capture / Guard /
 //! Overwatch at positions, a turret seat as a position (card TPOS's next
 //! slice).
@@ -232,7 +234,7 @@ impl PositionTable {
         }
     }
 
-    fn index(mut positions: Vec<Position>, stats: TableStats) -> Self {
+    pub(crate) fn index(mut positions: Vec<Position>, stats: TableStats) -> Self {
         // A stable sort: one cell's points keep their build order.
         positions.sort_by_key(|q| cell_of(q.pos.x, q.pos.z));
         let mut cells = std::collections::BTreeMap::new();
@@ -665,6 +667,46 @@ pub(super) struct Pick {
     pub lean: i8,
 }
 
+/// What the Tactician fights (card TPOSR): the target where it is seen, or
+/// where it was last known - the PS2's cover state machine runs on every
+/// update whether the target is seen or not, its walk and hidden states
+/// keeping the target (`FUN_002ce4e8`: tracker+0x38 = FLT_MAX; AUDIT TPOS).
+/// A remembered target is not peeked at: its last known place, standing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Foe {
+    /// Its feet.
+    pub at: Vec3,
+    /// The point the confirming ray is cast at.
+    pub chest: Vec3,
+    /// In a vehicle (the Tactician's positions are for a soldier).
+    pub mounted: bool,
+    /// Seen on this think. The re-score (the target round the cover, out of
+    /// the band) waits for a think it is seen: the PS2's tracker holds the
+    /// target itself, the port's memory only a place it has left (re-scored
+    /// against it, a bot whose target came round its cover waited out the
+    /// next 5 s in view of it).
+    pub seen: bool,
+}
+
+impl Foe {
+    pub fn seen(e: &Unit) -> Self {
+        Foe {
+            at: e.soldier.pos,
+            chest: e.muzzle(),
+            mounted: e.mount.is_some(),
+            seen: true,
+        }
+    }
+    pub fn remembered(at: Vec3) -> Self {
+        Foe {
+            at,
+            chest: at + Vec3::Y * crate::unit::muzzle_height(crate::soldier::Stance::Stand),
+            mounted: false,
+            seen: false,
+        }
+    }
+}
+
 /// A draw in `lo..hi` ticks.
 fn span(me: crate::unit::UnitHandle, tick: u64, salt: u32, (lo, hi): (u64, u64)) -> u64 {
     lo + ((hi - lo) as f32 * unit_unit(me.index, tick, me.gen, SALT_TPOS ^ salt)) as u64
@@ -699,7 +741,7 @@ fn line_open(sim: &Sim, from: Vec3, to: Vec3) -> bool {
     crate::perception::los_terrain(sim, from, to) && crate::perception::los_world(sim, from, to)
 }
 
-/// The Tactician: the position for bot `tk` fighting `target`. `leaving` =
+/// The Tactician: the position for bot `tk` fighting `foe`. `leaving` =
 /// the one it leaves, left out, and with it every position within
 /// [`MOVE_MIN`] of it unless `.1` (the target went round its cover).
 /// `cover_only_tries` = only the tries with cover from the target (a bot at
@@ -708,7 +750,7 @@ pub(super) fn choose(
     sim: &Sim,
     tk: &Tick,
     st: &AiState,
-    target: &Unit,
+    foe: &Foe,
     leaving: Option<(u32, bool)>,
     cover_only_tries: bool,
     nt: &mut NavTick,
@@ -720,8 +762,8 @@ pub(super) fn choose(
     }
     let Tick { me, u, wc, .. } = *tk;
     let pos = u.soldier.pos;
-    let aim = target.soldier.pos;
-    let chest = target.muzzle();
+    let aim = foe.at;
+    let chest = foe.chest;
     let (inner, outer) = band(tk);
     let mut near = Vec::new();
     t.within(
@@ -842,6 +884,9 @@ pub(super) fn choose(
             3
         } else if lines.iter().any(|l| near_seg(p, *l)) {
             4
+        // (No position the tries can take fails this while [`COVER_REACH`]
+        // and [`OPEN_REACH`] are within [`BACKWARD`] - the triangle
+        // inequality; it counts in the funnel and binds a longer reach.)
         } else if !objective.is_none_or(|o| nav::xz_dist(p, o) <= nav::xz_dist(pos, o) + BACKWARD) {
             5
         } else if sim
@@ -999,13 +1044,18 @@ pub(super) fn release(st: &mut AiState, tick: u64) {
     }
 }
 
-/// The walk to the position held failed (its way is shut): it is left, not
-/// asked for again by this bot, and nothing is asked for [`RETRY`].
-pub(super) fn failed(st: &mut AiState, tick: u64) {
+/// The position held is not asked for again by this bot (the last four).
+fn shun(st: &mut AiState) {
     if st.tpos.held.is_some() {
         st.tpos.bad.rotate_right(1);
         st.tpos.bad[0] = st.tpos.held;
     }
+}
+
+/// The walk to the position held failed (its way is shut): it is left, not
+/// asked for again by this bot, and nothing is asked for [`RETRY`].
+pub(super) fn failed(st: &mut AiState, tick: u64) {
+    shun(st);
     release(st, tick);
     st.tpos.retry_at = tick + RETRY;
 }
@@ -1142,14 +1192,16 @@ fn cycle(sim: &Sim, tk: &Tick, st: &mut AiState, h: &mut HoldState, aim: Option<
 
 /// Card TPOS: the fight's position from the Tactician, this tick (`true`)
 /// — or `false` for the caller's own rule (FGHT's stand or circle: no table,
-/// a vehicle for a target, or nothing passed). Asked on the think; kept
-/// while reserved, covered from the target as it was, inside the band and
-/// not compromised (hit twice); another looked for 5-12 s after arriving.
+/// a vehicle for a target, or nothing passed). Asked on the think, the
+/// target seen or only remembered (card TPOSR: its cycle and leave tests run
+/// all the same); kept while covered from the target as it was, inside the
+/// band and not compromised (hit twice); another looked for 5-12 s after
+/// arriving.
 pub(super) fn fight(
     sim: &Sim,
     tk: &Tick,
     st: &mut AiState,
-    e: &Unit,
+    foe: &Foe,
     h: &mut HoldState,
     thinking: bool,
     nt: &mut NavTick,
@@ -1163,7 +1215,7 @@ pub(super) fn fight(
         .teams
         .iter()
         .any(|t| t.tickets() <= super::HOLD_ENDGAME);
-    if sim.positions.is_empty() || e.mount.is_some() || endgame {
+    if sim.positions.is_empty() || foe.mounted || endgame {
         if st.fight.mode == FightState::TAKE {
             nt.tpos_ev |= EV_WALK_DROPPED;
         }
@@ -1177,7 +1229,7 @@ pub(super) fn fight(
     if !thinking {
         return on;
     }
-    let aim = e.soldier.pos;
+    let aim = foe.at;
     let mut leaving = None;
     let mut timer_only = false;
     // On the way: this near, it is there where it stands; a walk not done by
@@ -1216,7 +1268,7 @@ pub(super) fn fight(
         let q = sim.positions.positions[i as usize];
         let d = xz(aim - q.pos);
         let (inner, outer) = band(tk);
-        let rescore = now >= st.tpos.rescore_at;
+        let rescore = foe.seen && now >= st.tpos.rescore_at;
         if rescore {
             st.tpos.rescore_at = now + RESCORE;
         }
@@ -1232,7 +1284,7 @@ pub(super) fn fight(
             && now >= st.tpos.retry_at
         {
             st.tpos.retry_at = now + RETRY;
-            if let Some(p) = choose(sim, tk, st, e, Some((i, false)), true, nt) {
+            if let Some(p) = choose(sim, tk, st, foe, Some((i, false)), true, nt) {
                 nt.tpos_ev |= EV_UPGRADE | EV_PICK_COVERED;
                 take(sim, tk, st, h, p, nt);
                 return true;
@@ -1247,6 +1299,12 @@ pub(super) fn fight(
         }
         leaving = Some((i, round));
         timer_only = !(round || hit || off_band);
+        // Card TPOSR (OURS): a position hit twice is compromised - not asked
+        // for again, as a failed walk's (left at once now, a bot with nothing
+        // else in reach walked back to it at its next ask, 2 s on).
+        if hit {
+            shun(st);
+        }
         nt.tpos_ev |= if round {
             EV_LEAVE_ROUND
         } else if hit {
@@ -1263,7 +1321,7 @@ pub(super) fn fight(
     // The 5-12 s timer takes another QUALIFYING position (the PS2's
     // "another qualifying hint"): from cover, only another with cover.
     let cover_only = timer_only && st.tpos.covered;
-    match choose(sim, tk, st, e, leaving, cover_only, nt) {
+    match choose(sim, tk, st, foe, leaving, cover_only, nt) {
         Some(p) => {
             nt.tpos_ev |= if p.covered {
                 EV_PICK_COVERED
@@ -1287,6 +1345,27 @@ pub(super) fn fight(
             false
         }
     }
+}
+
+/// Card TPOSR, every tick after the fight's rules: the position held stays
+/// reserved for as long as it is held, the target seen or not - the PS2's
+/// cover state machine re-stamps its hint's reservation on every update of
+/// its walk and cover states (`FUN_002d0c78` -> `FUN_002ded48`; AUDIT TPOS:
+/// renewed only on thinks with the target seen, 20 % of held time went
+/// unreserved and two bots shared a position). And a position hit twice is
+/// left at the next think whatever else the bot does (a target seen beyond
+/// the fight's reach, a friend's told record: neither runs [`fight`]).
+pub(super) fn keep(sim: &Sim, st: &mut AiState, thinking: bool, nt: &mut NavTick) {
+    if !st.fight.tactician() || st.tpos.held.is_none() {
+        return;
+    }
+    if thinking && st.tpos.hits >= 2 {
+        nt.tpos_ev |= EV_LEAVE_HIT;
+        shun(st);
+        release(st, sim.tick);
+        return;
+    }
+    st.tpos.until = st.tpos.until.max(sim.tick + FREE_AFTER);
 }
 
 /// A hit on a bot at its position: two and it is compromised (left at the
